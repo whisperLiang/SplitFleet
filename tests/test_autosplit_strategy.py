@@ -6,17 +6,17 @@ import pytest
 import torch
 from torch import nn
 
-from slbd.autosplit import ReplicaScope
-from slbd.common import ServerModelFitRes
-from slbd.common.constants import (
+from splitfleet.autosplit import ReplicaScope
+from splitfleet.common import ServerModelFitRes
+from splitfleet.common.constants import (
     AUTOSPLIT_CLIENT_STAGE_COUNT_CONFIG_KEY,
     AUTOSPLIT_CUTOFFS_CONFIG_KEY,
     AUTOSPLIT_PLAN_ID_CONFIG_KEY,
     AUTOSPLIT_STAGE_COUNT_CONFIG_KEY,
     AUTOSPLIT_STAGE_TO_WORKER_CONFIG_KEY,
 )
-from slbd.server.server_model.server_model import ServerModel
-from slbd.server.strategy import AutoSplitStrategy
+from splitfleet.server.server_model.server_model import ServerModel
+from splitfleet.server.strategy import AutoSplitStrategy
 
 
 class TinyNet(nn.Module):

@@ -823,7 +823,7 @@ wheels = [
 ]
 
 [[package]]
-name = "slbd"
+name = "splitfleet"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [
@@ -836,7 +836,6 @@ dependencies = [
     { name = "pandas" },
     { name = "protobuf" },
     { name = "torch" },
-    { name = "torchlens" },
     { name = "tqdm" },
 ]
 
@@ -859,7 +858,6 @@ requires-dist = [
     { name = "protobuf", specifier = ">=4.25.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3.0" },
     { name = "torch", specifier = ">=2.4.0" },
-    { name = "torchlens", editable = "vendor/torchlens_runtime" },
     { name = "tqdm", specifier = ">=4.66.0" },
 ]
 provides-extras = ["dev"]
@@ -924,25 +922,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/a4/f0/98ae802fa8c09d3149b0c8690741f3f5753c90e779bd28c9613257295945/torch-2.11.0-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:4cf8687f4aec3900f748d553483ef40e0ac38411c3c48d0a86a438f6d7a99b18", size = 419723025, upload-time = "2026-03-23T18:11:43.774Z" },
     { url = "https://files.pythonhosted.org/packages/f9/1e/18a9b10b4bd34f12d4e561c52b0ae7158707b8193c6cfc0aad2b48167090/torch-2.11.0-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:1b32ceda909818a03b112006709b02be1877240c31750a8d9c6b7bf5f2d8a6e5", size = 530589207, upload-time = "2026-03-23T18:11:23.756Z" },
     { url = "https://files.pythonhosted.org/packages/35/40/2d532e8c0e23705be9d1debce5bc37b68d59a39bda7584c26fe9668076fe/torch-2.11.0-cp310-cp310-win_amd64.whl", hash = "sha256:b3c712ae6fb8e7a949051a953fc412fe0a6940337336c3b6f905e905dac5157f", size = 114518313, upload-time = "2026-03-23T18:11:58.281Z" },
-]
-
-[[package]]
-name = "torchlens"
-version = "1.0.2"
-source = { editable = "vendor/torchlens_runtime" }
-dependencies = [
-    { name = "graphviz" },
-    { name = "numpy" },
-    { name = "pandas" },
-    { name = "torch" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "graphviz", specifier = ">=0.20.0" },
-    { name = "numpy", specifier = "<2" },
-    { name = "pandas", specifier = ">=2.2.0" },
-    { name = "torch", specifier = ">=2.4.0" },
 ]
 
 [[package]]

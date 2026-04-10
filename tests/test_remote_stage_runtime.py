@@ -3,11 +3,11 @@ import copy
 import torch
 from torch import nn
 
-from slbd.autosplit.planner import build_partition_plan
-from slbd.autosplit.runtime import AutoSplitSession
-from slbd.autosplit.types import PlacementPlan
-from slbd.server.stage_runtime.manager import StageRuntimeManager
-from slbd.worker import start_worker
+from splitfleet.autosplit.planner import build_partition_plan
+from splitfleet.autosplit.runtime import AutoSplitSession
+from splitfleet.autosplit.types import PlacementPlan
+from splitfleet.server.stage_runtime.manager import StageRuntimeManager
+from splitfleet.worker import start_worker
 
 
 class DeepNet(nn.Module):

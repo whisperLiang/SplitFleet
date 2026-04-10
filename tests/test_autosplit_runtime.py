@@ -5,7 +5,7 @@ import copy
 import torch
 from torch import nn
 
-from slbd.autosplit import AutoSplitSession, PlacementConstraint, WorkerSpec
+from splitfleet.autosplit import AutoSplitSession, PlacementConstraint, WorkerSpec
 
 
 class BranchNet(nn.Module):

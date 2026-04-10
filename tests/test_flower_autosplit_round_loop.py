@@ -18,14 +18,14 @@ from flwr.server.app import ServerConfig
 from flwr.server.client_manager import SimpleClientManager
 from flwr.server.client_proxy import ClientProxy
 
-from slbd.autosplit import ReplicaScope
-from slbd.client.autosplit_client import AutoSplitNumPyClient
-from slbd.client.autosplit_split_client import AutoSplitSplitLearningClient
-from slbd.client.numpy_client import NumPyClient
-from slbd.server.app import init_defaults
-from slbd.server.server_model.proxy.server_model_proxy import ServerModelProxy
-from slbd.server.strategy import AutoSplitStrategy
-from slbd.worker import start_worker
+from splitfleet.autosplit import ReplicaScope
+from splitfleet.client.autosplit_client import AutoSplitNumPyClient
+from splitfleet.client.autosplit_split_client import AutoSplitSplitLearningClient
+from splitfleet.client.numpy_client import NumPyClient
+from splitfleet.server.app import init_defaults
+from splitfleet.server.server_model.proxy.server_model_proxy import ServerModelProxy
+from splitfleet.server.strategy import AutoSplitStrategy
+from splitfleet.worker import start_worker
 
 
 class DeepNet(nn.Module):

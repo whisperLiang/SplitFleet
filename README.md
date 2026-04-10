@@ -47,7 +47,7 @@ Not implemented yet:
 
 SplitFleet is organized around four layers:
 
-1. `slbd.autosplit`
+1. `splitfleet.autosplit`
    Compiles execution plans, enumerates split candidates, builds partition plans, places stages onto workers, and replays forward/backward execution.
 2. `AutoSplitStrategy`
    Injects autosplit plans into the Flower round loop and exposes variant knobs such as shared tail, per-client tail, and SplitFed-style aggregation.
@@ -104,7 +104,7 @@ uv run --no-sync pytest -q
 
 ## Example: AutoSplit Strategy
 
-The main entrypoint for the unified framework is [`AutoSplitStrategy`](slbd/server/strategy/autosplit_strategy.py).
+The main entrypoint for the unified framework is [`AutoSplitStrategy`](splitfleet/server/strategy/autosplit_strategy.py).
 
 ```python
 import torch
@@ -112,10 +112,10 @@ from torch import nn
 from flwr.server.app import ServerConfig
 from flwr.server.client_manager import SimpleClientManager
 
-from slbd.client.autosplit_split_client import AutoSplitSplitLearningClient
-from slbd.server.app import init_defaults
-from slbd.server.strategy import AutoSplitStrategy
-from slbd.worker import start_worker
+from splitfleet.client.autosplit_split_client import AutoSplitSplitLearningClient
+from splitfleet.server.app import init_defaults
+from splitfleet.server.strategy import AutoSplitStrategy
+from splitfleet.worker import start_worker
 
 model = MyModel()
 sample_inputs = torch.randn(8, 3, 224, 224)
@@ -162,17 +162,17 @@ For a runnable example, see [`examples/autosplit_remote_worker_demo.py`](example
 
 ## Main Components
 
-- [`slbd/autosplit`](slbd/autosplit)
+- [`splitfleet/autosplit`](splitfleet/autosplit)
   Autosplit tracing, planning, serialization, caching, and replay runtime.
-- [`slbd/server/strategy/autosplit_strategy.py`](slbd/server/strategy/autosplit_strategy.py)
+- [`splitfleet/server/strategy/autosplit_strategy.py`](splitfleet/server/strategy/autosplit_strategy.py)
   Unified Flower strategy for autosplit and split learning variants.
-- [`slbd/server/stage_runtime`](slbd/server/stage_runtime)
+- [`splitfleet/server/stage_runtime`](splitfleet/server/stage_runtime)
   Stage runtime manager, worker registry, and executors.
-- [`slbd/client/autosplit_client.py`](slbd/client/autosplit_client.py)
+- [`splitfleet/client/autosplit_client.py`](splitfleet/client/autosplit_client.py)
   Data-owning client that delegates model execution to autosplit runtimes.
-- [`slbd/client/autosplit_split_client.py`](slbd/client/autosplit_split_client.py)
+- [`splitfleet/client/autosplit_split_client.py`](splitfleet/client/autosplit_split_client.py)
   Split learning client with client-local prefix execution.
-- [`slbd/worker`](slbd/worker)
+- [`splitfleet/worker`](splitfleet/worker)
   Worker runtime and worker startup helpers.
 
 ## Validation Status

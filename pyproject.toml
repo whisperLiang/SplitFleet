@@ -3,13 +3,13 @@ requires = ["setuptools >= 61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "slbd"
+name = "splitfleet"
 version = "0.2.0"
 authors = [
     {name="Boris Radovic", email="radovic.brs@gmail.com"}
 ]
 requires-python = ">=3.10,<3.11"
-description = "Split learning extension built on top of flower."
+description = "Unified split learning framework with autosplitting built on top of Flower."
 readme = "README.md"
 classifiers = [
     "Private :: Do Not Upload"
@@ -35,7 +35,7 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["slbd*", "torchlens*", "model_management*"]
+include = ["splitfleet*", "torchlens*", "model_management*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

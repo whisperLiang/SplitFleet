@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from slbd.autosplit.cache import PlanCacheEntry, PlanCacheStore
-from slbd.autosplit.types import PlacementConstraint, PlacementObjective, WorkerSpec
+from splitfleet.autosplit.cache import PlanCacheEntry, PlanCacheStore
+from splitfleet.autosplit.types import PlacementConstraint, PlacementObjective, WorkerSpec
 
 
 def test_worker_signature_is_stable() -> None:

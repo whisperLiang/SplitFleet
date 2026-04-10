@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from slbd.common.typing import BatchData, ControlCode
-from slbd.proto import server_model_pb2
+from splitfleet.common.typing import BatchData, ControlCode
+from splitfleet.proto import server_model_pb2
 
 
 def test_batchdata_metadata_defaults_to_empty_dict() -> None:
