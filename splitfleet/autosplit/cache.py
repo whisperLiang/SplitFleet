@@ -1,9 +1,20 @@
-"""Persistent cache for autosplit partition and placement choices."""
+"""Persistent cache for autosplit partition and placement choices.
+
+Optimized with:
+- In-memory LRU cache layer for fast repeated access
+- Async file I/O for non-blocking saves
+- Thread-safe operations
+- TTL-based cache invalidation
+"""
 
 from __future__ import annotations
 
 import json
 import os
+import threading
+import time
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Iterable, Optional
 
@@ -62,46 +73,193 @@ class PlanCacheEntry:
         )
 
 
-class PlanCacheStore:
-    """Filesystem-backed cache keyed by model name."""
+@dataclass
+class _CacheEntry:
+    """Internal cache entry with timestamp for TTL support."""
+    entry: PlanCacheEntry
+    timestamp: float
 
-    def __init__(self, root_dir: str) -> None:
+
+class PlanCacheStore:
+    """Filesystem-backed cache with in-memory LRU layer.
+
+    Features:
+    - Two-tier caching: memory (LRU) + disk (JSON)
+    - Thread-safe operations with fine-grained locking
+    - Async disk writes for non-blocking saves
+    - TTL-based memory cache invalidation
+    """
+
+    def __init__(
+        self,
+        root_dir: str,
+        *,
+        max_memory_cache: int = 32,
+        ttl_seconds: float = 3600.0,
+    ) -> None:
+        """Initialize the cache store.
+
+        Args:
+            root_dir: Directory for persistent cache files.
+            max_memory_cache: Maximum number of entries in memory cache.
+            ttl_seconds: Time-to-live for memory cache entries (0 = no TTL).
+        """
         self.root_dir = root_dir
+        self._max_memory_cache = max_memory_cache
+        self._ttl_seconds = ttl_seconds
+
+        # Thread-safe LRU cache using OrderedDict
+        self._memory_cache: OrderedDict[str, _CacheEntry] = OrderedDict()
+        self._cache_lock = threading.RLock()
+
+        # Thread pool for async disk writes
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cache_writer")
 
     def _path_for(self, model_name: str) -> str:
         safe_name = model_name.replace("\\", "_").replace("/", "_")
         return os.path.join(self.root_dir, f"{safe_name}.json")
 
     def load(self, model_name: str) -> Optional[PlanCacheEntry]:
+        """Load a cache entry, checking memory cache first.
+
+        Args:
+            model_name: Name of the model to load cache for.
+
+        Returns:
+            Cached entry or None if not found/expired.
+        """
+        # Check memory cache first (fast path)
+        with self._cache_lock:
+            cached = self._memory_cache.get(model_name)
+            if cached is not None:
+                # Check TTL
+                if self._ttl_seconds > 0:
+                    if time.time() - cached.timestamp > self._ttl_seconds:
+                        del self._memory_cache[model_name]
+                    else:
+                        # Move to end for LRU
+                        self._memory_cache.move_to_end(model_name)
+                        return cached.entry
+                else:
+                    self._memory_cache.move_to_end(model_name)
+                    return cached.entry
+
+        # Fall back to disk
+        entry = self._load_from_disk(model_name)
+        if entry is not None:
+            with self._cache_lock:
+                self._add_to_memory_cache(model_name, entry)
+        return entry
+
+    def _load_from_disk(self, model_name: str) -> Optional[PlanCacheEntry]:
+        """Load entry from disk (internal method)."""
         path = self._path_for(model_name)
         if not os.path.exists(path):
             return None
-        with open(path, "r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-        if not isinstance(payload, dict):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if not isinstance(payload, dict):
+                return None
+            return PlanCacheEntry.from_dict(payload)
+        except (json.JSONDecodeError, OSError, KeyError):
             return None
-        return PlanCacheEntry.from_dict(payload)
 
     def save(self, entry: PlanCacheEntry) -> None:
-        os.makedirs(self.root_dir, exist_ok=True)
-        path = self._path_for(entry.model_name)
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(entry.to_dict(), handle, indent=2, sort_keys=True)
+        """Save entry to memory cache and asynchronously to disk.
+
+        Args:
+            entry: Cache entry to save.
+        """
+        # Update memory cache immediately
+        with self._cache_lock:
+            self._add_to_memory_cache(entry.model_name, entry)
+
+        # Async disk write
+        self._executor.submit(self._save_to_disk, entry)
+
+    def _save_to_disk(self, entry: PlanCacheEntry) -> None:
+        """Save entry to disk (internal method, runs in thread)."""
+        try:
+            os.makedirs(self.root_dir, exist_ok=True)
+            path = self._path_for(entry.model_name)
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(entry.to_dict(), handle, indent=2, sort_keys=True)
+        except OSError:
+            pass  # Silently fail disk writes
+
+    def _add_to_memory_cache(self, model_name: str, entry: PlanCacheEntry) -> None:
+        """Add entry to memory cache with LRU eviction (must hold lock)."""
+        # Remove if exists (for move-to-end behavior)
+        if model_name in self._memory_cache:
+            del self._memory_cache[model_name]
+
+        # Evict oldest if at capacity
+        while len(self._memory_cache) >= self._max_memory_cache:
+            self._memory_cache.popitem(last=False)
+
+        self._memory_cache[model_name] = _CacheEntry(
+            entry=entry,
+            timestamp=time.time(),
+        )
+
+    def invalidate(self, model_name: str) -> bool:
+        """Remove entry from both memory and disk cache.
+
+        Args:
+            model_name: Name of model to invalidate.
+
+        Returns:
+            True if entry was removed, False if not found.
+        """
+        found = False
+        with self._cache_lock:
+            if model_name in self._memory_cache:
+                del self._memory_cache[model_name]
+                found = True
+
+        path = self._path_for(model_name)
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+                found = True
+            except OSError:
+                pass
+
+        return found
+
+    def clear_memory_cache(self) -> int:
+        """Clear all entries from memory cache.
+
+        Returns:
+            Number of entries cleared.
+        """
+        with self._cache_lock:
+            count = len(self._memory_cache)
+            self._memory_cache.clear()
+            return count
+
+    def shutdown(self) -> None:
+        """Shutdown the async executor (call on program exit)."""
+        self._executor.shutdown(wait=True)
 
     @staticmethod
     def worker_signature(worker_specs: Iterable[WorkerSpec]) -> str:
-        parts = []
-        for spec in sorted(worker_specs, key=lambda item: item.worker_id):
-            parts.append(
-                ":".join(
-                    [
-                        spec.worker_id,
-                        spec.device,
-                        str(spec.bandwidth_mbps),
-                        str(spec.memory_bytes),
-                        "1" if spec.online else "0",
-                        ",".join(spec.tags),
-                    ]
-                )
+        """Generate a signature string from worker specs.
+
+        Optimized with list comprehension and join.
+        """
+        parts = [
+            ":".join(
+                [
+                    spec.worker_id,
+                    spec.device,
+                    str(spec.bandwidth_mbps),
+                    str(spec.memory_bytes),
+                    "1" if spec.online else "0",
+                    ",".join(spec.tags),
+                ]
             )
+            for spec in sorted(worker_specs, key=lambda item: item.worker_id)
+        ]
         return "|".join(parts)

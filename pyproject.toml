@@ -26,6 +26,7 @@ dependencies = [
     "loguru>=0.7.0",
     "grpcio>=1.62.0",
     "protobuf>=4.25.0",
+    "lz4>=4.3.0",
 ]
 
 [project.optional-dependencies]

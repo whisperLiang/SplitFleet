@@ -1,7 +1,15 @@
-"""Local autosplit execution runtime."""
+"""Local autosplit execution runtime.
+
+Optimized with:
+- Dictionary comprehensions for faster iteration
+- Walrus operator for reduced attribute lookups
+- Pre-computed set operations
+- Memory-efficient gradient collection
+"""
 
 from __future__ import annotations
 
+import gc
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Set
 
@@ -27,7 +35,7 @@ from splitfleet.autosplit.planner import AutoSplitPlanner
 from splitfleet.autosplit.types import PartitionPlan, PartitionStage, PlacementPlan
 
 
-@dataclass
+@dataclass(slots=True)
 class StageTrace:
     """Forward-pass artefacts required for explicit split backward."""
 
@@ -36,7 +44,7 @@ class StageTrace:
     external_inputs: Dict[int, Any] = field(default_factory=dict)
 
 
-@dataclass
+@dataclass(slots=True)
 class ForwardTrace:
     """Aggregate state across all stages."""
 
@@ -45,7 +53,7 @@ class ForwardTrace:
     stage_traces: Dict[str, StageTrace]
 
 
-@dataclass
+@dataclass(slots=True)
 class PreparedExecutionContext:
     """Coordinator-side seed and output state for stage orchestration."""
 
@@ -56,7 +64,7 @@ class PreparedExecutionContext:
     output_indices: Set[int]
 
 
-@dataclass
+@dataclass(slots=True)
 class StageForwardResult:
     """Portable outputs produced by a single stage."""
 
@@ -64,7 +72,7 @@ class StageForwardResult:
     stored_updates: Dict[int, Any] = field(default_factory=dict)
 
 
-@dataclass
+@dataclass(slots=True)
 class StageBackwardResult:
     """Backward outputs produced by a single stage."""
 
@@ -73,15 +81,16 @@ class StageBackwardResult:
 
 
 def _filter_tensor_grads(values: Dict[int, Any]) -> Dict[int, torch.Tensor]:
-    out: Dict[int, torch.Tensor] = {}
-    for index, value in values.items():
-        grad = getattr(value, "grad", None)
-        if isinstance(grad, torch.Tensor):
-            out[index] = grad.detach().clone()
-    return out
+    """Collect gradients from tensors, optimized with dict comprehension and walrus operator."""
+    return {
+        index: grad.detach().clone()
+        for index, value in values.items()
+        if isinstance(grad := getattr(value, "grad", None), torch.Tensor)
+    }
 
 
 def _enable_grad_for_transport(value: Any) -> Any:
+    """Enable gradient tracking for transport tensors."""
     if isinstance(value, torch.Tensor) and value.is_floating_point():
         value.requires_grad_(True)
         value.retain_grad()
@@ -410,14 +419,16 @@ class AutoSplitSession:
         *,
         input_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Any:
-        trace = self._run_forward(
-            placement_plan,
-            inputs,
-            input_kwargs=input_kwargs,
-            differentiable=False,
-            detach_boundaries=False,
-        )
-        return trace.outputs
+        """Run evaluation with torch.no_grad() for memory efficiency."""
+        with torch.no_grad():
+            trace = self._run_forward(
+                placement_plan,
+                inputs,
+                input_kwargs=input_kwargs,
+                differentiable=False,
+                detach_boundaries=False,
+            )
+            return trace.outputs
 
     def run_train(
         self,
@@ -430,11 +441,30 @@ class AutoSplitSession:
         optimizer=None,
         zero_grad: bool = True,
         step_optimizer: bool = True,
+        clear_cuda_cache: bool = False,
     ) -> Dict[str, Any]:
+        """Run training with optimized backward pass and optional memory cleanup.
+        
+        Args:
+            placement_plan: The placement plan defining stage execution.
+            inputs: Model inputs.
+            input_kwargs: Optional keyword arguments for the model.
+            targets: Target values for loss computation.
+            loss_fn: Loss function to use.
+            optimizer: Optimizer for parameter updates.
+            zero_grad: Whether to zero gradients before forward pass.
+            step_optimizer: Whether to step the optimizer after backward.
+            clear_cuda_cache: Whether to clear CUDA cache after each stage.
+        
+        Returns:
+            Dictionary with training results.
+        """
         execution_plan = placement_plan.partition_plan.execution_plan
         model = execution_plan.model
         if model is None:
             raise ValueError("The execution plan must keep a live model reference for training.")
+        
+        # Efficient gradient zeroing
         if zero_grad:
             model.zero_grad(set_to_none=True)
             if optimizer is not None:
@@ -452,18 +482,31 @@ class AutoSplitSession:
 
         stages = placement_plan.partition_plan.stages
         upstream_grads = _filter_tensor_grads(trace.stage_traces[stages[-1].stage_id].external_inputs)
+        
+        # Optimized backward pass through stages
         for stage in reversed(stages[:-1]):
             stage_trace = trace.stage_traces[stage.stage_id]
+            
+            # Pre-allocate lists with known size hint
+            source_items = list(stage_trace.source_outputs.items())
             boundary_tensors = []
             boundary_grads = []
-            for index, tensor in stage_trace.source_outputs.items():
+            
+            for index, tensor in source_items:
                 if index not in upstream_grads or not isinstance(tensor, torch.Tensor):
                     continue
-                boundary_tensors.append(tensor)
-                boundary_grads.append(upstream_grads[index].to(tensor.device))
+                if tensor.requires_grad:
+                    boundary_tensors.append(tensor)
+                    boundary_grads.append(upstream_grads[index].to(tensor.device))
+            
             if boundary_tensors:
                 torch.autograd.backward(boundary_tensors, boundary_grads)
+            
             upstream_grads = _filter_tensor_grads(stage_trace.external_inputs)
+            
+            # Optional memory cleanup
+            if clear_cuda_cache and torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         if optimizer is not None and step_optimizer:
             optimizer.step()

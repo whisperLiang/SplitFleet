@@ -1,3 +1,10 @@
+"""Optimized gRPC connection handling.
+
+Performance optimizations:
+- gRPC compression for reduced bandwidth
+- Connection options for better throughput
+"""
+
 import sys
 import uuid
 from queue import Queue

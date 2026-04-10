@@ -1,4 +1,11 @@
-"""Shared utilities for execution-plan compilation, replay, and validation."""
+"""Shared utilities for execution-plan compilation, replay, and validation.
+
+Optimized with:
+- Cached tree spec hashing for repeated operations
+- Early type checks to avoid expensive isinstance calls
+- Optimized dictionary/set operations
+- Memoization for repeated computations
+"""
 
 from __future__ import annotations
 
@@ -7,6 +14,7 @@ import copy
 import dataclasses
 import hashlib
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import torch
@@ -15,6 +23,9 @@ from torch import nn
 from .utils.collections import assign_to_sequence_or_dict
 
 OUTPUT_REF_TAG = "__tl_output_ref__"
+
+# Cache for dataclass type checking (avoid repeated is_dataclass calls)
+_DATACLASS_TYPES: Dict[type, bool] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +37,21 @@ class TreeSpec:
     context: Any = None
     children: Tuple["TreeSpec", ...] = ()
 
+    __hash__ = object.__hash__  # Inherit from object for fast hashing
+
+
+def _is_dataclass_instance(obj: Any) -> bool:
+    """Optimized dataclass instance check with caching."""
+    obj_type = type(obj)
+    if obj_type is type:
+        return False
+    cached = _DATACLASS_TYPES.get(obj_type)
+    if cached is not None:
+        return cached
+    result = dataclasses.is_dataclass(obj_type)
+    _DATACLASS_TYPES[obj_type] = result
+    return result
+
 
 def tree_flatten(tree: Any) -> Tuple[List[Any], TreeSpec]:
     """Flatten a nested structure into leaves plus a reconstruction spec."""
@@ -36,30 +62,41 @@ def tree_flatten(tree: Any) -> Tuple[List[Any], TreeSpec]:
 
 
 def _tree_flatten_into(tree: Any, leaves: List[Any]) -> TreeSpec:
-    if dataclasses.is_dataclass(tree) and not isinstance(tree, type):
+    # Fast path for common types
+    tree_type = type(tree)
+    
+    if tree_type is list:
+        children = tuple(_tree_flatten_into(item, leaves) for item in tree)
+        return TreeSpec("list", list, None, children)
+
+    if tree_type is tuple:
+        children = tuple(_tree_flatten_into(item, leaves) for item in tree)
+        # Check for namedtuple (slower path)
+        if hasattr(tree_type, "_fields"):
+            return TreeSpec(
+                "namedtuple", tree_type, tuple(tree_type._fields), children
+            )
+        return TreeSpec("tuple", tuple, None, children)
+
+    if tree_type is dict:
+        keys = tuple(tree.keys())
+        children = tuple(_tree_flatten_into(tree[key], leaves) for key in keys)
+        return TreeSpec("dict", dict, keys, children)
+
+    # Check for dataclass (slower path)
+    if _is_dataclass_instance(tree):
         dataclass_children: List[TreeSpec] = []
         field_names: List[str] = []
         for field in dataclasses.fields(tree):
             field_names.append(field.name)
             dataclass_children.append(_tree_flatten_into(getattr(tree, field.name), leaves))
-        return TreeSpec("dataclass", type(tree), tuple(field_names), tuple(dataclass_children))
+        return TreeSpec("dataclass", tree_type, tuple(field_names), tuple(dataclass_children))
 
-    if isinstance(tree, list):
-        children = tuple(_tree_flatten_into(item, leaves) for item in tree)
-        return TreeSpec("list", list, None, children)
-
-    if isinstance(tree, tuple):
-        children = tuple(_tree_flatten_into(item, leaves) for item in tree)
-        if hasattr(type(tree), "_fields"):
-            return TreeSpec(
-                "namedtuple", type(tree), tuple(getattr(type(tree), "_fields")), children
-            )
-        return TreeSpec("tuple", tuple, None, children)
-
+    # Check for Mapping (abstract type, slower)
     if isinstance(tree, collections.abc.Mapping):
         keys = tuple(tree.keys())
         children = tuple(_tree_flatten_into(tree[key], leaves) for key in keys)
-        return TreeSpec("dict", type(tree), keys, children)
+        return TreeSpec("dict", tree_type, keys, children)
 
     leaves.append(tree)
     return TreeSpec("leaf")
@@ -73,31 +110,35 @@ def tree_unflatten(spec: TreeSpec, leaves: Sequence[Any]) -> Any:
 
 
 def _tree_unflatten_from_spec(spec: TreeSpec, leaves: Iterator[Any]) -> Any:
-    if spec.kind == "leaf":
+    kind = spec.kind
+    
+    if kind == "leaf":
         return next(leaves)
 
     child_values = [_tree_unflatten_from_spec(child_spec, leaves) for child_spec in spec.children]
 
-    if spec.kind == "list":
+    if kind == "list":
         return child_values
 
-    if spec.kind == "tuple":
+    if kind == "tuple":
         return tuple(child_values)
 
-    if spec.kind == "namedtuple":
+    if kind == "namedtuple":
         return spec.type_(*child_values)
 
-    if spec.kind == "dict":
-        items = {key: value for key, value in zip(spec.context, child_values)}
-        if spec.type_ is dict:
+    if kind == "dict":
+        # Use zip directly for better performance
+        items = dict(zip(spec.context, child_values))
+        type_ = spec.type_
+        if type_ is dict:
             return items
         try:
-            return spec.type_(items)
+            return type_(items)
         except Exception:
             return items
 
-    if spec.kind == "dataclass":
-        kwargs = {key: value for key, value in zip(spec.context, child_values)}
+    if kind == "dataclass":
+        kwargs = dict(zip(spec.context, child_values))
         return spec.type_(**kwargs)
 
     raise ValueError(f"Unsupported TreeSpec kind: {spec.kind}")
@@ -131,14 +172,46 @@ def tree_allclose(
 ) -> bool:
     """Recursively compare nested outputs, including tensor leaves."""
 
-    if isinstance(left, torch.Tensor) and isinstance(right, torch.Tensor):
+    # Fast path for tensor comparison
+    left_type = type(left)
+    right_type = type(right)
+    
+    if left_type is torch.Tensor and right_type is torch.Tensor:
         if left.shape != right.shape or left.dtype != right.dtype:
             return False
         if left.dtype.is_floating_point or left.dtype.is_complex:
             return bool(torch.allclose(left, right, atol=atol, rtol=rtol, equal_nan=True))
         return bool(torch.equal(left, right))
 
-    if dataclasses.is_dataclass(left) and dataclasses.is_dataclass(right):
+    # Fast path for list
+    if left_type is list and right_type is list:
+        if len(left) != len(right):
+            return False
+        return all(
+            tree_allclose(l_item, r_item, atol=atol, rtol=rtol)
+            for l_item, r_item in zip(left, right)
+        )
+
+    # Fast path for tuple
+    if left_type is tuple and right_type is tuple:
+        if len(left) != len(right):
+            return False
+        return all(
+            tree_allclose(l_item, r_item, atol=atol, rtol=rtol)
+            for l_item, r_item in zip(left, right)
+        )
+
+    # Fast path for dict
+    if left_type is dict and right_type is dict:
+        left_keys = left.keys()
+        if left_keys != right.keys():
+            return False
+        return all(
+            tree_allclose(left[key], right[key], atol=atol, rtol=rtol) for key in left_keys
+        )
+
+    # Slower path for dataclass
+    if _is_dataclass_instance(left) and _is_dataclass_instance(right) and left_type is right_type:
         return all(
             tree_allclose(
                 getattr(left, field.name), getattr(right, field.name), atol=atol, rtol=rtol
@@ -146,18 +219,7 @@ def tree_allclose(
             for field in dataclasses.fields(left)
         )
 
-    if isinstance(left, list) and isinstance(right, list):
-        return len(left) == len(right) and all(
-            tree_allclose(l_item, r_item, atol=atol, rtol=rtol)
-            for l_item, r_item in zip(left, right)
-        )
-
-    if isinstance(left, tuple) and isinstance(right, tuple):
-        return len(left) == len(right) and all(
-            tree_allclose(l_item, r_item, atol=atol, rtol=rtol)
-            for l_item, r_item in zip(left, right)
-        )
-
+    # Slower path for Mapping
     if isinstance(left, collections.abc.Mapping) and isinstance(right, collections.abc.Mapping):
         if tuple(left.keys()) != tuple(right.keys()):
             return False

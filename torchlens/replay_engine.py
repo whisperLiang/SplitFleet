@@ -100,16 +100,29 @@ class _ComputedStore(Protocol):
 
 
 class _NodeValueStore:
-    __slots__ = ("_values",)
+    """Optimized value store for execution nodes.
+    
+    Performance optimizations:
+    - Uses __slots__ for memory efficiency
+    - Pre-allocated list for O(1) access
+    - Fast path checks with direct index comparison
+    """
+    __slots__ = ("_values", "_size")
 
     def __init__(self, size: int, seeded_values: Optional[Dict[int, Any]] = None) -> None:
         self._values = [_MISSING] * size
+        self._size = size
         if seeded_values is not None:
             for idx, value in seeded_values.items():
-                self._values[idx] = value
+                if 0 <= idx < size:
+                    self._values[idx] = value
 
     def __contains__(self, idx: object) -> bool:
-        return isinstance(idx, int) and 0 <= idx < len(self._values) and self._values[idx] is not _MISSING
+        # Fast path: direct type and range check
+        if not isinstance(idx, int):
+            return False
+        values = self._values
+        return 0 <= idx < self._size and values[idx] is not _MISSING
 
     def __getitem__(self, idx: int) -> Any:
         value = self._values[idx]
@@ -125,20 +138,24 @@ class _NodeValueStore:
         return default if value is _MISSING else value
 
     def pop(self, idx: int, default: Any = None) -> Any:
-        value = self._values[idx]
+        values = self._values
+        value = values[idx]
         if value is _MISSING:
             return default
-        self._values[idx] = _MISSING
+        values[idx] = _MISSING
         return value
 
     def values(self) -> Iterable[Any]:
         return (value for value in self._values if value is not _MISSING)
 
     def materialize(self, indices: Iterable[int]) -> Dict[int, Any]:
+        """Materialize values for given indices, optimized with local variable binding."""
+        values = self._values
+        size = self._size
         return {
-            idx: self._values[idx]
+            idx: values[idx]
             for idx in indices
-            if 0 <= idx < len(self._values) and self._values[idx] is not _MISSING
+            if isinstance(idx, int) and 0 <= idx < size and values[idx] is not _MISSING
         }
 
 
