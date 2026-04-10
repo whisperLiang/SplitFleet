@@ -23,6 +23,7 @@ message BatchData {
   map<string, ByteTensor> data = 2;  // dictionary with parameters to be passed to the function
   ControlCode control_code = 3;
   string cid = 4;
+  map<string, string> metadata = 5;
 }
 
 enum ControlCode {

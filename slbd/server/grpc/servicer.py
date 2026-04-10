@@ -42,7 +42,8 @@ class ServerModelServicer(server_model_pb2_grpc.ServerModelServicer):
     ) -> BatchData:
         data = BatchData(
             data = from_grpc_format(request.data),
-            control_code=control_code_from_proto(request.control_code)
+            control_code=control_code_from_proto(request.control_code),
+            metadata=dict(request.metadata),
         )
         method_name = request.method
         event = EventWithReturnValue()
@@ -77,7 +78,8 @@ class ServerModelServicer(server_model_pb2_grpc.ServerModelServicer):
     def _to_grpc(self, data: BatchData) -> server_model_pb2.BatchData:
         return server_model_pb2.BatchData(
             data=to_grpc_format(data.data),
-            control_code=control_code_to_proto(data.control_code)
+            control_code=control_code_to_proto(data.control_code),
+            metadata=data.metadata,
         )
 
     async def UnaryRequest(

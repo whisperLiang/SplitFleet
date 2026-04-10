@@ -42,6 +42,11 @@ class BatchData:
     """
     data: Dict[str, Union[bytes, List[bytes]]]
     control_code: ControlCode
+    metadata: Dict[str, str] = None
+
+    def __post_init__(self):
+        if self.metadata is None:
+            self.metadata = {}
 
 
 @dataclass

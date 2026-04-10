@@ -91,6 +91,7 @@ class GrpcServerModelProxy(ServerModelProxy):
                 method=method,
                 data=to_grpc_format(batch_data.data),
                 control_code=control_code_to_proto(batch_data.control_code),
+                metadata=batch_data.metadata,
             )
             self.request_queue.put(ins)
             res = next(self.response_stream)
@@ -102,11 +103,13 @@ class GrpcServerModelProxy(ServerModelProxy):
                     data=to_grpc_format(batch_data.data),
                     control_code=control_code_to_proto(batch_data.control_code),
                     cid=self.cid,
+                    metadata=batch_data.metadata,
                 )
             )
         return BatchData(
             data=from_grpc_format(res.data),
-            control_code=control_code_from_proto(res.control_code)
+            control_code=control_code_from_proto(res.control_code),
+            metadata=dict(res.metadata),
         )
 
     def _streaming_request(self, method, batch_data, _streams_, _timeout_):
@@ -116,7 +119,8 @@ class GrpcServerModelProxy(ServerModelProxy):
         ins = server_model_pb2.BatchData(
             method=method,
             data=to_grpc_format(batch_data.data),
-            control_code=control_code_to_proto(batch_data.control_code)
+            control_code=control_code_to_proto(batch_data.control_code),
+            metadata=batch_data.metadata,
         )
         self.request_queue.put(ins)
 
@@ -128,14 +132,16 @@ class GrpcServerModelProxy(ServerModelProxy):
         ins = server_model_pb2.BatchData(
             method=method,
             data=to_grpc_format(batch_data.data),
-            control_code=control_code_to_proto(batch_data.control_code)
+            control_code=control_code_to_proto(batch_data.control_code),
+            metadata=batch_data.metadata,
         )
         self.request_queue.put(ins)
         def get_future_fuction():
             res = next(self.response_stream)
             batch_data = BatchData(
                 data=from_grpc_format(res.data),
-                control_code=control_code_from_proto(res.control_code)
+                control_code=control_code_from_proto(res.control_code),
+                metadata=dict(res.metadata),
             )
             return self._parse_response_args(batch_data)
 

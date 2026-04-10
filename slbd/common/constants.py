@@ -1,1 +1,6 @@
 CLIENT_ID_CONFIG_KEY = "__hidden_client_id__"
+AUTOSPLIT_PLAN_ID_CONFIG_KEY = "__autosplit_plan_id__"
+AUTOSPLIT_STAGE_COUNT_CONFIG_KEY = "__autosplit_stage_count__"
+AUTOSPLIT_CLIENT_STAGE_COUNT_CONFIG_KEY = "__autosplit_client_stage_count__"
+AUTOSPLIT_STAGE_TO_WORKER_CONFIG_KEY = "__autosplit_stage_to_worker__"
+AUTOSPLIT_CUTOFFS_CONFIG_KEY = "__autosplit_cutoffs__"

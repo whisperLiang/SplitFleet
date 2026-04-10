@@ -20,6 +20,7 @@ from flwr.server.superlink.fleet.grpc_bidi.grpc_server import valid_certificates
 
 from slbd.server.grpc.flower_servicer import FlowerServiceServicer
 from slbd.server.server_model.manager import ServerModelManager, GrpcServerModelManager
+from slbd.server.stage_runtime.manager import StageRuntimeManager
 from slbd.server.strategy import Strategy
 from slbd.server.grpc.servicer import ServerModelServicer
 from slbd.server.server import Server
@@ -47,9 +48,22 @@ def init_defaults(
         if client_manager is None:
             client_manager = SimpleClientManager()
 
-        server_model_manager = GrpcServerModelManager(
-            init_server_model_fn=strategy.init_server_model_fn,
-        )
+        if getattr(strategy, "uses_stage_runtime", False):
+            server_model_manager = StageRuntimeManager(
+                init_server_model_fn=strategy.init_server_model_fn,
+            )
+            if hasattr(strategy, "bind_stage_runtime_manager"):
+                strategy.bind_stage_runtime_manager(server_model_manager)
+            for worker_spec in getattr(strategy, "worker_specs", []):
+                server_model_manager.register_worker(worker_spec)
+            if hasattr(strategy, "get_or_create_placement_plan"):
+                server_model_manager.set_placement_plan(
+                    strategy.get_or_create_placement_plan()
+                )
+        else:
+            server_model_manager = GrpcServerModelManager(
+                init_server_model_fn=strategy.init_server_model_fn,
+            )
 
         server = Server(
             client_manager=client_manager,

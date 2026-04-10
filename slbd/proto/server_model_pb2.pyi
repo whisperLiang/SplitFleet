@@ -20,7 +20,7 @@ ERROR_PROCESSING_STREAM: ControlCode
 INIT_STREAM: ControlCode
 
 class BatchData(_message.Message):
-    __slots__ = ("method", "data", "control_code", "cid")
+    __slots__ = ("method", "data", "control_code", "cid", "metadata")
     class DataEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -28,15 +28,24 @@ class BatchData(_message.Message):
         key: str
         value: ByteTensor
         def __init__(self, key: _Optional[str] = ..., value: _Optional[_Union[ByteTensor, _Mapping]] = ...) -> None: ...
+    class MetadataEntry(_message.Message):
+        __slots__ = ("key", "value")
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: str
+        value: str
+        def __init__(self, key: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...
     METHOD_FIELD_NUMBER: _ClassVar[int]
     DATA_FIELD_NUMBER: _ClassVar[int]
     CONTROL_CODE_FIELD_NUMBER: _ClassVar[int]
     CID_FIELD_NUMBER: _ClassVar[int]
+    METADATA_FIELD_NUMBER: _ClassVar[int]
     method: str
     data: _containers.MessageMap[str, ByteTensor]
     control_code: ControlCode
     cid: str
-    def __init__(self, method: _Optional[str] = ..., data: _Optional[_Mapping[str, ByteTensor]] = ..., control_code: _Optional[_Union[ControlCode, str]] = ..., cid: _Optional[str] = ...) -> None: ...
+    metadata: _containers.ScalarMap[str, str]
+    def __init__(self, method: _Optional[str] = ..., data: _Optional[_Mapping[str, ByteTensor]] = ..., control_code: _Optional[_Union[ControlCode, str]] = ..., cid: _Optional[str] = ..., metadata: _Optional[_Mapping[str, str]] = ...) -> None: ...
 
 class ByteTensor(_message.Message):
     __slots__ = ("single_tensor", "tensors")

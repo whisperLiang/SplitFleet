@@ -2,7 +2,10 @@
 """Client and server classes corresponding to protobuf-defined services."""
 import grpc
 
-import slbd.proto.server_model_pb2 as server__model__pb2
+try:
+    from slbd.proto import server_model_pb2 as server__model__pb2
+except ImportError:  # pragma: no cover
+    import server_model_pb2 as server__model__pb2
 
 
 class ServerModelStub(object):
