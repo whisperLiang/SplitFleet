@@ -1,16 +1,16 @@
-"""Autosplit IR shared across planning, runtime, and strategies."""
+"""Autosplit types shared across Ariadne planning and strategy code."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-from torchlens.replay_plan import BoundaryPayload, ExecNode, ExecutionPlan
+from ariadne import BoundaryPayload
 
 
 class ReplicaScope(str, Enum):
-    """Supported state-sharing semantics for server-side stages."""
+    """Supported state-sharing semantics for server-side suffix replicas."""
 
     SHARED = "shared"
     PER_CLIENT = "per_client"
@@ -19,7 +19,7 @@ class ReplicaScope(str, Enum):
 
 @dataclass(frozen=True)
 class WorkerSpec:
-    """Describe a worker candidate that can host one or more stages."""
+    """Describe a worker candidate that can host a split side."""
 
     worker_id: str
     address: Optional[str] = None
@@ -32,11 +32,11 @@ class WorkerSpec:
 
 @dataclass(frozen=True)
 class PlacementConstraint:
-    """Hard constraints applied before scoring candidate placements."""
+    """Hard constraints applied before scoring Ariadne prefix/suffix placements."""
 
-    max_stages: int = 3
-    max_frontier_size: int = 4
-    max_candidates: int = 24
+    max_stages: int = 2
+    max_frontier_size: int = 1
+    max_candidates: int = 1
     max_payload_bytes: int = 32 * 1024 * 1024
     max_stage_memory_bytes: Optional[int] = None
     privacy_metric_lower_bound: float = 0.0
@@ -54,52 +54,32 @@ class PlacementObjective:
 
 
 @dataclass
-class PartitionStage:
-    """One ordered stage inside a partition plan."""
-
-    stage_id: str
-    node_indices: List[int]
-    input_indices: List[int]
-    output_indices: List[int]
-    input_labels: List[str]
-    output_labels: List[str]
-    passthrough_input_indices: List[int] = field(default_factory=list)
-    passthrough_input_labels: List[str] = field(default_factory=list)
-    estimated_compute_cost: float = 0.0
-    estimated_activation_bytes: int = 0
-    estimated_parameter_bytes: int = 0
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class PartitionPlan:
-    """Ordered multi-stage partition over one concrete execution plan."""
+class AriadnePlacementPlan:
+    """Concrete two-stage SplitFleet placement backed by Ariadne."""
 
     plan_id: str
-    model_name: str
-    execution_plan: ExecutionPlan
-    stages: List[PartitionStage]
+    split_id: str
     graph_signature: str
+    boundary: str
+    mode: str
+    prefix_worker_id: str
+    suffix_worker_id: str
+    score: float
     metadata: Dict[str, Any] = field(default_factory=dict)
+    worker_specs: Dict[str, WorkerSpec] = field(default_factory=dict)
+    objective: PlacementObjective = field(default_factory=PlacementObjective)
+    constraints: PlacementConstraint = field(default_factory=PlacementConstraint)
 
     @property
     def stage_count(self) -> int:
-        return len(self.stages)
-
-
-@dataclass
-class PlacementPlan:
-    """Concrete worker assignment for a partition plan."""
-
-    partition_plan: PartitionPlan
-    stage_to_worker: Dict[str, str]
-    worker_specs: Dict[str, WorkerSpec]
-    score: float
-    stage_scores: Dict[str, float] = field(default_factory=dict)
-    objective: PlacementObjective = field(default_factory=PlacementObjective)
-    constraints: PlacementConstraint = field(default_factory=PlacementConstraint)
-    metadata: Dict[str, Any] = field(default_factory=dict)
+        return 2
 
     @property
-    def plan_id(self) -> str:
-        return self.partition_plan.plan_id
+    def stage_to_worker(self) -> dict[str, str]:
+        return {
+            "prefix": self.prefix_worker_id,
+            "suffix": self.suffix_worker_id,
+        }
+
+
+PlacementPlan = AriadnePlacementPlan

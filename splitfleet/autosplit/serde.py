@@ -118,14 +118,22 @@ def serialize_plan_descriptor(placement_plan: PlacementPlan) -> bytes:
 
     descriptor = {
         "plan_id": placement_plan.plan_id,
-        "model_name": placement_plan.partition_plan.model_name,
-        "graph_signature": placement_plan.partition_plan.graph_signature,
-        "cutoffs": list(placement_plan.partition_plan.metadata.get("cutoffs", [])),
+        "backend": "ariadne",
+        "graph_signature": placement_plan.graph_signature,
+        "split_id": placement_plan.split_id,
+        "boundary": placement_plan.boundary,
+        "mode": placement_plan.mode,
+        "stage_count": placement_plan.stage_count,
+        "client_stage_count": 1,
         "stage_to_worker": dict(placement_plan.stage_to_worker),
         "score": placement_plan.score,
         "constraints": asdict(placement_plan.constraints),
         "objective": asdict(placement_plan.objective),
-        "metadata": dict(placement_plan.metadata),
+        "metadata": {
+            key: value
+            for key, value in placement_plan.metadata.items()
+            if not key.startswith("_")
+        },
     }
     return json.dumps(descriptor, sort_keys=True).encode("utf-8")
 

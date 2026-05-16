@@ -51,6 +51,7 @@ def init_defaults(
         if getattr(strategy, "uses_stage_runtime", False):
             server_model_manager = StageRuntimeManager(
                 init_server_model_fn=strategy.init_server_model_fn,
+                autosplit_session=getattr(strategy, "autosplit_session", None),
             )
             if hasattr(strategy, "bind_stage_runtime_manager"):
                 strategy.bind_stage_runtime_manager(server_model_manager)

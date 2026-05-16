@@ -2,10 +2,17 @@ from __future__ import annotations
 
 import copy
 
+import pytest
 import torch
 from torch import nn
 
 from splitfleet.autosplit import AutoSplitSession, PlacementConstraint, WorkerSpec
+from splitfleet.client.autosplit_split_client import AutoSplitSplitLearningClient, _model_to_ndarrays
+from splitfleet.common.constants import (
+    AUTOSPLIT_BOUNDARY_CONFIG_KEY,
+    AUTOSPLIT_MODE_CONFIG_KEY,
+    AUTOSPLIT_PLAN_ID_CONFIG_KEY,
+)
 
 
 class BranchNet(nn.Module):
@@ -21,75 +28,108 @@ class BranchNet(nn.Module):
         return self.head(torch.cat([left, right], dim=-1))
 
 
-def mse_loss(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    return torch.nn.functional.mse_loss(prediction, target)
+class BatchNormNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(4, 4, bias=False)
+        self.bn = nn.BatchNorm1d(4)
+        self.fc2 = nn.Linear(4, 2, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc2(self.bn(self.fc1(x)))
 
 
-def _build_workers(count: int) -> list[WorkerSpec]:
-    return [
-        WorkerSpec(worker_id=f"worker-{index}", device="cpu", bandwidth_mbps=500.0)
-        for index in range(count)
-    ]
-
-
-def test_autosplit_eval_matches_direct_forward() -> None:
+def test_ariadne_autosplit_eval_matches_direct_forward() -> None:
     torch.manual_seed(7)
     model = BranchNet().eval()
-    inputs = torch.randn(3, 4)
+    trace_inputs = torch.randn(2, 4)
+    runtime_inputs = torch.randn(3, 4)
     session = AutoSplitSession(device="cpu")
     placement = session.plan(
         model,
-        inputs,
-        worker_specs=_build_workers(3),
-        constraints=PlacementConstraint(max_stages=3, max_candidates=8, max_frontier_size=2),
-        preferred_stage_count=3,
+        trace_inputs,
+        worker_specs=[WorkerSpec(worker_id="coordinator", device="cpu")],
+        constraints=PlacementConstraint(),
+        preferred_stage_count=2,
+        client_stage_count=1,
+        dynamic_batch=(2, 8),
     )
 
-    replayed = session.run_eval(placement, inputs)
-    expected = model(inputs)
+    replayed = session.run_eval(placement, runtime_inputs)
+    expected = model(runtime_inputs)
 
-    assert placement.partition_plan.stage_count == 3
+    assert placement.stage_count == 2
+    assert placement.split_id
     assert torch.allclose(replayed, expected, atol=1e-5, rtol=1e-5)
 
 
-def _assert_parameter_grads_match(lhs: nn.Module, rhs: nn.Module) -> None:
-    for (lhs_name, lhs_param), (rhs_name, rhs_param) in zip(
-        lhs.named_parameters(),
-        rhs.named_parameters(),
-    ):
-        assert lhs_name == rhs_name
-        assert lhs_param.grad is not None
-        assert rhs_param.grad is not None
-        assert torch.allclose(lhs_param.grad, rhs_param.grad, atol=1e-5, rtol=1e-5)
-
-
-def test_autosplit_train_matches_direct_backward_for_three_stages() -> None:
+def test_ariadne_autosplit_train_runs_suffix_and_prefix_backward() -> None:
     torch.manual_seed(13)
-    base_model = BranchNet().train()
-    direct_model = copy.deepcopy(base_model)
-    split_model = copy.deepcopy(base_model)
-    inputs = torch.randn(4, 4)
-    targets = torch.randn(4, 2)
-
-    direct_output = direct_model(inputs)
-    direct_loss = mse_loss(direct_output, targets)
-    direct_loss.backward()
-
+    model = BranchNet().train()
+    inputs = torch.randn(3, 4)
+    targets = torch.randn(3, 2)
     session = AutoSplitSession(device="cpu")
     placement = session.plan(
-        split_model,
-        inputs,
-        worker_specs=_build_workers(3),
-        constraints=PlacementConstraint(max_stages=3, max_candidates=8, max_frontier_size=2),
-        preferred_stage_count=3,
+        model,
+        torch.randn(2, 4),
+        preferred_stage_count=2,
+        client_stage_count=1,
+        dynamic_batch=(2, 8),
     )
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    before = {name: param.detach().clone() for name, param in model.named_parameters()}
+
     result = session.run_train(
         placement,
         inputs,
-        targets=targets,
-        loss_fn=mse_loss,
-        step_optimizer=False,
+        targets,
+        loss_fn=nn.MSELoss(),
+        prefix_optimizer=optimizer,
+        suffix_optimizer=optimizer,
     )
 
-    assert torch.allclose(result["output"], direct_output, atol=1e-5, rtol=1e-5)
-    _assert_parameter_grads_match(direct_model, split_model)
+    assert torch.isfinite(result["loss"])
+    assert result["split_id"] == placement.split_id
+    assert any(
+        not torch.allclose(before[name], param.detach())
+        for name, param in model.named_parameters()
+    )
+
+
+def test_client_prepares_mode_specific_ariadne_runtimes() -> None:
+    torch.manual_seed(31)
+    client = AutoSplitSplitLearningClient(
+        model=BatchNormNet(),
+        train_data=[],
+        sample_inputs=torch.randn(2, 4),
+    )
+    config = {
+        AUTOSPLIT_PLAN_ID_CONFIG_KEY: "mode-sensitive-plan",
+        AUTOSPLIT_BOUNDARY_CONFIG_KEY: "after:fc1",
+        AUTOSPLIT_MODE_CONFIG_KEY: "generated_eager",
+    }
+
+    train_handle = client._prepare_round(_model_to_ndarrays(client.model), config, training=True)
+    train_inputs = torch.randn(3, 4)
+    expected_train = copy.deepcopy(client.model).train()(train_inputs)
+    split_train = train_handle.runtime.run_suffix(train_handle.runtime.run_prefix(train_inputs))
+
+    assert torch.allclose(split_train, expected_train, atol=1e-5, rtol=1e-5)
+
+    eval_handle = client._prepare_round(_model_to_ndarrays(client.model), config, training=False)
+    eval_inputs = torch.randn(3, 4)
+    with torch.no_grad():
+        expected_eval = copy.deepcopy(client.model).eval()(eval_inputs)
+        split_eval = eval_handle.runtime.run_suffix(eval_handle.runtime.run_prefix(eval_inputs))
+
+    assert train_handle is not eval_handle
+    assert torch.allclose(split_eval, expected_eval, atol=1e-5, rtol=1e-5)
+
+
+def test_ariadne_planner_rejects_sample_kwargs() -> None:
+    with pytest.raises(ValueError, match="positional model inputs only"):
+        AutoSplitSession(device="cpu").plan(
+            BranchNet(),
+            torch.randn(2, 4),
+            sample_kwargs={"x": torch.randn(2, 4)},
+        )

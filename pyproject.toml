@@ -16,9 +16,10 @@ classifiers = [
 ]
 
 dependencies = [
-    "flwr~=1.9.0",
-    "torch>=2.4.0",
-    "numpy<2",
+    "flwr>=1.29.0",
+    "ariadne-split==0.1.1",
+    "torch>=2.11.0",
+    "numpy>=2.2.6",
     "pandas>=2.2.0",
     "tqdm>=4.66.0",
     "ipython>=8.18.0",
@@ -35,8 +36,16 @@ dev = [
     "grpcio-tools>=1.62.0",
 ]
 
+integration = [
+    "torchvision>=0.26.0",
+    "timm>=1.0.26",
+    "ultralytics>=8.4.41",
+    "rfdetr>=1.6.5",
+    "transformers>=4.0.0",
+]
+
 [tool.setuptools.packages.find]
-include = ["splitfleet*", "torchlens*", "model_management*"]
+include = ["splitfleet*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

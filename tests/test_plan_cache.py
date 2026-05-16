@@ -26,8 +26,8 @@ def test_cache_entry_matches_full_signature() -> None:
     entry = PlanCacheEntry(
         model_name="Demo",
         graph_signature="graph",
-        cutoffs=[1, 3],
-        stage_to_worker={"stage-a": "worker-0"},
+        boundary="50%",
+        split_id="after:layer",
         score=1.5,
         worker_signature="worker-0",
         constraint_signature=constraints.__dict__,

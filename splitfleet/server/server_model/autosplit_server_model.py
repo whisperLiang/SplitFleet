@@ -79,7 +79,7 @@ class AutoSplitServerModel(NumPyServerModel):
         self.device = device
         self.model = copy.deepcopy(model).to(device)
         self.optimizer = None
-        self.placement_plan = None
+        self.runtime_handle = None
         self.sid = ""
         self.num_examples = 0
         self.loss_total = 0.0
@@ -90,7 +90,7 @@ class AutoSplitServerModel(NumPyServerModel):
 
     def configure_fit(self, parameters, config) -> None:
         _ = config
-        self._configure(parameters=parameters, sid=config.get("sid", ""))
+        self._configure(parameters=parameters, sid=config.get("sid", ""), training=True)
         trainable = [param for param in self.model.parameters() if param.requires_grad]
         if trainable:
             if self.optimizer_fn is not None:
@@ -99,13 +99,11 @@ class AutoSplitServerModel(NumPyServerModel):
                 self.optimizer = torch.optim.SGD(trainable, lr=0.01)
         else:
             self.optimizer = None
-        self.model.train()
 
     def configure_evaluate(self, parameters, config) -> None:
         _ = config
-        self._configure(parameters=parameters, sid=config.get("sid", ""))
+        self._configure(parameters=parameters, sid=config.get("sid", ""), training=False)
         self.optimizer = None
-        self.model.eval()
 
     def get_fit_result(self):
         average_loss = self.loss_total / max(self.num_examples, 1)
@@ -122,11 +120,12 @@ class AutoSplitServerModel(NumPyServerModel):
                 torch_inputs = _to_torch(batch_inputs, device=self.device)
                 torch_targets = _to_torch(batch_targets, device=self.device)
                 result = self.runtime_manager.run_train_plan(
-                    self.placement_plan,
+                    self.runtime_handle,
                     torch_inputs,
                     targets=torch_targets,
                     loss_fn=self.loss_fn,
-                    optimizer=self.optimizer,
+                    prefix_optimizer=self.optimizer,
+                    suffix_optimizer=self.optimizer,
                 )
                 examples = _batch_size(torch_inputs)
                 loss_value = float(result["loss"].detach().cpu())
@@ -148,7 +147,7 @@ class AutoSplitServerModel(NumPyServerModel):
                 torch_inputs = _to_torch(batch_inputs, device=self.device)
                 torch_targets = _to_torch(batch_targets, device=self.device)
                 outputs = self.runtime_manager.run_eval_plan(
-                    self.placement_plan,
+                    self.runtime_handle,
                     torch_inputs,
                 )
                 loss = self.runtime_manager.autosplit_session.compute_loss(
@@ -164,13 +163,17 @@ class AutoSplitServerModel(NumPyServerModel):
                 )
             return responses
 
-    def _configure(self, *, parameters, sid: str) -> None:
+    def _configure(self, *, parameters, sid: str, training: bool) -> None:
         self.sid = sid
         self.num_examples = 0
         self.loss_total = 0.0
         _load_model_from_ndarrays(self.model, parameters)
+        if training:
+            self.model.train()
+        else:
+            self.model.eval()
         plan_suffix = f"{sid or 'shared'}_{uuid.uuid4().hex[:8]}"
-        self.placement_plan = self.runtime_manager.clone_placement_plan(
-            model=self.model,
-            plan_id_suffix=plan_suffix,
+        self.runtime_handle = self.runtime_manager.clone_runtime_for_model(
+            self.model,
+            suffix=plan_suffix,
         )

@@ -36,7 +36,7 @@ class StageWorkerServicer(stage_worker_pb2_grpc.StageWorkerServicer):
             worker_id=self.runtime.worker_spec.worker_id,
             plan_id=placement.plan_id,
             accepted=True,
-            graph_signature=placement.partition_plan.graph_signature,
+            graph_signature=placement.graph_signature,
             message="ok",
         )
 

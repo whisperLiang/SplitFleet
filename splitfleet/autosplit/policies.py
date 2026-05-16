@@ -18,13 +18,13 @@ class PartitionSelectionPolicy:
         if not placements:
             raise ValueError("No placement plans were provided.")
         if self.preferred_stage_count is None:
-            return min(placements, key=lambda plan: (plan.score, plan.partition_plan.stage_count))
+            return min(placements, key=lambda plan: (plan.score, plan.stage_count))
         matching = [
             plan for plan in placements
-            if plan.partition_plan.stage_count == self.preferred_stage_count
+            if plan.stage_count == self.preferred_stage_count
         ]
         pool = matching or list(placements)
-        return min(pool, key=lambda plan: (plan.score, plan.partition_plan.stage_count))
+        return min(pool, key=lambda plan: (plan.score, plan.stage_count))
 
 
 @dataclass(frozen=True)

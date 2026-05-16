@@ -1,28 +1,31 @@
-"""Worker-side runtime for stage-level autosplit execution."""
+"""Compatibility worker runtime for removed node-level stage execution."""
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-from splitfleet.autosplit.planner import build_partition_plan
-from splitfleet.autosplit.runtime import AutoSplitSession, StageBackwardResult, StageForwardResult, StageTrace
-from splitfleet.autosplit.serde import load_model_state
-from splitfleet.autosplit.types import PlacementPlan, WorkerSpec
+from splitfleet.autosplit.runtime import AutoSplitSession
+from splitfleet.autosplit.types import AriadnePlacementPlan, WorkerSpec
+
+
+REMOTE_STAGE_ERROR = (
+    "Ariadne backend currently supports coordinator-local suffix execution only; "
+    "old node-level remote stage execution has been removed."
+)
 
 
 @dataclass
 class RegisteredPlacement:
-    """Worker-local placement metadata."""
+    """Worker-local Ariadne placement metadata."""
 
     descriptor: Dict[str, Any]
-    placement_plan: PlacementPlan
+    placement_plan: AriadnePlacementPlan
     model: Any
 
 
 class StageWorkerRuntime:
-    """Stateful worker runtime that executes individual autosplit stages."""
+    """Remote node-level workers are no longer part of the Ariadne backend."""
 
     def __init__(
         self,
@@ -38,118 +41,42 @@ class StageWorkerRuntime:
         self.sample_inputs = sample_inputs
         self.sample_kwargs = dict(sample_kwargs or {})
         self.autosplit_session = autosplit_session or AutoSplitSession(device=worker_spec.device)
-        self._execution_plan = None
         self._placements: Dict[str, RegisteredPlacement] = {}
-        self._stage_traces: Dict[str, Dict[str, StageTrace]] = {}
-
-    def _ensure_execution_plan(self):
-        if self._execution_plan is None:
-            traced = self.autosplit_session.planner.tracer.trace(
-                self.model,
-                self.sample_inputs,
-                sample_kwargs=self.sample_kwargs or None,
-            )
-            self._execution_plan = traced.execution_plan
-        self._execution_plan.set_model(self.model)
-        return self._execution_plan
 
     def register_plan(
         self,
         descriptor: Dict[str, Any],
         *,
         model_state: bytes = b"",
-    ) -> PlacementPlan:
-        existing = self._placements.get(descriptor["plan_id"])
-        if existing is not None:
-            plan_model = existing.model
-            if model_state:
-                load_model_state(plan_model, model_state, map_location=self.worker_spec.device)
-            plan_model.zero_grad(set_to_none=True)
-            self._placements[descriptor["plan_id"]] = RegisteredPlacement(
-                descriptor=descriptor,
-                placement_plan=existing.placement_plan,
-                model=plan_model,
-            )
-            return existing.placement_plan
-
-        plan_model = copy.deepcopy(self.model).to(self.worker_spec.device)
-        if model_state:
-            load_model_state(plan_model, model_state, map_location=self.worker_spec.device)
-        plan_model.zero_grad(set_to_none=True)
-
-        execution_plan = copy.copy(self._ensure_execution_plan())
-        execution_plan.set_model(plan_model)
-        expected_signature = descriptor.get("graph_signature")
-        if expected_signature and execution_plan.graph_signature != expected_signature:
-            raise ValueError(
-                "Worker graph signature mismatch: "
-                f"{execution_plan.graph_signature} != {expected_signature}"
-            )
-
-        partition_plan = build_partition_plan(
-            execution_plan,
-            descriptor.get("cutoffs", []),
-            model_name=descriptor.get("model_name") or execution_plan.model_name,
-        )
-        placement_plan = PlacementPlan(
-            partition_plan=partition_plan,
-            stage_to_worker=dict(descriptor.get("stage_to_worker", {})),
-            worker_specs={self.worker_spec.worker_id: self.worker_spec},
+    ) -> AriadnePlacementPlan:
+        _ = model_state
+        placement_plan = AriadnePlacementPlan(
+            plan_id=str(descriptor["plan_id"]),
+            split_id=str(descriptor.get("split_id", "")),
+            graph_signature=str(descriptor.get("graph_signature", "")),
+            boundary=str(descriptor.get("boundary", "50%")),
+            mode=str(descriptor.get("mode", "generated_eager")),
+            prefix_worker_id="client",
+            suffix_worker_id=self.worker_spec.worker_id,
             score=float(descriptor.get("score", 0.0)),
             metadata=dict(descriptor.get("metadata", {})),
+            worker_specs={self.worker_spec.worker_id: self.worker_spec},
         )
-        self._placements[descriptor["plan_id"]] = RegisteredPlacement(
+        self._placements[placement_plan.plan_id] = RegisteredPlacement(
             descriptor=descriptor,
             placement_plan=placement_plan,
-            model=plan_model,
+            model=self.model,
         )
         return placement_plan
 
-    def execute_stage(
-        self,
-        *,
-        plan_id: str,
-        stage_id: str,
-        execution_id: str,
-        seeded_values: Dict[int, Any],
-        differentiable: bool,
-        detach_boundary: bool,
-    ) -> StageForwardResult:
-        placement_plan = self._placements[plan_id].placement_plan
-        stage = next(
-            stage
-            for stage in placement_plan.partition_plan.stages
-            if stage.stage_id == stage_id
-        )
-        stage_trace, result = self.autosplit_session.run_stage_forward(
-            placement_plan,
-            stage,
-            seeded_values,
-            differentiable=differentiable,
-            detach_boundary=detach_boundary,
-            output_indices=self.autosplit_session.get_output_indices(placement_plan),
-        )
-        self._stage_traces.setdefault(execution_id, {})[stage_id] = stage_trace
-        return result
+    def execute_stage(self, *args, **kwargs):
+        _ = (args, kwargs)
+        raise NotImplementedError(REMOTE_STAGE_ERROR)
 
-    def backward_stage(
-        self,
-        *,
-        plan_id: str,
-        stage_id: str,
-        execution_id: str,
-        upstream_grads: Dict[int, Any],
-    ) -> StageBackwardResult:
-        placement_plan = self._placements[plan_id].placement_plan
-        stage_trace = self._stage_traces.get(execution_id, {}).pop(stage_id)
-        result = self.autosplit_session.run_stage_backward(
-            placement_plan,
-            stage_trace,
-            upstream_grads,
-        )
-        if execution_id in self._stage_traces and not self._stage_traces[execution_id]:
-            self._stage_traces.pop(execution_id, None)
-        return result
+    def backward_stage(self, *args, **kwargs):
+        _ = (args, kwargs)
+        raise NotImplementedError(REMOTE_STAGE_ERROR)
 
     def clear_execution(self, execution_id: str) -> bool:
-        return self._stage_traces.pop(execution_id, None) is not None
+        _ = execution_id
+        return False

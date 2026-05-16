@@ -27,8 +27,8 @@ class PlanCacheEntry:
 
     model_name: str
     graph_signature: str
-    cutoffs: list[int]
-    stage_to_worker: Dict[str, str]
+    boundary: str
+    split_id: str
     score: float
     worker_signature: str
     constraint_signature: Dict[str, Any]
@@ -60,11 +60,8 @@ class PlanCacheEntry:
         return cls(
             model_name=str(payload["model_name"]),
             graph_signature=str(payload["graph_signature"]),
-            cutoffs=[int(value) for value in payload.get("cutoffs", [])],
-            stage_to_worker={
-                str(stage_id): str(worker_id)
-                for stage_id, worker_id in dict(payload.get("stage_to_worker", {})).items()
-            },
+            boundary=str(payload.get("boundary", "50%")),
+            split_id=str(payload.get("split_id", "")),
             score=float(payload.get("score", 0.0)),
             worker_signature=str(payload.get("worker_signature", "")),
             constraint_signature=dict(payload.get("constraint_signature", {})),

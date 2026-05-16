@@ -1,8 +1,7 @@
-"""Autosplit-aware strategy facade built on top of PlainSlStrategy."""
+"""Ariadne autosplit-aware strategy facade built on top of PlainSlStrategy."""
 
 from __future__ import annotations
 
-import json
 from logging import ERROR
 from typing import Any, Dict, Optional, Sequence
 
@@ -21,15 +20,20 @@ from splitfleet.autosplit import (
     ReplicaScopePolicy,
     WorkerSpec,
 )
+from splitfleet.autosplit.planner import validate_ariadne_stage_counts
 from splitfleet.common.constants import (
+    AUTOSPLIT_BACKEND_CONFIG_KEY,
+    AUTOSPLIT_BACKEND_VALUE_ARIADNE,
+    AUTOSPLIT_BOUNDARY_CONFIG_KEY,
     AUTOSPLIT_CLIENT_STAGE_COUNT_CONFIG_KEY,
-    AUTOSPLIT_CUTOFFS_CONFIG_KEY,
+    AUTOSPLIT_GRAPH_SIGNATURE_CONFIG_KEY,
+    AUTOSPLIT_MODE_CONFIG_KEY,
     AUTOSPLIT_PLAN_ID_CONFIG_KEY,
+    AUTOSPLIT_SPLIT_ID_CONFIG_KEY,
     AUTOSPLIT_STAGE_COUNT_CONFIG_KEY,
-    AUTOSPLIT_STAGE_TO_WORKER_CONFIG_KEY,
 )
+from splitfleet.server.server_model.ariadne_tail_server_model import AriadneTailServerModel
 from splitfleet.server.server_model.autosplit_server_model import AutoSplitServerModel
-from splitfleet.server.server_model.autosplit_tail_server_model import AutoSplitTailServerModel
 from splitfleet.server.strategy.plain_strategy import PlainSlStrategy
 
 
@@ -57,7 +61,7 @@ def _coerce_aggregation_policy(
 
 
 class AutoSplitStrategy(PlainSlStrategy):
-    """Strategy that computes and propagates autosplit placement metadata."""
+    """Strategy that computes and propagates Ariadne split metadata."""
 
     uses_stage_runtime = True
 
@@ -76,17 +80,25 @@ class AutoSplitStrategy(PlainSlStrategy):
         replica_scope_policy: Optional[ReplicaScopePolicy | ReplicaScope | str] = None,
         execution_schedule_policy: Optional[ExecutionSchedulePolicy] = None,
         aggregation_policy: Optional[AggregationPolicy | str] = None,
-        preferred_stage_count: Optional[int] = None,
-        client_stage_count: int = 0,
+        preferred_stage_count: Optional[int] = 2,
+        client_stage_count: int = 1,
+        boundary: str = "50%",
+        mode: str = "generated_eager",
         loss_fn=None,
         optimizer_fn=None,
         runtime_device: str = "cpu",
         **kwargs,
     ) -> None:
+        if sample_kwargs:
+            raise ValueError("Ariadne backend currently accepts positional model inputs only.")
+        validate_ariadne_stage_counts(
+            preferred_stage_count=preferred_stage_count,
+            client_stage_count=client_stage_count,
+        )
         self.model = model
         self.sample_inputs = sample_inputs
-        self.sample_kwargs = dict(sample_kwargs or {})
-        self.worker_specs = list(worker_specs or [WorkerSpec(worker_id="local", device="cpu")])
+        self.sample_kwargs = {}
+        self.worker_specs = list(worker_specs or [WorkerSpec(worker_id="coordinator", device="cpu")])
         self.autosplit_session = autosplit_session or AutoSplitSession(
             planner=planner or AutoSplitPlanner()
         )
@@ -110,20 +122,14 @@ class AutoSplitStrategy(PlainSlStrategy):
                 "SplitFed aggregation requires `ReplicaScope.PER_CLIENT` server replicas."
             )
         self.execution_schedule_policy = execution_schedule_policy or ExecutionSchedulePolicy()
-        self.client_stage_count = max(0, int(client_stage_count))
+        self.client_stage_count = int(client_stage_count)
+        self.boundary = boundary
+        self.mode = mode
         self.loss_fn = loss_fn
         self.optimizer_fn = optimizer_fn
         self.runtime_device = runtime_device
         self._placement_plan = None
         self._runtime_manager = None
-
-        if (
-            self.client_stage_count > 0
-            and self.partition_selection_policy.preferred_stage_count is None
-        ):
-            self.partition_selection_policy = PartitionSelectionPolicy(
-                preferred_stage_count=max(2, self.client_stage_count + 1)
-            )
 
         init_server_model_fn = kwargs.pop("init_server_model_fn", None) or self._make_server_model
         super().__init__(
@@ -135,11 +141,11 @@ class AutoSplitStrategy(PlainSlStrategy):
 
     def bind_stage_runtime_manager(self, runtime_manager) -> None:
         self._runtime_manager = runtime_manager
+        if self._placement_plan is not None:
+            runtime_manager.set_placement_plan(self._placement_plan)
 
     def initialize_parameters(self, client_manager):
         _ = client_manager
-        if self.client_stage_count <= 0:
-            return ndarrays_to_parameters([])
         return ndarrays_to_parameters(
             [tensor.detach().cpu().numpy() for tensor in self.model.state_dict().values()]
         )
@@ -152,71 +158,33 @@ class AutoSplitStrategy(PlainSlStrategy):
             self._placement_plan = self.autosplit_session.plan(
                 self.model,
                 self.sample_inputs,
-                sample_kwargs=self.sample_kwargs or None,
                 worker_specs=self.worker_specs,
                 constraints=self.constraints,
                 objective=self.objective,
                 preferred_stage_count=self.partition_selection_policy.preferred_stage_count,
+                client_stage_count=self.client_stage_count,
                 model_name=self.model.__class__.__name__,
+                boundary=self.boundary,
+                mode=self.mode,
+                trainable=True,
             )
-            if self.client_stage_count > 0 and not self._tail_is_trainable(self._placement_plan):
-                self._placement_plan = self._select_client_split_compatible_plan()
-            if self._placement_plan.partition_plan.stage_count <= self.client_stage_count:
-                raise RuntimeError(
-                    "Autosplit planned too few stages for the requested client-local prefix. "
-                    f"stage_count={self._placement_plan.partition_plan.stage_count}, "
-                    f"client_stage_count={self.client_stage_count}"
-                )
+            if self._runtime_manager is not None:
+                self._runtime_manager.set_placement_plan(self._placement_plan)
         return self._placement_plan
-
-    def _tail_is_trainable(self, placement_plan) -> bool:
-        tail_stages = placement_plan.partition_plan.stages[self.client_stage_count :]
-        return any(stage.estimated_parameter_bytes > 0 for stage in tail_stages)
-
-    def _select_client_split_compatible_plan(self):
-        traced = self.autosplit_session.planner.tracer.trace(
-            self.model,
-            self.sample_inputs,
-            sample_kwargs=self.sample_kwargs or None,
-        )
-        partition_plans = self.autosplit_session.planner.enumerate_partition_plans(
-            traced,
-            constraints=self.constraints,
-            preferred_stage_count=self.partition_selection_policy.preferred_stage_count,
-        )
-        placements = []
-        for partition_plan in partition_plans:
-            placement = self.autosplit_session.planner.place_partition_plan(
-                partition_plan,
-                self.worker_specs,
-                constraints=self.constraints,
-                objective=self.objective,
-            )
-            if placement is None:
-                continue
-            if placement.partition_plan.stage_count <= self.client_stage_count:
-                continue
-            if not self._tail_is_trainable(placement):
-                continue
-            placements.append(placement)
-        if not placements:
-            raise RuntimeError(
-                "No autosplit placement keeps a trainable tail for the requested client prefix."
-            )
-        return self.partition_selection_policy.choose(placements)
 
     def _make_server_model(self):
         if self._runtime_manager is None:
             raise RuntimeError(
                 "AutoSplitStrategy has not been bound to a StageRuntimeManager yet."
             )
-        if self.client_stage_count > 0:
-            return AutoSplitTailServerModel(
+        if self.client_stage_count == 1:
+            return AriadneTailServerModel(
                 runtime_manager=self._runtime_manager,
                 model=self.model,
                 optimizer_fn=self.optimizer_fn,
                 loss_fn=self.loss_fn,
-                client_stage_count=self.client_stage_count,
+                boundary=self.boundary,
+                mode=self.mode,
                 device=self.runtime_device,
             )
         return AutoSplitServerModel(
@@ -230,14 +198,14 @@ class AutoSplitStrategy(PlainSlStrategy):
     def _autosplit_config(self) -> Dict[str, Any]:
         placement = self.get_or_create_placement_plan()
         return {
+            AUTOSPLIT_BACKEND_CONFIG_KEY: AUTOSPLIT_BACKEND_VALUE_ARIADNE,
             AUTOSPLIT_PLAN_ID_CONFIG_KEY: placement.plan_id,
-            AUTOSPLIT_STAGE_COUNT_CONFIG_KEY: placement.partition_plan.stage_count,
-            AUTOSPLIT_CLIENT_STAGE_COUNT_CONFIG_KEY: self.client_stage_count,
-            AUTOSPLIT_STAGE_TO_WORKER_CONFIG_KEY: json.dumps(placement.stage_to_worker, sort_keys=True),
-            AUTOSPLIT_CUTOFFS_CONFIG_KEY: json.dumps(
-                placement.partition_plan.metadata.get("cutoffs", []),
-                sort_keys=True,
-            ),
+            AUTOSPLIT_SPLIT_ID_CONFIG_KEY: placement.split_id,
+            AUTOSPLIT_GRAPH_SIGNATURE_CONFIG_KEY: placement.graph_signature,
+            AUTOSPLIT_BOUNDARY_CONFIG_KEY: placement.boundary,
+            AUTOSPLIT_MODE_CONFIG_KEY: placement.mode,
+            AUTOSPLIT_STAGE_COUNT_CONFIG_KEY: 2,
+            AUTOSPLIT_CLIENT_STAGE_COUNT_CONFIG_KEY: 1,
         }
 
     def configure_fit(self, server_round, parameters, client_manager):
