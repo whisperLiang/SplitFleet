@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import time
 from collections import OrderedDict
 from typing import Any, Callable, Iterable, Optional
 
@@ -106,6 +107,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
         return _model_to_ndarrays(self.model)
 
     def fit(self, parameters, config):
+        fit_start = time.perf_counter()
         runtime_handle = self._prepare_round(parameters, config, training=True)
         prefix_optimizer = self._build_optimizer()
 
@@ -138,9 +140,12 @@ class AutoSplitSplitLearningClient(NumPyClient):
             num_examples += batch_examples
             weighted_loss += batch_loss * batch_examples
 
-        metrics = {}
-        if num_examples > 0:
-            metrics["loss"] = weighted_loss / num_examples
+        average_loss = weighted_loss / max(num_examples, 1)
+        metrics = {
+            "loss": average_loss,
+            "fit_duration_sec": time.perf_counter() - fit_start,
+            "num_examples": num_examples,
+        }
         return _model_to_ndarrays(self.model), num_examples, metrics
 
     def evaluate(self, parameters, config):

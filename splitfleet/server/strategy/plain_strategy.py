@@ -108,13 +108,30 @@ class PlainSlStrategy(Strategy):
         sample_size, min_num_clients = self.num_fit_clients(
             client_manager.num_available()
         )
-        clients = client_manager.sample(
-            num_clients=sample_size, min_num_clients=min_num_clients
+        clients = self.select_fit_clients(
+            server_round=server_round,
+            client_manager=client_manager,
+            sample_size=sample_size,
+            min_num_clients=min_num_clients,
         )
         self._round_active_clients = [client.cid for client in clients]
 
         # Return client/config pairs
         return [(client, copy.deepcopy(fit_ins)) for client in clients]
+
+    def select_fit_clients(
+        self,
+        *,
+        server_round: int,
+        client_manager: ClientManager,
+        sample_size: int,
+        min_num_clients: int,
+    ) -> List[ClientProxy]:
+        _ = server_round
+        return client_manager.sample(
+            num_clients=sample_size,
+            min_num_clients=min_num_clients,
+        )
 
     def configure_server_fit(
         self,

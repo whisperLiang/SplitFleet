@@ -6,6 +6,7 @@ from logging import ERROR
 from typing import Any, Dict, Optional, Sequence
 
 from flwr.common import log, ndarrays_to_parameters, parameters_to_ndarrays
+from flwr.server.client_manager import ClientManager
 from flwr.server.strategy.aggregate import aggregate
 
 from splitfleet.autosplit import (
@@ -19,6 +20,12 @@ from splitfleet.autosplit import (
     ReplicaScope,
     ReplicaScopePolicy,
     WorkerSpec,
+)
+from splitfleet.server.client_selection import (
+    ClientSelector,
+    OortSelector,
+    OortSelectorConfig,
+    RandomSelector,
 )
 from splitfleet.autosplit.planner import validate_ariadne_stage_counts
 from splitfleet.common.constants import (
@@ -87,6 +94,9 @@ class AutoSplitStrategy(PlainSlStrategy):
         loss_fn=None,
         optimizer_fn=None,
         runtime_device: str = "cpu",
+        client_selection: str | None = "flower_default",
+        client_selector: Optional[ClientSelector] = None,
+        oort_config: Optional[OortSelectorConfig] = None,
         **kwargs,
     ) -> None:
         if sample_kwargs:
@@ -130,6 +140,12 @@ class AutoSplitStrategy(PlainSlStrategy):
         self.runtime_device = runtime_device
         self._placement_plan = None
         self._runtime_manager = None
+        self.client_selector = self._make_client_selector(
+            client_selection=client_selection,
+            client_selector=client_selector,
+            oort_config=oort_config,
+        )
+        self._last_selection_result = None
 
         init_server_model_fn = kwargs.pop("init_server_model_fn", None) or self._make_server_model
         super().__init__(
@@ -138,6 +154,27 @@ class AutoSplitStrategy(PlainSlStrategy):
             process_clients_as_batch=self.execution_schedule_policy.should_batch(),
             **kwargs,
         )
+
+    @staticmethod
+    def _make_client_selector(
+        *,
+        client_selection: str | None,
+        client_selector: Optional[ClientSelector],
+        oort_config: Optional[OortSelectorConfig],
+    ) -> Optional[ClientSelector]:
+        if client_selector is not None:
+            return client_selector
+        if client_selection is None:
+            return None
+        normalized = str(client_selection).strip().lower()
+        if normalized in ("flower_default", "default"):
+            return None
+        if normalized == "oort":
+            return OortSelector(oort_config or OortSelectorConfig())
+        if normalized == "random":
+            seed = oort_config.seed if oort_config is not None else 233
+            return RandomSelector(seed=seed)
+        raise ValueError(f"Unsupported client_selection: {client_selection!r}")
 
     def bind_stage_runtime_manager(self, runtime_manager) -> None:
         self._runtime_manager = runtime_manager
@@ -215,6 +252,65 @@ class AutoSplitStrategy(PlainSlStrategy):
             fit_ins.config.update(autosplit_config)
         return instructions
 
+    def select_fit_clients(
+        self,
+        *,
+        server_round: int,
+        client_manager: ClientManager,
+        sample_size: int,
+        min_num_clients: int,
+    ):
+        if self.client_selector is None:
+            return super().select_fit_clients(
+                server_round=server_round,
+                client_manager=client_manager,
+                sample_size=sample_size,
+                min_num_clients=min_num_clients,
+            )
+
+        try:
+            available_clients = client_manager.all()
+        except (AttributeError, NotImplementedError):
+            return super().select_fit_clients(
+                server_round=server_round,
+                client_manager=client_manager,
+                sample_size=sample_size,
+                min_num_clients=min_num_clients,
+            )
+        client_map = self._normalize_client_map(available_clients)
+        candidate_cids = list(client_map)
+        if len(candidate_cids) < min_num_clients:
+            return super().select_fit_clients(
+                server_round=server_round,
+                client_manager=client_manager,
+                sample_size=sample_size,
+                min_num_clients=min_num_clients,
+            )
+
+        result = self.client_selector.select(
+            round_id=server_round,
+            candidate_cids=candidate_cids,
+            num_clients=sample_size,
+        )
+        self._last_selection_result = result
+        clients = [
+            client_map[cid]
+            for cid in result.selected_cids
+            if cid in client_map
+        ]
+        self._round_active_clients = [client.cid for client in clients]
+        return clients
+
+    @staticmethod
+    def _normalize_client_map(available_clients):
+        if isinstance(available_clients, dict):
+            return {str(cid): client for cid, client in available_clients.items()}
+        return {
+            str(client.cid): client
+            for client in available_clients
+            if hasattr(client, "cid")
+        }
+
     def configure_evaluate(self, server_round, parameters, client_manager):
         instructions = super().configure_evaluate(server_round, parameters, client_manager)
         autosplit_config = self._autosplit_config()
@@ -239,7 +335,8 @@ class AutoSplitStrategy(PlainSlStrategy):
         return server_configs
 
     def aggregate_fit(self, server_round, results, failures):
-        _ = server_round
+        if self.client_selector is not None:
+            self._update_client_selector_after_fit(server_round, results, failures)
         self.requests_state = {}
         self._round_active_clients = []
         for failure in failures:
@@ -262,6 +359,40 @@ class AutoSplitStrategy(PlainSlStrategy):
             fit_metrics = [(res.num_examples, res.metrics) for _, res in results]
             aggregated_metrics = self.fit_metrics_aggregation_fn(fit_metrics)
         return parameters_aggregated, aggregated_metrics
+
+    def _update_client_selector_after_fit(self, server_round, results, failures) -> None:
+        for client, fit_res in results:
+            cid = getattr(client, "cid", None)
+            if cid is None:
+                continue
+            metrics = dict(fit_res.metrics or {})
+            metrics.setdefault("num_examples", fit_res.num_examples)
+            self.client_selector.update_after_fit(
+                round_id=server_round,
+                cid=str(cid),
+                num_examples=fit_res.num_examples,
+                metrics=metrics,
+            )
+        for failure in failures:
+            cid = self._failure_cid(failure)
+            if cid is None:
+                continue
+            self.client_selector.update_after_failure(
+                round_id=server_round,
+                cid=cid,
+                reason=failure,
+            )
+
+    @staticmethod
+    def _failure_cid(failure) -> str | None:
+        if isinstance(failure, tuple) and failure:
+            cid = getattr(failure[0], "cid", None)
+            return str(cid) if cid is not None else None
+        for attr in ("cid", "client_id"):
+            cid = getattr(failure, attr, None)
+            if cid is not None:
+                return str(cid)
+        return None
 
     def aggregate_server_fit(self, server_round, results):
         _ = server_round
