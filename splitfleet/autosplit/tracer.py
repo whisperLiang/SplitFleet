@@ -1,4 +1,4 @@
-"""Ariadne owns tracing for the current autosplit backend."""
+"""TorchLens owns tracing for the current autosplit backend."""
 
 from __future__ import annotations
 

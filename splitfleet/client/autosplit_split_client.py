@@ -1,4 +1,4 @@
-"""Client-side Ariadne split-learning adapter with local prefix execution."""
+"""Client-side TorchLens split-learning adapter with local prefix execution."""
 
 from __future__ import annotations
 
@@ -10,13 +10,13 @@ from typing import Any, Callable, Iterable, Optional
 import numpy as np
 import torch
 
-from splitfleet.autosplit import AutoSplitSession, AriadneRuntimeHandle, normalize_inputs
+from splitfleet.autosplit import AutoSplitSession, SplitRuntimeHandle, normalize_inputs
 from splitfleet.autosplit.serde import dumps_torch_object, loads_torch_object
 from splitfleet.client.numpy_client import NumPyClient
 from splitfleet.common import BatchData, ControlCode
 from splitfleet.common.constants import (
     AUTOSPLIT_BACKEND_CONFIG_KEY,
-    AUTOSPLIT_BACKEND_VALUE_ARIADNE,
+    AUTOSPLIT_BACKEND_VALUE_TORCHLENS,
     AUTOSPLIT_BOUNDARY_CONFIG_KEY,
     AUTOSPLIT_CLIENT_STAGE_COUNT_CONFIG_KEY,
     AUTOSPLIT_GRAPH_SIGNATURE_CONFIG_KEY,
@@ -36,7 +36,7 @@ def _load_model_from_ndarrays(model: torch.nn.Module, ndarrays: list[np.ndarray]
     state_dict = model.state_dict()
     if len(state_dict) != len(ndarrays):
         raise ValueError(
-            "Ariadne split client parameter mismatch: "
+            "TorchLens split client parameter mismatch: "
             f"expected {len(state_dict)} tensors, received {len(ndarrays)}."
         )
     loaded_state = OrderedDict()
@@ -75,7 +75,7 @@ def _batch_size(value: Any) -> int:
 
 
 class AutoSplitSplitLearningClient(NumPyClient):
-    """Run an Ariadne prefix locally and delegate suffix work to the server model."""
+    """Run a TorchLens prefix locally and delegate suffix work to the server model."""
 
     def __init__(
         self,
@@ -91,7 +91,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
         device: str = "cpu",
     ) -> None:
         if sample_kwargs:
-            raise ValueError("Ariadne backend currently accepts positional model inputs only.")
+            raise ValueError("TorchLens autosplit backend accepts positional model inputs only.")
         self.model = copy.deepcopy(model).to(device)
         self.train_data = train_data
         self.evaluate_data = evaluate_data if evaluate_data is not None else train_data
@@ -100,7 +100,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
         self.optimizer_fn = optimizer_fn
         self.autosplit_session = autosplit_session or AutoSplitSession(device=device)
         self.device = device
-        self._runtime_cache: dict[str, AriadneRuntimeHandle] = {}
+        self._runtime_cache: dict[str, SplitRuntimeHandle] = {}
 
     def get_parameters(self, config):
         _ = config
@@ -122,14 +122,17 @@ class AutoSplitSplitLearningClient(NumPyClient):
             if prefix_optimizer is not None:
                 prefix_optimizer.zero_grad(set_to_none=True)
 
-            boundary = runtime_handle.runtime.run_training_prefix(*normalize_inputs(torch_inputs))
+            boundary = runtime_handle.backend.run_prefix(
+                *normalize_inputs(torch_inputs),
+                training=True,
+            )
             response = self._call_tail(
                 method_name="train_tail",
                 boundary=boundary,
                 targets=torch_targets,
                 num_examples=_batch_size(torch_inputs),
             )
-            runtime_handle.runtime.backward_prefix(
+            runtime_handle.backend.backward_prefix(
                 boundary,
                 boundary_grads=response["boundary_grads"],
                 optimizer=prefix_optimizer,
@@ -158,7 +161,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
                 inputs, targets = self.batch_adapter(batch)
                 torch_inputs = _move_to_device(inputs, self.device)
                 torch_targets = _move_to_device(targets, self.device)
-                boundary = runtime_handle.runtime.run_prefix(*normalize_inputs(torch_inputs))
+                boundary = runtime_handle.backend.run_prefix(*normalize_inputs(torch_inputs))
                 response = self._call_tail(
                     method_name="evaluate_tail",
                     boundary=boundary,
@@ -173,13 +176,13 @@ class AutoSplitSplitLearningClient(NumPyClient):
         average_loss = weighted_loss / max(num_examples, 1)
         return float(average_loss), num_examples, {"loss": average_loss}
 
-    def _prepare_round(self, parameters, config, *, training: bool) -> AriadneRuntimeHandle:
-        if config.get(AUTOSPLIT_BACKEND_CONFIG_KEY) not in (None, AUTOSPLIT_BACKEND_VALUE_ARIADNE):
-            raise ValueError("AutoSplitSplitLearningClient only supports the Ariadne backend.")
+    def _prepare_round(self, parameters, config, *, training: bool) -> SplitRuntimeHandle:
+        if config.get(AUTOSPLIT_BACKEND_CONFIG_KEY) not in (None, AUTOSPLIT_BACKEND_VALUE_TORCHLENS):
+            raise ValueError("AutoSplitSplitLearningClient only supports the TorchLens backend.")
         client_stage_count = int(config.get(AUTOSPLIT_CLIENT_STAGE_COUNT_CONFIG_KEY, 1))
         if client_stage_count != 1:
             raise ValueError(
-                "Ariadne backend currently supports exactly one client-local prefix stage."
+                "TorchLens autosplit backend supports exactly one client-local prefix stage."
             )
         _load_model_from_ndarrays(self.model, parameters)
         if training:
@@ -188,7 +191,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
             self.model.eval()
         return self._ensure_runtime_handle(config)
 
-    def _ensure_runtime_handle(self, config) -> AriadneRuntimeHandle:
+    def _ensure_runtime_handle(self, config) -> SplitRuntimeHandle:
         plan_id = str(config[AUTOSPLIT_PLAN_ID_CONFIG_KEY])
         split_id = str(config.get(AUTOSPLIT_SPLIT_ID_CONFIG_KEY, ""))
         graph_signature = str(config.get(AUTOSPLIT_GRAPH_SIGNATURE_CONFIG_KEY, ""))
@@ -207,11 +210,11 @@ class AutoSplitSplitLearningClient(NumPyClient):
         )
         if split_id and handle.plan.split_id != split_id:
             raise RuntimeError(
-                f"Ariadne split id mismatch: prepared {handle.plan.split_id}, expected {split_id}."
+                f"TorchLens split id mismatch: prepared {handle.plan.split_id}, expected {split_id}."
             )
         if graph_signature and handle.plan.graph_signature != graph_signature:
             raise RuntimeError(
-                "Ariadne graph signature mismatch: "
+                "TorchLens graph signature mismatch: "
                 f"prepared {handle.plan.graph_signature}, expected {graph_signature}."
             )
         self._runtime_cache[cache_key] = handle

@@ -1,11 +1,11 @@
 # SplitFleet
 
 SplitFleet is a PyTorch split learning framework built on top of [Flower](https://flower.ai/).
-The autosplit runtime is now backed by the published `ariadne-split` package, so SplitFleet focuses on Flower strategy integration, client/server transport, server-tail replicas, and aggregation policy.
+The autosplit runtime is now backed by the published `torchlens` package, so SplitFleet focuses on Flower strategy integration, client/server transport, server-tail replicas, and aggregation policy.
 
 ## What This Project Does
 
-Given a PyTorch model and example positional inputs, SplitFleet prepares an Ariadne split runtime, runs a client-local prefix, sends a typed `BoundaryPayload` to the server suffix, and completes split inference or split training inside the Flower round loop.
+Given a PyTorch model and example positional inputs, SplitFleet prepares a TorchLens split runtime, runs a client-local prefix, sends a typed `BoundaryPayload` to the server suffix, and completes split inference or split training inside the Flower round loop.
 
 Currently supported:
 
@@ -40,10 +40,10 @@ uv sync --extra dev --extra integration
 
 ## Quick Start
 
-Run the Ariadne split training demo:
+Run the TorchLens split training demo:
 
 ```bash
-uv run --no-sync python examples/ariadne_split_training_demo.py
+uv run --no-sync python examples/torchlens_split_training_demo.py
 ```
 
 Run the coordinator-local suffix demo:
@@ -61,13 +61,13 @@ uv run --no-sync pytest -q
 Run the real-model task matrix:
 
 ```bash
-uv run --no-sync pytest tests/integration/test_ariadne_real_task_matrix.py -q
+uv run --no-sync pytest tests/integration/test_torchlens_real_task_matrix.py -q
 ```
 
 Run optional heavy detection checks:
 
 ```bash
-SPLITFLEET_RUN_HEAVY_REAL_MODELS=1 uv run --no-sync pytest tests/integration/test_ariadne_real_detection_optional.py -q
+SPLITFLEET_RUN_HEAVY_REAL_MODELS=1 uv run --no-sync pytest tests/integration/test_torchlens_real_detection_optional.py -q
 ```
 
 ## Example: AutoSplit Strategy
@@ -108,10 +108,10 @@ client = AutoSplitSplitLearningClient(
 
 ## Main Components
 
-- [`splitfleet/autosplit`](splitfleet/autosplit): Ariadne adapter, two-stage planner, runtime facade, serde, and cache.
+- [`splitfleet/autosplit`](splitfleet/autosplit): TorchLens adapter, two-stage planner, runtime facade, serde, and cache.
 - [`splitfleet/server/strategy/autosplit_strategy.py`](splitfleet/server/strategy/autosplit_strategy.py): Flower strategy metadata and aggregation policy.
-- [`splitfleet/server/stage_runtime`](splitfleet/server/stage_runtime): active Ariadne runtime handle management for coordinator-local suffix execution.
-- [`splitfleet/server/server_model/ariadne_tail_server_model.py`](splitfleet/server/server_model/ariadne_tail_server_model.py): server suffix model bridge.
+- [`splitfleet/server/stage_runtime`](splitfleet/server/stage_runtime): active TorchLens runtime handle management for coordinator-local suffix execution.
+- [`splitfleet/server/server_model/autosplit_tail_server_model.py`](splitfleet/server/server_model/autosplit_tail_server_model.py): server suffix model bridge.
 - [`splitfleet/client/autosplit_split_client.py`](splitfleet/client/autosplit_split_client.py): client prefix execution and boundary payload exchange.
 
 ## Validation
@@ -120,14 +120,14 @@ Default checks:
 
 ```bash
 uv run --no-sync pytest -q
-uv run --no-sync pytest tests/unit/test_ariadne_boundary_serde.py -q
+uv run --no-sync pytest tests/unit/test_torchlens_boundary_serde.py -q
 ```
 
 Integration checks:
 
 ```bash
-uv run --no-sync pytest tests/integration/test_ariadne_real_task_matrix.py -q
-SPLITFLEET_RUN_HEAVY_REAL_MODELS=1 uv run --no-sync pytest tests/integration/test_ariadne_real_detection_optional.py -q
+uv run --no-sync pytest tests/integration/test_torchlens_real_task_matrix.py -q
+SPLITFLEET_RUN_HEAVY_REAL_MODELS=1 uv run --no-sync pytest tests/integration/test_torchlens_real_detection_optional.py -q
 ```
 
 Cleanup checks:

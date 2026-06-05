@@ -118,11 +118,17 @@ def serialize_plan_descriptor(placement_plan: PlacementPlan) -> bytes:
 
     descriptor = {
         "plan_id": placement_plan.plan_id,
-        "backend": "ariadne",
+        "backend": getattr(placement_plan, "backend", "torchlens"),
+        "runtime_backend": getattr(placement_plan, "runtime_backend", "torchlens_native"),
         "graph_signature": placement_plan.graph_signature,
         "split_id": placement_plan.split_id,
         "boundary": placement_plan.boundary,
         "mode": placement_plan.mode,
+        "candidate_id": getattr(placement_plan, "candidate_id", ""),
+        "boundary_tensor_labels": list(getattr(placement_plan, "boundary_tensor_labels", []) or []),
+        "payload_bytes": int(getattr(placement_plan, "payload_bytes", 0) or 0),
+        "feature_abi_id": getattr(placement_plan, "feature_abi_id", ""),
+        "runtime_contract": dict(getattr(placement_plan, "runtime_contract", {}) or {}),
         "stage_count": placement_plan.stage_count,
         "client_stage_count": 1,
         "stage_to_worker": dict(placement_plan.stage_to_worker),

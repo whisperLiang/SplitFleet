@@ -111,7 +111,7 @@ def test_oort_configure_fit_returns_correct_number_of_clients() -> None:
     assert len({client.cid for client, _ in instructions}) == 2
 
 
-def test_oort_configure_fit_keeps_ariadne_autosplit_metadata() -> None:
+def test_oort_configure_fit_keeps_torchlens_autosplit_metadata() -> None:
     strategy = _strategy(client_selection="oort")
     manager = FakeClientManager(["c1", "c2", "c3", "c4"])
 

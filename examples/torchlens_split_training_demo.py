@@ -1,4 +1,4 @@
-"""Minimal Ariadne split training demo for SplitFleet."""
+"""Minimal TorchLens split training demo for SplitFleet."""
 
 from __future__ import annotations
 
@@ -6,16 +6,16 @@ import torch
 from torch import nn
 from torchvision.models import resnet18
 
-from splitfleet.autosplit import prepare_ariadne_runtime
+from splitfleet.autosplit import prepare_torchlens_runtime
 
 
 def main() -> None:
     torch.manual_seed(7)
     model = resnet18(weights=None)
-    runtime = prepare_ariadne_runtime(
+    runtime = prepare_torchlens_runtime(
         model,
         torch.randn(2, 3, 96, 96),
-        boundary="after:layer3",
+        boundary="50%",
         trainable=True,
         dynamic_batch=(2, 8),
     )
@@ -23,17 +23,17 @@ def main() -> None:
     labels = torch.randint(0, 1000, (3,))
     optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
 
-    boundary = runtime.runtime.run_prefix(x)
-    output = runtime.runtime.run_suffix(boundary)
+    boundary = runtime.backend.run_prefix(x)
+    output = runtime.backend.run_suffix(boundary)
 
-    training_boundary = runtime.runtime.run_training_prefix(x)
-    loss, boundary_grads = runtime.runtime.train_suffix(
+    training_boundary = runtime.backend.run_prefix(x, training=True)
+    loss, boundary_grads = runtime.backend.train_suffix(
         training_boundary,
         labels,
         loss_fn=nn.CrossEntropyLoss(),
         optimizer=optimizer,
     )
-    runtime.runtime.backward_prefix(
+    runtime.backend.backward_prefix(
         training_boundary,
         boundary_grads=boundary_grads,
         optimizer=optimizer,
@@ -48,4 +48,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -1,6 +1,6 @@
 CLIENT_ID_CONFIG_KEY = "__hidden_client_id__"
 AUTOSPLIT_BACKEND_CONFIG_KEY = "autosplit_backend"
-AUTOSPLIT_BACKEND_VALUE_ARIADNE = "ariadne"
+AUTOSPLIT_BACKEND_VALUE_TORCHLENS = "torchlens"
 AUTOSPLIT_PLAN_ID_CONFIG_KEY = "autosplit_plan_id"
 AUTOSPLIT_SPLIT_ID_CONFIG_KEY = "autosplit_split_id"
 AUTOSPLIT_GRAPH_SIGNATURE_CONFIG_KEY = "autosplit_graph_signature"

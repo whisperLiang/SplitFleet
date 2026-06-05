@@ -1,4 +1,4 @@
-"""Compatibility worker runtime for removed node-level stage execution."""
+"""Compatibility worker runtime for inactive node-level stage execution."""
 
 from __future__ import annotations
 
@@ -6,26 +6,26 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from splitfleet.autosplit.runtime import AutoSplitSession
-from splitfleet.autosplit.types import AriadnePlacementPlan, WorkerSpec
+from splitfleet.autosplit.types import SplitPlan, WorkerSpec
 
 
 REMOTE_STAGE_ERROR = (
-    "Ariadne backend currently supports coordinator-local suffix execution only; "
-    "old node-level remote stage execution has been removed."
+    "TorchLens autosplit backend supports coordinator-local suffix execution only; "
+    "node-level remote stage execution is not active."
 )
 
 
 @dataclass
 class RegisteredPlacement:
-    """Worker-local Ariadne placement metadata."""
+    """Worker-local placement metadata."""
 
     descriptor: Dict[str, Any]
-    placement_plan: AriadnePlacementPlan
+    placement_plan: SplitPlan
     model: Any
 
 
 class StageWorkerRuntime:
-    """Remote node-level workers are no longer part of the Ariadne backend."""
+    """Remote node-level workers are not active for the TorchLens autosplit backend."""
 
     def __init__(
         self,
@@ -48,9 +48,9 @@ class StageWorkerRuntime:
         descriptor: Dict[str, Any],
         *,
         model_state: bytes = b"",
-    ) -> AriadnePlacementPlan:
+    ) -> SplitPlan:
         _ = model_state
-        placement_plan = AriadnePlacementPlan(
+        placement_plan = SplitPlan(
             plan_id=str(descriptor["plan_id"]),
             split_id=str(descriptor.get("split_id", "")),
             graph_signature=str(descriptor.get("graph_signature", "")),
@@ -59,6 +59,14 @@ class StageWorkerRuntime:
             prefix_worker_id="client",
             suffix_worker_id=self.worker_spec.worker_id,
             score=float(descriptor.get("score", 0.0)),
+            backend=str(descriptor.get("backend", "torchlens")),
+            runtime_backend=str(descriptor.get("runtime_backend", "torchlens_native")),
+            candidate_id=str(descriptor.get("candidate_id", "")),
+            boundary_tensor_labels=[
+                str(label) for label in list(descriptor.get("boundary_tensor_labels") or [])
+            ],
+            payload_bytes=int(descriptor.get("payload_bytes", 0) or 0),
+            runtime_contract=dict(descriptor.get("runtime_contract") or {}),
             metadata=dict(descriptor.get("metadata", {})),
             worker_specs={self.worker_spec.worker_id: self.worker_spec},
         )

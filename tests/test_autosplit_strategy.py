@@ -8,7 +8,7 @@ from splitfleet.autosplit import ReplicaScope
 from splitfleet.common import ServerModelFitRes
 from splitfleet.common.constants import (
     AUTOSPLIT_BACKEND_CONFIG_KEY,
-    AUTOSPLIT_BACKEND_VALUE_ARIADNE,
+    AUTOSPLIT_BACKEND_VALUE_TORCHLENS,
     AUTOSPLIT_BOUNDARY_CONFIG_KEY,
     AUTOSPLIT_CLIENT_STAGE_COUNT_CONFIG_KEY,
     AUTOSPLIT_GRAPH_SIGNATURE_CONFIG_KEY,
@@ -45,7 +45,7 @@ class DummyServerModel(ServerModel):
         self.eval_config = ins
 
 
-def test_autosplit_strategy_generates_ariadne_metadata() -> None:
+def test_autosplit_strategy_generates_torchlens_metadata() -> None:
     model = TinyNet().eval()
     sample_inputs = torch.randn(2, 4)
     strategy = AutoSplitStrategy(
@@ -57,11 +57,11 @@ def test_autosplit_strategy_generates_ariadne_metadata() -> None:
 
     config = strategy._autosplit_config()
 
-    assert config[AUTOSPLIT_BACKEND_CONFIG_KEY] == AUTOSPLIT_BACKEND_VALUE_ARIADNE
-    assert config[AUTOSPLIT_PLAN_ID_CONFIG_KEY].startswith("ariadne_")
+    assert config[AUTOSPLIT_BACKEND_CONFIG_KEY] == AUTOSPLIT_BACKEND_VALUE_TORCHLENS
+    assert config[AUTOSPLIT_PLAN_ID_CONFIG_KEY].startswith("torchlens_")
     assert config[AUTOSPLIT_SPLIT_ID_CONFIG_KEY]
     assert config[AUTOSPLIT_GRAPH_SIGNATURE_CONFIG_KEY]
-    assert config[AUTOSPLIT_BOUNDARY_CONFIG_KEY] == "50%"
+    assert config[AUTOSPLIT_BOUNDARY_CONFIG_KEY].startswith("after:")
     assert config[AUTOSPLIT_MODE_CONFIG_KEY] == "generated_eager"
     assert config[AUTOSPLIT_STAGE_COUNT_CONFIG_KEY] == 2
     assert config[AUTOSPLIT_CLIENT_STAGE_COUNT_CONFIG_KEY] == 1

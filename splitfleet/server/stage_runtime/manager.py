@@ -1,26 +1,26 @@
-"""Ariadne runtime manager for SplitFleet server-side suffix execution."""
+"""TorchLens runtime manager for SplitFleet server-side suffix execution."""
 
 from __future__ import annotations
 
 import copy
 from typing import Any, Optional
 
-from splitfleet.autosplit.ariadne_adapter import AriadneRuntimeHandle
+from splitfleet.autosplit import SplitRuntimeHandle
 from splitfleet.autosplit.runtime import AutoSplitSession
-from splitfleet.autosplit.types import AriadnePlacementPlan, WorkerSpec
+from splitfleet.autosplit.types import SplitPlan, WorkerSpec
 from splitfleet.server.server_model.manager.grpc_manager import GrpcServerModelManager
 from splitfleet.server.server_model.manager.manager import ServerModelManager
 from splitfleet.server.stage_runtime.registry import GLOBAL_WORKER_REGISTRY, WorkerRegistry
 
 
 REMOTE_STAGE_ERROR = (
-    "Ariadne backend currently supports coordinator-local suffix execution only; "
-    "old node-level remote stage execution has been removed."
+    "TorchLens autosplit backend supports coordinator-local suffix execution only; "
+    "node-level remote stage execution is not active."
 )
 
 
 class StageRuntimeManager(ServerModelManager):
-    """Bridge Ariadne split runtimes into the existing server-model lifecycle."""
+    """Bridge TorchLens split runtimes into the existing server-model lifecycle."""
 
     def __init__(
         self,
@@ -32,24 +32,24 @@ class StageRuntimeManager(ServerModelManager):
         super().__init__()
         self.autosplit_session = autosplit_session or AutoSplitSession()
         self.worker_registry = worker_registry or GLOBAL_WORKER_REGISTRY
-        self._placement_plan: Optional[AriadnePlacementPlan] = None
-        self._runtime_handle: Optional[AriadneRuntimeHandle] = None
+        self._placement_plan: Optional[SplitPlan] = None
+        self._runtime_handle: Optional[SplitRuntimeHandle] = None
         self._delegate = (
             GrpcServerModelManager(init_server_model_fn=init_server_model_fn)
             if init_server_model_fn is not None
             else None
         )
 
-    def set_placement_plan(self, placement_plan: AriadnePlacementPlan) -> None:
+    def set_placement_plan(self, placement_plan: SplitPlan) -> None:
         self._placement_plan = placement_plan
         handle = placement_plan.metadata.get("_runtime_handle")
-        if isinstance(handle, AriadneRuntimeHandle):
+        if isinstance(handle, SplitRuntimeHandle):
             self.bind_runtime_handle(handle)
 
-    def get_placement_plan(self) -> Optional[AriadnePlacementPlan]:
+    def get_placement_plan(self) -> Optional[SplitPlan]:
         return self._placement_plan
 
-    def bind_runtime_handle(self, runtime_handle: AriadneRuntimeHandle) -> None:
+    def bind_runtime_handle(self, runtime_handle: SplitRuntimeHandle) -> None:
         self._runtime_handle = runtime_handle
         self.autosplit_session._runtime_handles[runtime_handle.plan.plan_id] = runtime_handle
 
@@ -59,9 +59,9 @@ class StageRuntimeManager(ServerModelManager):
     def list_workers(self, *, online_only: bool = True) -> list[WorkerSpec]:
         return self.worker_registry.list_workers(online_only=online_only)
 
-    def _require_runtime_handle(self) -> AriadneRuntimeHandle:
+    def _require_runtime_handle(self) -> SplitRuntimeHandle:
         if self._runtime_handle is None:
-            raise RuntimeError("No Ariadne runtime handle is active.")
+            raise RuntimeError("No TorchLens runtime handle is active.")
         return self._runtime_handle
 
     def clone_runtime_for_model(
@@ -69,11 +69,11 @@ class StageRuntimeManager(ServerModelManager):
         model,
         *,
         suffix: str = "",
-    ) -> AriadneRuntimeHandle:
+    ) -> SplitRuntimeHandle:
         base = self._require_runtime_handle()
         sample_inputs = base.plan.metadata.get("_example_inputs")
         if sample_inputs is None:
-            raise RuntimeError("The active Ariadne runtime does not retain sample inputs.")
+            raise RuntimeError("The active TorchLens runtime does not retain sample inputs.")
         handle = self.autosplit_session.prepare_runtime(
             model,
             sample_inputs,
@@ -82,8 +82,6 @@ class StageRuntimeManager(ServerModelManager):
             trainable=base.plan.trainable,
             dynamic_batch=base.plan.dynamic_batch,
             trace_batch_mode=base.plan.trace_batch_mode,
-            objective=base.plan.metadata.get("_objective"),
-            compile_options=base.plan.metadata.get("_compile_options"),
         )
         if suffix:
             original_plan_id = handle.plan.plan_id
@@ -97,7 +95,7 @@ class StageRuntimeManager(ServerModelManager):
         *,
         model=None,
         plan_id_suffix: Optional[str] = None,
-    ) -> AriadnePlacementPlan:
+    ) -> SplitPlan:
         if self._placement_plan is None:
             raise RuntimeError("No autosplit placement plan is active.")
         cloned = copy.copy(self._placement_plan)
@@ -114,7 +112,7 @@ class StageRuntimeManager(ServerModelManager):
     def run_eval(self, inputs: Any) -> Any:
         return self.autosplit_session.run_eval(self._require_runtime_handle(), inputs)
 
-    def run_eval_plan(self, runtime_handle: AriadneRuntimeHandle, inputs: Any) -> Any:
+    def run_eval_plan(self, runtime_handle: SplitRuntimeHandle, inputs: Any) -> Any:
         return self.autosplit_session.run_eval(runtime_handle, inputs)
 
     def run_train(
@@ -137,7 +135,7 @@ class StageRuntimeManager(ServerModelManager):
 
     def run_train_plan(
         self,
-        runtime_handle: AriadneRuntimeHandle,
+        runtime_handle: SplitRuntimeHandle,
         inputs: Any,
         *,
         targets: Any = None,
@@ -154,12 +152,12 @@ class StageRuntimeManager(ServerModelManager):
             suffix_optimizer=suffix_optimizer,
         )
 
-    def run_eval_tail_plan(self, runtime_handle: AriadneRuntimeHandle, boundary) -> Any:
+    def run_eval_tail_plan(self, runtime_handle: SplitRuntimeHandle, boundary) -> Any:
         return self.autosplit_session.run_suffix_eval(runtime_handle, boundary)
 
     def run_train_tail_plan(
         self,
-        runtime_handle: AriadneRuntimeHandle,
+        runtime_handle: SplitRuntimeHandle,
         boundary,
         *,
         targets: Any = None,

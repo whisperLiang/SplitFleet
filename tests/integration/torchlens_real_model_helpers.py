@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 import torch
 
-from splitfleet.autosplit import prepare_ariadne_runtime
+from splitfleet.autosplit import prepare_torchlens_runtime
 from splitfleet.autosplit.serde import dumps_torch_object, loads_torch_object
 
 
@@ -89,7 +89,7 @@ def nested_tensor_loss(output) -> torch.Tensor:
 
 
 def make_runtime(model, trace_inputs, boundary, dynamic_batch=(2, 3)):
-    return prepare_ariadne_runtime(
+    return prepare_torchlens_runtime(
         model,
         trace_inputs,
         boundary=boundary,
@@ -103,14 +103,14 @@ def run_split_inference_equivalence(model, trace_inputs, runtime_inputs, boundar
     runtime = make_runtime(model, trace_inputs, boundary)
     with torch.no_grad():
         direct = model(*normalize_inputs(runtime_inputs))
-        boundary_payload = runtime.runtime.run_prefix(*normalize_inputs(runtime_inputs))
-        split = runtime.runtime.run_suffix(boundary_payload)
+        boundary_payload = runtime.backend.run_prefix(*normalize_inputs(runtime_inputs))
+        split = runtime.backend.run_suffix(boundary_payload)
     assert boundary_payload.tensors
     assert first_tensor_batch_size(runtime_inputs) == 3
     assert_nested_structure_equal(direct, split)
     assert_nested_shape_equal(direct, split)
     assert_nested_close(direct, split)
-    run_boundary_serde_roundtrip(runtime.runtime, boundary_payload)
+    run_boundary_serde_roundtrip(runtime, boundary_payload)
     return runtime
 
 
@@ -119,14 +119,14 @@ def run_split_training_smoke(model, trace_inputs, runtime_inputs, targets, loss_
     runtime = make_runtime(model, trace_inputs, boundary)
     optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=1e-4)
     before = clone_trainable_state(model)
-    boundary = runtime.runtime.run_training_prefix(*normalize_inputs(runtime_inputs))
-    loss, boundary_grads = runtime.runtime.train_suffix(
+    boundary = runtime.backend.run_prefix(*normalize_inputs(runtime_inputs), training=True)
+    loss, boundary_grads = runtime.backend.train_suffix(
         boundary,
         targets,
         loss_fn=loss_fn,
         optimizer=optimizer,
     )
-    runtime.runtime.backward_prefix(boundary, boundary_grads=boundary_grads, optimizer=optimizer)
+    runtime.backend.backward_prefix(boundary, boundary_grads=boundary_grads, optimizer=optimizer)
     after = clone_trainable_state(model)
     assert torch.isfinite(loss)
     assert boundary.tensors
@@ -137,8 +137,8 @@ def run_split_training_smoke(model, trace_inputs, runtime_inputs, targets, loss_
 
 def run_boundary_serde_roundtrip(runtime, boundary):
     restored = loads_torch_object(dumps_torch_object(boundary))
-    output1 = runtime.run_suffix(boundary)
-    output2 = runtime.run_suffix(restored)
+    output1 = runtime.backend.run_suffix(boundary)
+    output2 = runtime.backend.run_suffix(restored)
     assert restored.tensors
     assert hasattr(restored, "passthrough_inputs")
     assert_nested_shape_equal(output1, output2)

@@ -39,7 +39,7 @@ class BatchNormNet(nn.Module):
         return self.fc2(self.bn(self.fc1(x)))
 
 
-def test_ariadne_autosplit_eval_matches_direct_forward() -> None:
+def test_torchlens_autosplit_eval_matches_direct_forward() -> None:
     torch.manual_seed(7)
     model = BranchNet().eval()
     trace_inputs = torch.randn(2, 4)
@@ -63,7 +63,7 @@ def test_ariadne_autosplit_eval_matches_direct_forward() -> None:
     assert torch.allclose(replayed, expected, atol=1e-5, rtol=1e-5)
 
 
-def test_ariadne_autosplit_train_runs_suffix_and_prefix_backward() -> None:
+def test_torchlens_autosplit_train_runs_suffix_and_prefix_backward() -> None:
     torch.manual_seed(13)
     model = BranchNet().train()
     inputs = torch.randn(3, 4)
@@ -96,7 +96,7 @@ def test_ariadne_autosplit_train_runs_suffix_and_prefix_backward() -> None:
     )
 
 
-def test_client_prepares_mode_specific_ariadne_runtimes() -> None:
+def test_client_prepares_mode_specific_torchlens_runtimes() -> None:
     torch.manual_seed(31)
     client = AutoSplitSplitLearningClient(
         model=BatchNormNet(),
@@ -112,7 +112,7 @@ def test_client_prepares_mode_specific_ariadne_runtimes() -> None:
     train_handle = client._prepare_round(_model_to_ndarrays(client.model), config, training=True)
     train_inputs = torch.randn(3, 4)
     expected_train = copy.deepcopy(client.model).train()(train_inputs)
-    split_train = train_handle.runtime.run_suffix(train_handle.runtime.run_prefix(train_inputs))
+    split_train = train_handle.backend.run_suffix(train_handle.backend.run_prefix(train_inputs))
 
     assert torch.allclose(split_train, expected_train, atol=1e-5, rtol=1e-5)
 
@@ -120,13 +120,13 @@ def test_client_prepares_mode_specific_ariadne_runtimes() -> None:
     eval_inputs = torch.randn(3, 4)
     with torch.no_grad():
         expected_eval = copy.deepcopy(client.model).eval()(eval_inputs)
-        split_eval = eval_handle.runtime.run_suffix(eval_handle.runtime.run_prefix(eval_inputs))
+        split_eval = eval_handle.backend.run_suffix(eval_handle.backend.run_prefix(eval_inputs))
 
     assert train_handle is not eval_handle
     assert torch.allclose(split_eval, expected_eval, atol=1e-5, rtol=1e-5)
 
 
-def test_ariadne_planner_rejects_sample_kwargs() -> None:
+def test_torchlens_planner_rejects_sample_kwargs() -> None:
     with pytest.raises(ValueError, match="positional model inputs only"):
         AutoSplitSession(device="cpu").plan(
             BranchNet(),

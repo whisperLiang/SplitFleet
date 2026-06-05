@@ -1,4 +1,4 @@
-"""Ariadne autosplit-aware strategy facade built on top of PlainSlStrategy."""
+"""TorchLens autosplit-aware strategy facade built on top of PlainSlStrategy."""
 
 from __future__ import annotations
 
@@ -27,10 +27,10 @@ from splitfleet.server.client_selection import (
     OortSelectorConfig,
     RandomSelector,
 )
-from splitfleet.autosplit.planner import validate_ariadne_stage_counts
+from splitfleet.autosplit.planner import validate_stage_counts
 from splitfleet.common.constants import (
     AUTOSPLIT_BACKEND_CONFIG_KEY,
-    AUTOSPLIT_BACKEND_VALUE_ARIADNE,
+    AUTOSPLIT_BACKEND_VALUE_TORCHLENS,
     AUTOSPLIT_BOUNDARY_CONFIG_KEY,
     AUTOSPLIT_CLIENT_STAGE_COUNT_CONFIG_KEY,
     AUTOSPLIT_GRAPH_SIGNATURE_CONFIG_KEY,
@@ -39,7 +39,7 @@ from splitfleet.common.constants import (
     AUTOSPLIT_SPLIT_ID_CONFIG_KEY,
     AUTOSPLIT_STAGE_COUNT_CONFIG_KEY,
 )
-from splitfleet.server.server_model.ariadne_tail_server_model import AriadneTailServerModel
+from splitfleet.server.server_model.autosplit_tail_server_model import AutoSplitTailServerModel
 from splitfleet.server.server_model.autosplit_server_model import AutoSplitServerModel
 from splitfleet.server.strategy.plain_strategy import PlainSlStrategy
 
@@ -68,7 +68,7 @@ def _coerce_aggregation_policy(
 
 
 class AutoSplitStrategy(PlainSlStrategy):
-    """Strategy that computes and propagates Ariadne split metadata."""
+    """Strategy that computes and propagates TorchLens split metadata."""
 
     uses_stage_runtime = True
 
@@ -100,8 +100,8 @@ class AutoSplitStrategy(PlainSlStrategy):
         **kwargs,
     ) -> None:
         if sample_kwargs:
-            raise ValueError("Ariadne backend currently accepts positional model inputs only.")
-        validate_ariadne_stage_counts(
+            raise ValueError("TorchLens autosplit backend accepts positional model inputs only.")
+        validate_stage_counts(
             preferred_stage_count=preferred_stage_count,
             client_stage_count=client_stage_count,
         )
@@ -215,7 +215,7 @@ class AutoSplitStrategy(PlainSlStrategy):
                 "AutoSplitStrategy has not been bound to a StageRuntimeManager yet."
             )
         if self.client_stage_count == 1:
-            return AriadneTailServerModel(
+            return AutoSplitTailServerModel(
                 runtime_manager=self._runtime_manager,
                 model=self.model,
                 optimizer_fn=self.optimizer_fn,
@@ -235,7 +235,7 @@ class AutoSplitStrategy(PlainSlStrategy):
     def _autosplit_config(self) -> Dict[str, Any]:
         placement = self.get_or_create_placement_plan()
         return {
-            AUTOSPLIT_BACKEND_CONFIG_KEY: AUTOSPLIT_BACKEND_VALUE_ARIADNE,
+            AUTOSPLIT_BACKEND_CONFIG_KEY: AUTOSPLIT_BACKEND_VALUE_TORCHLENS,
             AUTOSPLIT_PLAN_ID_CONFIG_KEY: placement.plan_id,
             AUTOSPLIT_SPLIT_ID_CONFIG_KEY: placement.split_id,
             AUTOSPLIT_GRAPH_SIGNATURE_CONFIG_KEY: placement.graph_signature,

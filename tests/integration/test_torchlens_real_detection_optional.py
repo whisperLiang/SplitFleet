@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch import nn
 
-from tests.integration.ariadne_real_model_helpers import (
+from tests.integration.torchlens_real_model_helpers import (
     clone_trainable_state,
     has_any_parameter_grad,
     make_runtime,
@@ -61,7 +61,7 @@ def test_yolov8n_optional_split_smoke() -> None:
     trace_inputs = torch.randn(2, 3, 160, 160)
     runtime_inputs = torch.randn(3, 3, 160, 160)
     try:
-        run_split_inference_equivalence(model, trace_inputs, runtime_inputs, "after:model.model.2")
+        run_split_inference_equivalence(model, trace_inputs, runtime_inputs, "50%")
     except Exception as exc:
         pytest.xfail(f"YOLOv8n split inference is not stable in this environment: {exc}")
 
@@ -85,26 +85,26 @@ def test_rfdetr_nano_optional_split_smoke() -> None:
             model,
             trace_inputs,
             runtime_inputs,
-            "after:model.transformer.decoder.layers.0.norm3",
+            "50%",
         )
         # RF-DETR's train() path builds batch-dependent Python containers before
         # the chosen boundary. Keep the heavy smoke in eval mode while still
-        # exercising Ariadne's training prefix/suffix/backward APIs.
+        # exercising TorchLens's training prefix/suffix/backward APIs.
         runtime = make_runtime(
             model,
             trace_inputs,
-            "after:model.transformer.decoder.layers.0.norm3",
+            "50%",
         )
         optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=1e-4)
         before = clone_trainable_state(model)
-        boundary = runtime.runtime.run_training_prefix(runtime_inputs)
-        loss, boundary_grads = runtime.runtime.train_suffix(
+        boundary = runtime.backend.run_prefix(runtime_inputs, training=True)
+        loss, boundary_grads = runtime.backend.train_suffix(
             boundary,
             None,
             loss_fn=lambda output, _targets: nested_tensor_loss(output),
             optimizer=optimizer,
         )
-        runtime.runtime.backward_prefix(boundary, boundary_grads=boundary_grads, optimizer=optimizer)
+        runtime.backend.backward_prefix(boundary, boundary_grads=boundary_grads, optimizer=optimizer)
         after = clone_trainable_state(model)
         assert torch.isfinite(loss)
         assert boundary.tensors

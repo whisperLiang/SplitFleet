@@ -1,6 +1,6 @@
-"""Ariadne autosplit demo with coordinator-local suffix execution.
+"""TorchLens autosplit demo with coordinator-local suffix execution.
 
-The old node-level remote stage replay demo was removed with the Ariadne backend.
+The old node-level remote stage replay demo was removed with the TorchLens backend.
 This example keeps the filename for discoverability but now demonstrates the
 supported client-prefix/coordinator-suffix path.
 """

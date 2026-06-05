@@ -1,18 +1,10 @@
-"""Public autosplit facade for SplitFleet's Ariadne backend."""
+"""Public autosplit facade for SplitFleet's TorchLens backend."""
 
-from ariadne import BoundaryPayload
-
-from splitfleet.autosplit.ariadne_adapter import (
-    AriadneRuntimeHandle,
-    AriadneSplitPlan,
-    backward_prefix,
-    infer_trace_batch_mode,
-    normalize_example_inputs,
-    prepare_ariadne_runtime,
-    run_prefix,
-    run_suffix,
-    run_training_prefix,
-    train_suffix,
+from splitfleet.autosplit.boundary import (
+    BoundaryPayload,
+    BoundarySpec,
+    from_torchlens_boundary,
+    to_torchlens_boundary,
 )
 from splitfleet.autosplit.cache import PlanCacheEntry, PlanCacheStore
 from splitfleet.autosplit.policies import (
@@ -21,7 +13,7 @@ from splitfleet.autosplit.policies import (
     PartitionSelectionPolicy,
     ReplicaScopePolicy,
 )
-from splitfleet.autosplit.planner import AutoSplitPlanner
+from splitfleet.autosplit.planner import AutoSplitPlanner, validate_stage_counts
 from splitfleet.autosplit.runtime import AutoSplitSession, compute_loss, normalize_inputs
 from splitfleet.autosplit.serde import (
     deserialize_plan_descriptor,
@@ -31,24 +23,54 @@ from splitfleet.autosplit.serde import (
     loads_torch_object,
     serialize_plan_descriptor,
 )
+from splitfleet.autosplit.torchlens_backend import (
+    SplitRuntimeHandle,
+    TorchLensRuntimeHandle,
+    TorchLensSplitBackend,
+    backward_prefix,
+    prepare_torchlens_runtime,
+    run_prefix,
+    run_suffix,
+    run_training_prefix,
+    train_suffix,
+)
+from splitfleet.autosplit.torchlens_candidate import SplitCandidate
+from splitfleet.autosplit.torchlens_contract import (
+    FeatureAbiSpec,
+    build_feature_abi_spec,
+    build_runtime_contract,
+    classify_contract_compatibility,
+    feature_abi_id,
+    runtime_identity_id,
+)
+from splitfleet.autosplit.torchlens_runtime import (
+    SplitRuntime,
+    SplitSpec,
+    infer_trace_batch_mode,
+    make_split_spec,
+    normalize_example_inputs,
+    prepare_split_replay_runtime,
+    prepare_split_runtime,
+    torchlens_runtime_version,
+)
 from splitfleet.autosplit.types import (
-    AriadnePlacementPlan,
     PlacementConstraint,
     PlacementObjective,
     PlacementPlan,
     ReplicaScope,
+    SplitPlan,
+    SplitRuntimePlan,
     WorkerSpec,
 )
 
 __all__ = [
     "AggregationPolicy",
-    "AriadnePlacementPlan",
-    "AriadneRuntimeHandle",
-    "AriadneSplitPlan",
     "AutoSplitPlanner",
     "AutoSplitSession",
     "BoundaryPayload",
+    "BoundarySpec",
     "ExecutionSchedulePolicy",
+    "FeatureAbiSpec",
     "PartitionSelectionPolicy",
     "PlacementConstraint",
     "PlacementObjective",
@@ -57,21 +79,41 @@ __all__ = [
     "PlanCacheStore",
     "ReplicaScope",
     "ReplicaScopePolicy",
+    "SplitCandidate",
+    "SplitPlan",
+    "SplitRuntime",
+    "SplitRuntimeHandle",
+    "SplitRuntimePlan",
+    "SplitSpec",
+    "TorchLensRuntimeHandle",
+    "TorchLensSplitBackend",
     "WorkerSpec",
     "backward_prefix",
+    "build_feature_abi_spec",
+    "build_runtime_contract",
+    "classify_contract_compatibility",
     "compute_loss",
     "deserialize_plan_descriptor",
     "dump_model_state",
     "dumps_torch_object",
+    "feature_abi_id",
+    "from_torchlens_boundary",
     "infer_trace_batch_mode",
     "load_model_state",
     "loads_torch_object",
+    "make_split_spec",
     "normalize_example_inputs",
     "normalize_inputs",
-    "prepare_ariadne_runtime",
+    "prepare_split_replay_runtime",
+    "prepare_split_runtime",
+    "prepare_torchlens_runtime",
     "run_prefix",
     "run_suffix",
     "run_training_prefix",
+    "runtime_identity_id",
     "serialize_plan_descriptor",
+    "to_torchlens_boundary",
+    "torchlens_runtime_version",
     "train_suffix",
+    "validate_stage_counts",
 ]

@@ -1,27 +1,26 @@
-"""Ariadne-backed two-stage autosplit placement planning."""
+"""TorchLens-backed two-stage autosplit placement planning."""
 
 from __future__ import annotations
 
 from dataclasses import asdict
 from typing import Any, Optional, Sequence
 
-from splitfleet.autosplit.ariadne_adapter import (
-    AriadneRuntimeHandle,
-    prepare_ariadne_runtime,
-)
 from splitfleet.autosplit.cache import PlanCacheEntry, PlanCacheStore
+from splitfleet.autosplit.torchlens_backend import (
+    TorchLensRuntimeHandle,
+    TorchLensSplitBackend,
+)
+from splitfleet.autosplit.torchlens_candidate import SplitCandidate
 from splitfleet.autosplit.types import (
-    AriadnePlacementPlan,
     PlacementConstraint,
     PlacementObjective,
+    SplitPlan,
     WorkerSpec,
 )
 
 
-TWO_STAGE_ERROR = "Ariadne backend currently supports prefix/suffix two-stage split only."
-ONE_CLIENT_STAGE_ERROR = (
-    "Ariadne backend currently supports exactly one client-local prefix stage."
-)
+TWO_STAGE_ERROR = "TorchLens autosplit backend supports prefix/suffix two-stage split only."
+ONE_CLIENT_STAGE_ERROR = "TorchLens autosplit backend supports exactly one client-local prefix stage."
 
 
 def _validate_stage_counts(
@@ -47,66 +46,111 @@ def _coordinator_worker(worker_specs: Sequence[WorkerSpec]) -> WorkerSpec:
     return WorkerSpec(worker_id="coordinator", device="cpu")
 
 
-def _score(runtime_handle: AriadneRuntimeHandle, worker: WorkerSpec, objective: PlacementObjective) -> float:
+def _score(candidate: SplitCandidate, worker: WorkerSpec, objective: PlacementObjective) -> float:
     bandwidth_bytes_per_s = max(float(worker.bandwidth_mbps), 1.0) * 125_000.0
-    bandwidth_cost = runtime_handle.plan.boundary_bytes / bandwidth_bytes_per_s
-    suffix_nodes = max(runtime_handle.plan.suffix_node_count, 1)
-    latency_cost = suffix_nodes / 1_000.0
-    return objective.bandwidth_weight * bandwidth_cost + objective.latency_weight * latency_cost
+    bandwidth_cost = candidate.estimated_payload_bytes / bandwidth_bytes_per_s
+    latency_cost = max(int(candidate.descriptor.get("suffix_node_count", 1)), 1) / 1_000.0
+    privacy_cost = 0.0 if candidate.privacy_leakage == float("inf") else candidate.privacy_leakage
+    return (
+        objective.bandwidth_weight * bandwidth_cost
+        + objective.latency_weight * latency_cost
+        + objective.privacy_weight * privacy_cost
+    )
+
+
+def _candidate_satisfies_constraints(
+    candidate: SplitCandidate,
+    validation: dict[str, Any],
+    constraints: PlacementConstraint,
+) -> bool:
+    if candidate.estimated_payload_bytes > constraints.max_payload_bytes:
+        return False
+    if constraints.require_trainable_tail and not candidate.is_trainable_tail:
+        return False
+    if constraints.max_privacy_leakage is not None and (
+        candidate.privacy_leakage > float(constraints.max_privacy_leakage)
+    ):
+        return False
+    if constraints.max_layer_freezing_ratio is not None and (
+        candidate.layer_freezing_ratio > float(constraints.max_layer_freezing_ratio)
+    ):
+        return False
+    if not bool(validation.get("success")):
+        return False
+    return True
 
 
 def _build_placement(
-    runtime_handle: AriadneRuntimeHandle,
+    runtime_handle: TorchLensRuntimeHandle,
     *,
-    boundary: str,
+    candidate: SplitCandidate,
+    validation: dict[str, Any],
     worker_specs: Sequence[WorkerSpec],
     constraints: PlacementConstraint,
     objective: PlacementObjective,
     model_name: Optional[str],
-) -> AriadnePlacementPlan:
-    if runtime_handle.plan.boundary_bytes > constraints.max_payload_bytes:
-        raise RuntimeError(
-            "Ariadne split boundary exceeds max_payload_bytes: "
-            f"{runtime_handle.plan.boundary_bytes} > {constraints.max_payload_bytes}."
-        )
+) -> SplitPlan:
     suffix_worker = _coordinator_worker(worker_specs)
     if constraints.max_stage_memory_bytes and suffix_worker.memory_bytes:
         suffix_memory = runtime_handle.plan.metadata.get("suffix_memory_bytes") or 0
         if suffix_memory and int(suffix_memory) > constraints.max_stage_memory_bytes:
-            raise RuntimeError("Ariadne suffix stage exceeds max_stage_memory_bytes.")
-    score = _score(runtime_handle, suffix_worker, objective)
-    plan = AriadnePlacementPlan(
+            raise RuntimeError("TorchLens suffix stage exceeds max_stage_memory_bytes.")
+    score = _score(candidate, suffix_worker, objective)
+    contract = dict(runtime_handle.plan.runtime_contract)
+    metadata = {
+        "backend": "torchlens",
+        "runtime_backend": "torchlens_native",
+        "model_name": model_name,
+        "trainable": runtime_handle.plan.trainable,
+        "dynamic_batch": runtime_handle.plan.dynamic_batch,
+        "trace_batch_mode": runtime_handle.plan.trace_batch_mode,
+        "trace_batch_size": runtime_handle.plan.trace_batch_size,
+        "boundary_bytes": runtime_handle.plan.boundary_bytes,
+        "prefix_node_count": runtime_handle.plan.prefix_node_count,
+        "suffix_node_count": runtime_handle.plan.suffix_node_count,
+        "trainable_suffix": runtime_handle.plan.trainable_suffix,
+        "boundary_nodes": tuple(runtime_handle.plan.boundary_tensor_labels),
+        "candidate_descriptor": candidate.to_dict(),
+        "validation": dict(validation),
+        "runtime_contract": contract,
+        "feature_layout_id": contract.get("feature_layout_id", ""),
+        "feature_abi_id": contract.get("feature_abi_id", ""),
+        "_runtime_handle": runtime_handle,
+    }
+    return SplitPlan(
         plan_id=runtime_handle.plan.plan_id,
         split_id=runtime_handle.plan.split_id,
         graph_signature=runtime_handle.plan.graph_signature,
-        boundary=boundary,
+        boundary=runtime_handle.plan.boundary,
         mode=runtime_handle.plan.mode,
         prefix_worker_id="client",
         suffix_worker_id=suffix_worker.worker_id,
         score=score,
+        backend="torchlens",
+        runtime_backend="torchlens_native",
+        candidate_id=candidate.candidate_id,
+        split_label=candidate.split_label,
+        boundary_tensor_labels=list(candidate.boundary_tensor_labels),
+        payload_bytes=candidate.estimated_payload_bytes,
+        validation=dict(validation),
+        candidate_descriptor=candidate.to_dict(),
+        trace_signature=runtime_handle.plan.graph_signature,
+        trace_batch_mode=runtime_handle.plan.trace_batch_mode,
+        dynamic_batch=runtime_handle.plan.dynamic_batch,
+        trace_batch_size=runtime_handle.plan.trace_batch_size,
+        canonical_split_key=candidate.boundary,
+        feature_layout_id=str(contract.get("feature_layout_id", "")),
+        feature_abi_id=str(contract.get("feature_abi_id", "")),
+        runtime_contract=contract,
         worker_specs={suffix_worker.worker_id: suffix_worker},
         objective=objective,
         constraints=constraints,
-        metadata={
-            "backend": "ariadne",
-            "model_name": model_name,
-            "trainable": runtime_handle.plan.trainable,
-            "dynamic_batch": runtime_handle.plan.dynamic_batch,
-            "trace_batch_mode": runtime_handle.plan.trace_batch_mode,
-            "boundary_bytes": runtime_handle.plan.boundary_bytes,
-            "prefix_node_count": runtime_handle.plan.prefix_node_count,
-            "suffix_node_count": runtime_handle.plan.suffix_node_count,
-            "trainable_suffix": runtime_handle.plan.trainable_suffix,
-            "boundary_nodes": runtime_handle.plan.metadata.get("boundary_nodes", ()),
-            "requested_boundary": boundary,
-            "_runtime_handle": runtime_handle,
-        },
+        metadata=metadata,
     )
-    return plan
 
 
 class AutoSplitPlanner:
-    """Plan Ariadne client-prefix/server-suffix split execution."""
+    """Plan TorchLens client-prefix/server-suffix split execution."""
 
     def plan(
         self,
@@ -127,9 +171,10 @@ class AutoSplitPlanner:
         dynamic_batch: tuple[int, int] | None = None,
         trace_batch_mode: str | None = None,
         compile_options: Any = None,
-    ) -> AriadnePlacementPlan:
+    ) -> SplitPlan:
+        del compile_options
         if sample_kwargs:
-            raise ValueError("Ariadne backend currently accepts positional model inputs only.")
+            raise ValueError("TorchLens autosplit backend accepts positional model inputs only.")
         _validate_stage_counts(
             preferred_stage_count=preferred_stage_count,
             client_stage_count=client_stage_count,
@@ -138,7 +183,8 @@ class AutoSplitPlanner:
         objective = objective or PlacementObjective()
         workers = list(worker_specs or [WorkerSpec(worker_id="coordinator", device="cpu")])
 
-        runtime_handle = prepare_ariadne_runtime(
+        backend = TorchLensSplitBackend(model_name=model_name or model.__class__.__name__)
+        backend.trace(
             model,
             sample_inputs,
             boundary=boundary,
@@ -146,34 +192,51 @@ class AutoSplitPlanner:
             trainable=trainable,
             dynamic_batch=dynamic_batch,
             trace_batch_mode=trace_batch_mode,
-            objective=None,
-            compile_options=compile_options,
+            model_name=model_name or model.__class__.__name__,
         )
-        if (
-            trainable
-            and constraints.require_trainable_tail
-            and not runtime_handle.plan.trainable_suffix
-        ):
-            if boundary == "auto":
-                raise RuntimeError("Ariadne did not find a trainable suffix for boundary='auto'.")
-            runtime_handle = prepare_ariadne_runtime(
-                model,
-                sample_inputs,
-                boundary="auto",
-                mode=mode,
-                trainable=trainable,
-                dynamic_batch=dynamic_batch,
-                trace_batch_mode=trace_batch_mode,
-                objective=None,
-                compile_options=compile_options,
-            )
-            boundary = "auto"
-            if not runtime_handle.plan.trainable_suffix:
-                raise RuntimeError("Ariadne did not find a trainable suffix for this model.")
+        candidates = backend.enumerate_candidates(
+            max_boundary_count=constraints.max_frontier_size,
+            max_payload_bytes=constraints.max_payload_bytes,
+            max_candidates=None,
+        )
+        if not candidates:
+            raise RuntimeError("TorchLens did not enumerate any legal split candidates for this model.")
 
+        checked = 0
+        selected: tuple[SplitCandidate, dict[str, Any]] | None = None
+        rejected: list[dict[str, Any]] = []
+        for candidate in candidates:
+            validation = backend.validate_candidate(candidate)
+            checked += 1
+            if _candidate_satisfies_constraints(candidate, validation, constraints):
+                selected = (candidate, validation)
+                break
+            rejected.append(
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "payload_bytes": candidate.estimated_payload_bytes,
+                    "trainable_tail": candidate.is_trainable_tail,
+                    "validation_success": bool(validation.get("success")),
+                    "validation_error": validation.get("error"),
+                }
+            )
+            if constraints.max_candidates and checked >= constraints.max_candidates:
+                break
+        if selected is None:
+            raise RuntimeError(
+                "TorchLens did not find a split candidate satisfying constraints. "
+                f"checked={checked}, rejected={rejected[:5]!r}"
+            )
+        selected_candidate, validation = selected
+        if backend.current_candidate is None or (
+            backend.current_candidate.candidate_id != selected_candidate.candidate_id
+        ):
+            backend.split(selected_candidate)
+        runtime_handle = backend.make_handle()
         placement = _build_placement(
             runtime_handle,
-            boundary=boundary,
+            candidate=runtime_handle.backend.current_candidate or selected_candidate,
+            validation=validation,
             worker_specs=workers,
             constraints=constraints,
             objective=objective,
@@ -194,13 +257,14 @@ class AutoSplitPlanner:
                     metadata={
                         "plan_id": placement.plan_id,
                         "mode": placement.mode,
+                        "backend": "torchlens",
                     },
                 )
             )
         return placement
 
 
-def validate_ariadne_stage_counts(
+def validate_stage_counts(
     *,
     preferred_stage_count: Optional[int],
     client_stage_count: Optional[int],

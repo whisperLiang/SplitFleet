@@ -13,8 +13,8 @@ from splitfleet.proto import stage_worker_pb2, stage_worker_pb2_grpc
 
 
 REMOTE_STAGE_ERROR = (
-    "Ariadne backend currently supports coordinator-local suffix execution only; "
-    "old node-level remote stage execution has been removed."
+    "TorchLens autosplit backend supports coordinator-local suffix execution only; "
+    "node-level remote stage execution is not active."
 )
 
 

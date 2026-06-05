@@ -19,7 +19,7 @@ class TinyNet(nn.Module):
 def test_old_remote_stage_execution_api_is_removed() -> None:
     manager = StageRuntimeManager()
 
-    with pytest.raises(NotImplementedError, match="old node-level remote stage execution"):
+    with pytest.raises(NotImplementedError, match="node-level remote stage execution is not active"):
         manager.run_stage_forward()
 
     assert "coordinator-local suffix execution" in REMOTE_STAGE_ERROR
@@ -36,7 +36,7 @@ def test_remote_worker_registration_still_exposes_clear_error() -> None:
         register_with_registry=False,
     )
     try:
-        with pytest.raises(NotImplementedError, match="old node-level remote stage execution"):
+        with pytest.raises(NotImplementedError, match="node-level remote stage execution is not active"):
             handle.runtime.execute_stage()
     finally:
         handle.stop()

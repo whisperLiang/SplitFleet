@@ -4,7 +4,7 @@ import pytest
 import torch
 from torch import nn
 
-from tests.integration.ariadne_real_model_helpers import (
+from tests.integration.torchlens_real_model_helpers import (
     nested_tensor_loss,
     run_split_inference_equivalence,
     run_split_training_smoke,
@@ -165,10 +165,10 @@ def build_retinanet_head_wrapper():
 
 
 IMAGE_CLASSIFICATION_MODELS = [
-    ("torchvision_resnet18", build_torchvision_resnet18, (3, 96, 96), "after:layer3"),
-    ("torchvision_mobilenet_v3_large", build_mobilenet_v3_large, (3, 96, 96), "after:features.10"),
-    ("timm_resnet50", build_timm_resnet50, (3, 96, 96), "after:layer3"),
-    ("timm_swin_tiny", build_timm_swin_tiny, (3, 224, 224), "after:layers.1"),
+    ("torchvision_resnet18", build_torchvision_resnet18, (3, 96, 96), "50%"),
+    ("torchvision_mobilenet_v3_large", build_mobilenet_v3_large, (3, 96, 96), "50%"),
+    ("timm_resnet50", build_timm_resnet50, (3, 96, 96), "50%"),
+    ("timm_swin_tiny", build_timm_swin_tiny, (3, 224, 224), "50%"),
 ]
 
 TEXT_CLASSIFICATION_MODELS = [
@@ -178,8 +178,8 @@ TEXT_CLASSIFICATION_MODELS = [
 ]
 
 SEGMENTATION_MODELS = [
-    ("deeplabv3_resnet50", build_deeplabv3_resnet50_wrapper, (3, 96, 96), "after:model.backbone.layer3.5"),
-    ("fcn_resnet50", build_fcn_resnet50_wrapper, (3, 96, 96), "after:model.backbone.layer3.5"),
+    ("deeplabv3_resnet50", build_deeplabv3_resnet50_wrapper, (3, 96, 96), "50%"),
+    ("fcn_resnet50", build_fcn_resnet50_wrapper, (3, 96, 96), "50%"),
     ("lraspp_mobilenet_v3_large", build_lraspp_wrapper, (3, 96, 96), "50%"),
 ]
 
@@ -233,7 +233,7 @@ def test_real_segmentation_models(name, builder, input_shape, boundary) -> None:
     runtime_inputs = torch.randn(3, *input_shape)
     mask = torch.randint(0, num_classes, (3, input_shape[1], input_shape[2]))
     runtime = run_split_inference_equivalence(model, trace_inputs, runtime_inputs, boundary)
-    split_output = runtime.runtime.run_suffix(runtime.runtime.run_prefix(runtime_inputs))
+    split_output = runtime.backend.run_suffix(runtime.backend.run_prefix(runtime_inputs))
     assert split_output.shape[:2] == (3, num_classes)
     run_split_training_smoke(
         model,

@@ -6,7 +6,7 @@ from torch import nn
 
 from splitfleet.client.autosplit_split_client import AutoSplitSplitLearningClient
 from splitfleet.common import ServerModelFitIns
-from splitfleet.server.server_model.ariadne_tail_server_model import AriadneTailServerModel
+from splitfleet.server.server_model.autosplit_tail_server_model import AutoSplitTailServerModel
 from splitfleet.server.server_model.proxy.server_model_proxy import ServerModelProxy
 from splitfleet.server.stage_runtime.manager import StageRuntimeManager
 from splitfleet.server.strategy import AutoSplitStrategy
@@ -66,7 +66,7 @@ def _model_to_ndarrays(model: nn.Module):
     return [tensor.detach().cpu().numpy() for tensor in model.state_dict().values()]
 
 
-def test_ariadne_split_learning_client_and_tail_exchange_boundary_payloads() -> None:
+def test_torchlens_split_learning_client_and_tail_exchange_boundary_payloads() -> None:
     torch.manual_seed(23)
     base_model = DeepNet()
     strategy_model = copy.deepcopy(base_model)
@@ -79,7 +79,7 @@ def test_ariadne_split_learning_client_and_tail_exchange_boundary_payloads() -> 
         boundary="50%",
         loss_fn=nn.MSELoss(),
         optimizer_fn=lambda model: torch.optim.SGD(model.parameters(), lr=0.05),
-        init_server_model_fn=lambda: AriadneTailServerModel(
+        init_server_model_fn=lambda: AutoSplitTailServerModel(
             runtime_manager=StageRuntimeManager(),
             model=strategy_model,
         ),
@@ -89,7 +89,7 @@ def test_ariadne_split_learning_client_and_tail_exchange_boundary_payloads() -> 
     manager.set_placement_plan(strategy.get_or_create_placement_plan())
     config = strategy._autosplit_config()
 
-    server_model = AriadneTailServerModel(
+    server_model = AutoSplitTailServerModel(
         runtime_manager=manager,
         model=strategy_model,
         optimizer_fn=lambda model: torch.optim.SGD(model.parameters(), lr=0.05),
@@ -128,7 +128,7 @@ def test_ariadne_split_learning_client_and_tail_exchange_boundary_payloads() -> 
     )
 
 
-def test_ariadne_splitfed_keeps_per_client_tail_semantics() -> None:
+def test_torchlens_splitfed_keeps_per_client_tail_semantics() -> None:
     strategy = AutoSplitStrategy(
         model=DeepNet(),
         sample_inputs=torch.randn(2, 4),
@@ -143,7 +143,7 @@ def test_ariadne_splitfed_keeps_per_client_tail_semantics() -> None:
     assert strategy.common_server_model is False
 
 
-def test_ariadne_tail_server_model_prepares_runtime_after_train_mode() -> None:
+def test_autosplit_tail_server_model_prepares_runtime_after_train_mode() -> None:
     torch.manual_seed(37)
     base_model = BatchNormNet().eval()
     strategy = AutoSplitStrategy(
@@ -155,7 +155,7 @@ def test_ariadne_tail_server_model_prepares_runtime_after_train_mode() -> None:
     manager = StageRuntimeManager(autosplit_session=strategy.autosplit_session)
     strategy.bind_stage_runtime_manager(manager)
     manager.set_placement_plan(strategy.get_or_create_placement_plan())
-    server_model = AriadneTailServerModel(
+    server_model = AutoSplitTailServerModel(
         runtime_manager=manager,
         model=base_model,
         loss_fn=nn.MSELoss(),
@@ -171,7 +171,7 @@ def test_ariadne_tail_server_model_prepares_runtime_after_train_mode() -> None:
 
     inputs = torch.randn(3, 4)
     expected = copy.deepcopy(server_model.model).train()(inputs)
-    boundary = server_model.runtime_handle.runtime.run_prefix(inputs)
-    split = server_model.runtime_handle.runtime.run_suffix(boundary)
+    boundary = server_model.runtime_handle.backend.run_prefix(inputs)
+    split = server_model.runtime_handle.backend.run_suffix(boundary)
 
     assert torch.allclose(split, expected, atol=1e-5, rtol=1e-5)

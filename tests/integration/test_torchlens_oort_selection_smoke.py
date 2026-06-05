@@ -9,7 +9,7 @@ from torch import nn
 
 from splitfleet.client.autosplit_split_client import AutoSplitSplitLearningClient
 from splitfleet.server.client_selection import OortSelector, OortSelectorConfig
-from splitfleet.server.server_model.ariadne_tail_server_model import AriadneTailServerModel
+from splitfleet.server.server_model.autosplit_tail_server_model import AutoSplitTailServerModel
 from splitfleet.server.server_model.proxy.server_model_proxy import ServerModelProxy
 from splitfleet.server.stage_runtime.manager import StageRuntimeManager
 from splitfleet.server.strategy import AutoSplitStrategy
@@ -75,7 +75,7 @@ def _model_to_ndarrays(model: nn.Module):
     return [tensor.detach().cpu().numpy() for tensor in model.state_dict().values()]
 
 
-def test_ariadne_split_training_smoke_with_oort_selection() -> None:
+def test_torchlens_split_training_smoke_with_oort_selection() -> None:
     torch.manual_seed(101)
     base_model = TinyNet()
     strategy_model = copy.deepcopy(base_model)
@@ -124,7 +124,7 @@ def test_ariadne_split_training_smoke_with_oort_selection() -> None:
             server_parameters,
             selected_cids,
         )
-        server_model = AriadneTailServerModel(
+        server_model = AutoSplitTailServerModel(
             runtime_manager=runtime_manager,
             model=strategy_model,
             optimizer_fn=lambda model: torch.optim.SGD(model.parameters(), lr=0.02),
