@@ -14,7 +14,7 @@ from splitfleet.autosplit.torchlens_backend import (
     backward_prefix,
     prepare_torchlens_runtime,
 )
-from splitfleet.autosplit.torchlens_runtime import normalize_example_inputs
+from splitfleet.autosplit.torchlens_runtime import normalize_example_inputs, require_torchlens_218
 from splitfleet.autosplit.types import SplitPlan
 
 
@@ -72,6 +72,7 @@ class AutoSplitSession:
     ) -> None:
         if backend != "torchlens":
             raise ValueError(f"Only the TorchLens autosplit backend is supported, got {backend!r}.")
+        require_torchlens_218()
         self.planner = planner or AutoSplitPlanner()
         self.cache_store = cache_store
         self.device = device
@@ -160,14 +161,27 @@ class AutoSplitSession:
         except KeyError as exc:
             raise RuntimeError(f"No TorchLens runtime handle is registered for plan {value!r}.") from exc
 
+    @staticmethod
+    def _runtime_context(handle: SplitRuntimeHandle) -> str:
+        plan = getattr(handle, "plan", None)
+        return (
+            f"torchlens_version={getattr(handle, 'torchlens_version', getattr(plan, 'torchlens_version', ''))!r}, "
+            f"boundary={getattr(plan, 'boundary', '')!r}, "
+            f"candidate_id={getattr(plan, 'candidate_id', '')!r}, "
+            f"feature_abi_id={getattr(handle, 'feature_abi_id', getattr(plan, 'feature_abi_id', ''))!r}"
+        )
+
     def compute_loss(self, outputs: Any, targets: Any = None, loss_fn=None) -> torch.Tensor:
         return compute_loss(outputs, targets, loss_fn)
 
     def run_eval(self, runtime_handle: SplitRuntimeHandle | SplitPlan, inputs: Any) -> Any:
         handle = self.get_runtime_handle(runtime_handle)
         with torch.no_grad():
-            boundary = handle.backend.run_prefix(*normalize_inputs(inputs))
-            return handle.backend.run_suffix(boundary)
+            try:
+                boundary = handle.backend.run_prefix(*normalize_inputs(inputs))
+                return handle.backend.run_suffix(boundary)
+            except Exception as exc:
+                raise RuntimeError(f"TorchLens split eval failed ({self._runtime_context(handle)}).") from exc
 
     def run_train(
         self,
@@ -180,19 +194,22 @@ class AutoSplitSession:
         suffix_optimizer=None,
     ) -> dict[str, Any]:
         handle = self.get_runtime_handle(runtime_handle)
-        boundary = handle.backend.run_prefix(*normalize_inputs(inputs), training=True)
-        loss, boundary_grads = handle.backend.train_suffix(
-            boundary,
-            targets,
-            loss_fn=loss_fn,
-            optimizer=suffix_optimizer,
-        )
-        backward_prefix(
-            handle,
-            boundary,
-            boundary_grads=boundary_grads,
-            optimizer=prefix_optimizer,
-        )
+        try:
+            boundary = handle.backend.run_prefix(*normalize_inputs(inputs), training=True)
+            loss, boundary_grads = handle.backend.train_suffix(
+                boundary,
+                targets,
+                loss_fn=loss_fn,
+                optimizer=suffix_optimizer,
+            )
+            backward_prefix(
+                handle,
+                boundary,
+                boundary_grads=boundary_grads,
+                optimizer=prefix_optimizer,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"TorchLens split train failed ({self._runtime_context(handle)}).") from exc
         return {
             "loss": loss,
             "boundary_grads": boundary_grads,

@@ -10,8 +10,10 @@ from splitfleet.autosplit import AutoSplitSession, PlacementConstraint, WorkerSp
 from splitfleet.client.autosplit_split_client import AutoSplitSplitLearningClient, _model_to_ndarrays
 from splitfleet.common.constants import (
     AUTOSPLIT_BOUNDARY_CONFIG_KEY,
+    AUTOSPLIT_DYNAMIC_BATCH_CONFIG_KEY,
     AUTOSPLIT_MODE_CONFIG_KEY,
     AUTOSPLIT_PLAN_ID_CONFIG_KEY,
+    AUTOSPLIT_RUNTIME_CONTRACT_CONFIG_KEY,
 )
 
 
@@ -124,6 +126,24 @@ def test_client_prepares_mode_specific_torchlens_runtimes() -> None:
 
     assert train_handle is not eval_handle
     assert torch.allclose(split_eval, expected_eval, atol=1e-5, rtol=1e-5)
+
+
+def test_client_rejects_malformed_autosplit_json_config() -> None:
+    client = AutoSplitSplitLearningClient(
+        model=BatchNormNet(),
+        train_data=[],
+        sample_inputs=torch.randn(2, 4),
+    )
+    config = {
+        AUTOSPLIT_PLAN_ID_CONFIG_KEY: "bad-contract-json",
+        AUTOSPLIT_BOUNDARY_CONFIG_KEY: "after:fc1",
+        AUTOSPLIT_MODE_CONFIG_KEY: "generated_eager",
+        AUTOSPLIT_RUNTIME_CONTRACT_CONFIG_KEY: "{not-json",
+        AUTOSPLIT_DYNAMIC_BATCH_CONFIG_KEY: "[2, 8]",
+    }
+
+    with pytest.raises(ValueError, match="Malformed JSON"):
+        client._prepare_round(_model_to_ndarrays(client.model), config, training=True)
 
 
 def test_torchlens_planner_rejects_sample_kwargs() -> None:

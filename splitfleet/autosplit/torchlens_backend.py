@@ -7,8 +7,6 @@ from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
 import torch
-from torchlens.split import SplitRuntime
-from torchlens.split.codegen import build_segments
 from torchlens.split.planner import plan_split
 
 from splitfleet.autosplit.boundary import (
@@ -21,7 +19,11 @@ from splitfleet.autosplit.torchlens_candidate import (
     build_candidate_descriptor,
     candidate_from_plan,
 )
-from splitfleet.autosplit.torchlens_contract import build_runtime_contract
+from splitfleet.autosplit.torchlens_contract import (
+    build_runtime_contract,
+    runtime_contract_digest,
+    stable_json,
+)
 from splitfleet.autosplit.torchlens_runtime import (
     TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION,
     first_tensor_batch_size,
@@ -41,6 +43,11 @@ class TorchLensRuntimeHandle:
     runtime: Any
     plan: SplitRuntimePlan
     backend: "TorchLensSplitBackend"
+    split_spec: Any | None = None
+    example_inputs: tuple[Any, ...] = ()
+    runtime_contract: dict[str, Any] | None = None
+    feature_abi_id: str = ""
+    torchlens_version: str = ""
 
 
 SplitRuntimeHandle = TorchLensRuntimeHandle
@@ -179,6 +186,9 @@ class TorchLensSplitBackend:
         self.model_family = model_family
         self.trace_batch_size: int | None = None
         self.validation: dict[str, Any] | None = None
+        self.runtime_contract: dict[str, Any] = {}
+        self.feature_abi_id: str = ""
+        self.feature_layout_id: str = ""
 
     def trace(
         self,
@@ -290,18 +300,11 @@ class TorchLensSplitBackend:
         if self.trace_sample_input is None or self.split_spec is None:
             raise RuntimeError("TorchLens split backend has not been traced.")
         self.split_spec = replace(self.split_spec, boundary=chosen.boundary)
-        base_runtime = self._ensure_runtime()
-        graph = getattr(base_runtime, "trace_graph", None)
-        if graph is None:
-            raise RuntimeError("TorchLens runtime does not expose trace_graph.")
-        plan = plan_split(graph, self.split_spec)
-        segments = build_segments(graph, plan, mode=self.split_spec.mode)
-        self.runtime = SplitRuntime(
-            model=model,
-            trace_graph=graph,
-            split_spec=self.split_spec,
-            plan=plan,
-            segments=segments,
+        self.runtime = prepare_split_runtime(
+            model,
+            self.trace_sample_input,
+            self.split_spec,
+            mode=self.split_spec.mode,
         )
         self.current_candidate = candidate_from_plan(
             self.runtime,
@@ -320,7 +323,23 @@ class TorchLensSplitBackend:
             if training and hasattr(runtime, "run_training_prefix")
             else runtime.run_prefix(*args)
         )
-        return _normalise_boundary_batch_metadata(from_torchlens_boundary(raw), args)
+        boundary_name = (
+            self.current_candidate.boundary
+            if self.current_candidate is not None
+            else str(getattr(self.split_spec, "boundary", ""))
+        )
+        payload = from_torchlens_boundary(
+            raw,
+            runtime=runtime,
+            boundary_name=boundary_name,
+            feature_layout_id=self.feature_layout_id,
+            feature_abi_id=self.feature_abi_id,
+        )
+        payload.metadata["runtime_backend"] = "torchlens_native"
+        payload.metadata["torchlens_version"] = torchlens_runtime_version()
+        if self.runtime_contract:
+            payload.metadata["runtime_contract_digest"] = runtime_contract_digest(self.runtime_contract)
+        return _normalise_boundary_batch_metadata(payload, args)
 
     def run_suffix(self, boundary: BoundaryPayload) -> Any:
         runtime = self._ensure_runtime()
@@ -361,13 +380,38 @@ class TorchLensSplitBackend:
         runtime = self._ensure_runtime()
         backward = getattr(runtime, "backward_prefix", None)
         if not callable(backward):
-            raise RuntimeError("TorchLens SplitRuntime does not support backward_prefix.")
+            try:
+                from torchlens.split.training import backward_prefix as training_backward_prefix
+            except Exception:
+                training_backward_prefix = None
+            if not callable(training_backward_prefix):
+                raise RuntimeError(
+                    "TorchLens SplitRuntime does not support backward_prefix "
+                    f"(torchlens_version={torchlens_runtime_version()}, "
+                    f"boundary={getattr(self.current_candidate, 'boundary', None)!r}, "
+                    f"candidate_id={getattr(self.current_candidate, 'candidate_id', None)!r}, "
+                    f"feature_abi_id={self.feature_abi_id!r})."
+                )
+            backward = lambda native, boundary_grads, optimizer=None: training_backward_prefix(
+                runtime,
+                native,
+                boundary_grads,
+                optimizer,
+            )
         native = to_torchlens_boundary(boundary)
         device = _runtime_device(runtime)
         if device is not None:
             native = native.to(device)
             boundary_grads = _move_to_device(boundary_grads, device)
         backward(native, boundary_grads=boundary_grads, optimizer=optimizer)
+
+    def compare_outputs(self, expected: Any, actual: Any) -> dict[str, Any]:
+        success, max_abs, max_rel = _compare_outputs(expected, actual)
+        return {
+            "success": bool(success),
+            "max_abs_diff": float(max_abs),
+            "max_rel_diff": float(max_rel),
+        }
 
     def validate_candidate(self, candidate: SplitCandidate | None = None) -> dict[str, Any]:
         chosen = candidate or self.current_candidate
@@ -376,6 +420,11 @@ class TorchLensSplitBackend:
                 "success": False,
                 "candidate_id": None,
                 "runtime": "torchlens_native",
+                "runtime_backend": "torchlens_native",
+                "torchlens_version": torchlens_runtime_version(),
+                "boundary": None,
+                "max_abs_diff": float("inf"),
+                "max_rel_diff": float("inf"),
                 "error": "no candidate selected",
             }
         if candidate is not None and (
@@ -389,6 +438,11 @@ class TorchLensSplitBackend:
                     "success": False,
                     "candidate_id": candidate.candidate_id,
                     "runtime": "torchlens_native",
+                    "runtime_backend": "torchlens_native",
+                    "torchlens_version": torchlens_runtime_version(),
+                    "boundary": candidate.boundary,
+                    "max_abs_diff": float("inf"),
+                    "max_rel_diff": float("inf"),
                     "error": str(exc),
                 }
         runtime = self._ensure_runtime()
@@ -405,6 +459,11 @@ class TorchLensSplitBackend:
                 "success": False,
                 "candidate_id": chosen.candidate_id,
                 "runtime": "torchlens_native",
+                "runtime_backend": "torchlens_native",
+                "torchlens_version": torchlens_runtime_version(),
+                "boundary": chosen.boundary,
+                "max_abs_diff": float("inf"),
+                "max_rel_diff": float("inf"),
                 "error": str(exc),
             }
         return {
@@ -413,6 +472,9 @@ class TorchLensSplitBackend:
             "max_rel_diff": float(max_rel),
             "candidate_id": chosen.candidate_id,
             "runtime": "torchlens_native",
+            "runtime_backend": "torchlens_native",
+            "torchlens_version": torchlens_runtime_version(),
+            "boundary": chosen.boundary,
             "error": None if success else "split replay output mismatch",
             "tail_trainability": bool(chosen.is_trainable_tail),
             "split_id": chosen.boundary,
@@ -429,18 +491,25 @@ class TorchLensSplitBackend:
         feature_layout = dict(candidate.descriptor.get("feature_layout") or {})
         contract = build_runtime_contract(
             model_family=str(self.model_family or self.model_name or ""),
+            model_name=str(self.model_name or ""),
             canonical_split_key=candidate.boundary,
             graph_signature=trace_signature(runtime),
             boundary_tensor_labels=list(candidate.boundary_tensor_labels),
             boundary_schema=boundary_schema,
             feature_layout=feature_layout,
             runtime_backend="torchlens_native",
+            torchlens_version=torchlens_runtime_version(),
             adapter_version=TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION,
             runtime_version=torchlens_runtime_version(),
+            boundary=candidate.boundary,
             trace_batch_mode=str(getattr(split_spec, "trace_batch_mode", "")),
             dynamic_batch=getattr(split_spec, "dynamic_batch", None),
             trace_batch_size=self.trace_batch_size,
+            batch_symbol=str(getattr(split_spec, "batch_symbol", "B") or "B"),
         )
+        self.runtime_contract = dict(contract)
+        self.feature_abi_id = str(contract.get("feature_abi_id", ""))
+        self.feature_layout_id = str(contract.get("feature_layout_id", ""))
         actual_split_id = str(candidate.boundary)
         runtime_plan = SplitRuntimePlan(
             plan_id=_make_plan_id(
@@ -464,6 +533,14 @@ class TorchLensSplitBackend:
             candidate_id=candidate.candidate_id,
             split_label=candidate.split_label,
             boundary_tensor_labels=list(candidate.boundary_tensor_labels),
+            backend="torchlens",
+            runtime_backend="torchlens_native",
+            torchlens_version=torchlens_runtime_version(),
+            model_name=str(self.model_name or ""),
+            model_family=str(self.model_family or self.model_name or ""),
+            canonical_split_key=candidate.boundary,
+            feature_layout_id=str(contract.get("feature_layout_id", "")),
+            feature_abi_id=str(contract.get("feature_abi_id", "")),
             runtime_contract=contract,
             metadata={
                 "boundary_nodes": tuple(candidate.boundary_tensor_labels),
@@ -471,6 +548,9 @@ class TorchLensSplitBackend:
                 "candidate_descriptor": build_candidate_descriptor(candidate),
                 "feature_layout_id": contract.get("feature_layout_id", ""),
                 "feature_abi_id": contract.get("feature_abi_id", ""),
+                "runtime_contract_digest": runtime_contract_digest(contract),
+                "runtime_contract_json": stable_json(contract),
+                "torchlens_version": torchlens_runtime_version(),
                 "_example_inputs": self.trace_sample_input,
             },
         )
@@ -479,6 +559,11 @@ class TorchLensSplitBackend:
             runtime=runtime,
             plan=runtime_plan,
             backend=self,
+            split_spec=split_spec,
+            example_inputs=tuple(self.trace_sample_input or ()),
+            runtime_contract=contract,
+            feature_abi_id=str(contract.get("feature_abi_id", "")),
+            torchlens_version=torchlens_runtime_version(),
         )
 
 

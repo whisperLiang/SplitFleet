@@ -1,30 +1,62 @@
-"""TorchLens native split runtime preparation for SplitFleet."""
+"""Thin TorchLens 2.18 native split runtime wrappers for SplitFleet."""
 
 from __future__ import annotations
 
 import importlib.metadata
-from dataclasses import replace
+from dataclasses import fields, replace
 from typing import Any, Literal
 
 import torch
-from torchlens.options import CaptureOptions, VisualizationOptions
-from torchlens.split import ReplayBoundary, SplitRuntime, SplitSpec
-from torchlens.split.codegen import build_segments
-from torchlens.split.planner import plan_split
+from torchlens.split import (
+    ReplayBoundary,
+    SplitRuntime,
+    SplitSpec,
+    prepare_split,
+    prepare_split_replay,
+)
 from torchlens.split.shape import infer_traced_batch_size
-from torchlens.split.trace_graph import trace_graph_from_model_log
-from torchlens.user_funcs import log_forward_pass
 
 
 DEFAULT_SPLIT_MODE = "generated_eager"
-TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION = "splitfleet-torchlens-native-runtime-v1"
+TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION = "splitfleet-torchlens-native-runtime-v2"
+TORCHLENS_MIN_NATIVE_RUNTIME_VERSION = "2.18.0"
 
 
 def torchlens_runtime_version() -> str:
     try:
+        import torchlens as tl
+
+        version = getattr(tl, "__version__", None)
+        if version:
+            return str(version)
+    except Exception:
+        pass
+    try:
         return importlib.metadata.version("torchlens")
     except importlib.metadata.PackageNotFoundError:
         return "unknown"
+
+
+def require_torchlens_218() -> None:
+    version = torchlens_runtime_version()
+    if _version_tuple(version) < _version_tuple(TORCHLENS_MIN_NATIVE_RUNTIME_VERSION):
+        raise RuntimeError(
+            "SplitFleet TorchLens autosplit requires torchlens>=2.18.0, "
+            f"but imported torchlens version is {version!r}."
+        )
+
+
+def _version_tuple(value: str) -> tuple[int, ...]:
+    parts: list[int] = []
+    for piece in str(value).split("."):
+        digits = ""
+        for char in piece:
+            if not char.isdigit():
+                break
+            digits += char
+        if digits:
+            parts.append(int(digits))
+    return tuple(parts or [0])
 
 
 def normalize_example_inputs(example_inputs: Any) -> tuple[Any, ...]:
@@ -69,39 +101,60 @@ def _normalize_mode(mode: str | None) -> Literal["generated_eager", "compiled"]:
     return normalized  # type: ignore[return-value]
 
 
+def _split_spec_field_names() -> set[str]:
+    return {field.name for field in fields(SplitSpec)}
+
+
 def make_split_spec(
     boundary: Any,
     *,
     batch_symbol: str = "B",
-    dynamic_batch: tuple[int, int] | None = (2, 64),
+    dynamic_batch: tuple[int, int] | None = None,
     trainable: bool = True,
     trace_batch_mode: str = "batch_gt1",
+    device_policy: str = "runtime",
     mode: str = DEFAULT_SPLIT_MODE,
+    use_live_param_sources: bool | None = True,
 ) -> SplitSpec:
     if isinstance(boundary, SplitSpec):
-        if mode is None or getattr(boundary, "mode", None) == mode:
-            return boundary
-        return replace(boundary, mode=_normalize_mode(mode))
+        updates: dict[str, Any] = {}
+        if mode is not None and getattr(boundary, "mode", None) != mode:
+            updates["mode"] = _normalize_mode(mode)
+        if "use_live_param_sources" in _split_spec_field_names() and (
+            use_live_param_sources is not None
+            and getattr(boundary, "use_live_param_sources", None) != use_live_param_sources
+        ):
+            updates["use_live_param_sources"] = use_live_param_sources
+        return replace(boundary, **updates) if updates else boundary
+
     if hasattr(boundary, "boundary") and not isinstance(boundary, str):
         config = boundary
-        return SplitSpec(
-            boundary=str(config.boundary),
-            batch_symbol=batch_symbol,
-            dynamic_batch=getattr(config, "dynamic_batch", dynamic_batch),
-            trainable=bool(getattr(config, "trainable", trainable)),
-            trace_batch_mode=str(getattr(config, "trace_batch_mode", trace_batch_mode)),
-            device_policy="runtime",
-            mode=_normalize_mode(getattr(config, "mode", mode)),
-        )
-    return SplitSpec(
-        boundary=str(boundary),
-        batch_symbol=batch_symbol,
-        dynamic_batch=dynamic_batch,
-        trainable=bool(trainable),
-        trace_batch_mode=str(trace_batch_mode or "batch_gt1"),
-        device_policy="runtime",
-        mode=_normalize_mode(mode),
-    )
+        boundary_value = str(config.boundary)
+        dynamic_batch_value = getattr(config, "dynamic_batch", dynamic_batch)
+        trainable_value = bool(getattr(config, "trainable", trainable))
+        trace_batch_mode_value = str(getattr(config, "trace_batch_mode", trace_batch_mode))
+        mode_value = _normalize_mode(getattr(config, "mode", mode))
+        use_live_value = getattr(config, "use_live_param_sources", use_live_param_sources)
+    else:
+        boundary_value = str(boundary)
+        dynamic_batch_value = dynamic_batch
+        trainable_value = bool(trainable)
+        trace_batch_mode_value = str(trace_batch_mode or "batch_gt1")
+        mode_value = _normalize_mode(mode)
+        use_live_value = use_live_param_sources
+
+    kwargs: dict[str, Any] = {
+        "boundary": boundary_value,
+        "batch_symbol": batch_symbol,
+        "dynamic_batch": dynamic_batch_value,
+        "trainable": trainable_value,
+        "trace_batch_mode": trace_batch_mode_value,
+        "device_policy": device_policy,
+        "mode": mode_value,
+    }
+    if "use_live_param_sources" in _split_spec_field_names():
+        kwargs["use_live_param_sources"] = use_live_value
+    return SplitSpec(**kwargs)
 
 
 def _spec_with_mode(split_spec_or_boundary: SplitSpec | str, mode: str | None) -> SplitSpec:
@@ -143,49 +196,18 @@ def _clear_torchlens_module_state(model: torch.nn.Module) -> None:
                 setattr(module, "forward", wrapped)
 
 
-def _prepare_split(model: torch.nn.Module, example_inputs: Any, spec: SplitSpec) -> SplitRuntime:
-    inputs = normalize_example_inputs(example_inputs)
-    _validate_trace_batch(inputs, spec)
-    _clear_torchlens_module_state(model)
-    model_log = log_forward_pass(
-        model,
-        inputs,
-        {},
-        capture=CaptureOptions(
-            layers_to_save="all",
-            keep_unsaved_layers=True,
-            detach_saved_tensors=False,
-            save_function_args=True,
-            intervention_ready=True,
-        ),
-        visualization=VisualizationOptions(view="none"),
-    )
-    traced_batch_size = infer_traced_batch_size(inputs)
-    graph = trace_graph_from_model_log(
-        model_log,
-        traced_batch_size=traced_batch_size,
-        batch_symbol=spec.batch_symbol,
-        dynamic_batch=spec.dynamic_batch,
-    )
-    plan = plan_split(graph, spec)
-    segments = build_segments(graph, plan, mode=spec.mode)
-    return SplitRuntime(
-        model=model,
-        trace_graph=graph,
-        split_spec=spec,
-        plan=plan,
-        segments=segments,
-    )
-
-
 def prepare_split_runtime(
     model: torch.nn.Module,
     example_inputs: Any,
     split_spec_or_boundary: SplitSpec | str,
     mode: str | None = None,
 ) -> SplitRuntime:
+    require_torchlens_218()
+    inputs = normalize_example_inputs(example_inputs)
     spec = _spec_with_mode(split_spec_or_boundary, mode)
-    return _prepare_split(model, example_inputs, spec)
+    _validate_trace_batch(inputs, spec)
+    _clear_torchlens_module_state(model)
+    return prepare_split(model, inputs, spec)
 
 
 def prepare_split_replay_runtime(
@@ -194,17 +216,30 @@ def prepare_split_replay_runtime(
     split_spec_or_boundary: SplitSpec | str,
     mode: str | None = None,
 ) -> SplitRuntime:
+    require_torchlens_218()
+    inputs = normalize_example_inputs(example_inputs)
     spec = _spec_with_mode(split_spec_or_boundary, mode)
-    replay_spec = SplitSpec(
-        boundary=spec.boundary,
-        batch_symbol=spec.batch_symbol,
-        dynamic_batch=spec.dynamic_batch,
-        trainable=False,
-        trace_batch_mode=spec.trace_batch_mode,
-        device_policy=spec.device_policy,
-        mode=spec.mode,
-    )
-    return _prepare_split(model, example_inputs, replay_spec)
+    _validate_trace_batch(inputs, spec)
+    _clear_torchlens_module_state(model)
+    return prepare_split_replay(model, inputs, spec)
+
+
+def prepare_torchlens_runtime(
+    model: torch.nn.Module,
+    example_inputs: Any,
+    split_spec_or_boundary: SplitSpec | str,
+    mode: str | None = None,
+) -> SplitRuntime:
+    return prepare_split_runtime(model, example_inputs, split_spec_or_boundary, mode)
+
+
+def prepare_torchlens_replay_runtime(
+    model: torch.nn.Module,
+    example_inputs: Any,
+    split_spec_or_boundary: SplitSpec | str,
+    mode: str | None = None,
+) -> SplitRuntime:
+    return prepare_split_replay_runtime(model, example_inputs, split_spec_or_boundary, mode)
 
 
 def build_split_runtime(model: Any, example_batch: Any, config: Any) -> SplitRuntime:
@@ -214,6 +249,10 @@ def build_split_runtime(model: Any, example_batch: Any, config: Any) -> SplitRun
         raise ValueError("TorchLens batch_gt1 tracing requires example_batch batch size > 1.")
     spec = make_split_spec(config)
     return prepare_split_runtime(model, inputs, spec, mode=spec.mode)
+
+
+def build_torchlens_runtime(model: Any, example_batch: Any, config: Any) -> SplitRuntime:
+    return build_split_runtime(model, example_batch, config)
 
 
 def trace_signature(runtime: Any) -> str:
@@ -228,6 +267,7 @@ def get_split_runtime_metadata(runtime: Any) -> dict[str, Any]:
         "split_id": getattr(runtime, "split_id", None),
         "graph_signature": trace_signature(runtime),
         "runtime_backend": "torchlens_native",
+        "torchlens_version": torchlens_runtime_version(),
         "torchlens_mode": getattr(split_spec, "mode", None),
         "boundary": getattr(split_spec, "boundary", None),
         "split_label": getattr(plan, "split_label", None),
@@ -243,8 +283,10 @@ __all__ = [
     "ReplayBoundary",
     "SplitRuntime",
     "SplitSpec",
+    "TORCHLENS_MIN_NATIVE_RUNTIME_VERSION",
     "TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION",
     "build_split_runtime",
+    "build_torchlens_runtime",
     "first_tensor_batch_size",
     "get_split_runtime_metadata",
     "infer_trace_batch_mode",
@@ -252,6 +294,9 @@ __all__ = [
     "normalize_example_inputs",
     "prepare_split_replay_runtime",
     "prepare_split_runtime",
+    "prepare_torchlens_replay_runtime",
+    "prepare_torchlens_runtime",
+    "require_torchlens_218",
     "torchlens_runtime_version",
     "trace_signature",
 ]

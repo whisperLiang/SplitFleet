@@ -9,6 +9,7 @@ from splitfleet.autosplit.torchlens_contract import (
     build_runtime_contract,
     classify_contract_compatibility,
     feature_abi_id,
+    stable_json,
 )
 
 
@@ -110,47 +111,82 @@ def test_feature_abi_is_batch_symbolic_and_runtime_identity_tolerant() -> None:
         }
     }
     layout = {"x": {"dtype": "torch.float32", "shape_without_batch": [8], "rank": 2}}
+    cuda_layout = {"x": {"dtype": "torch.float32", "shape_without_batch": [8], "rank": 2, "device": "cuda:0"}}
     spec_b1 = build_feature_abi_spec(
+        torchlens_version="2.18.0",
         model_family="toy",
+        model_name="ToyNet",
         canonical_split_key="after:x",
         graph_signature="graph",
+        boundary="after:x",
         boundary_tensor_labels=["x"],
         boundary_schema=schema_b1,
         feature_layout=layout,
+        trace_batch_mode="batch_gt1",
+        dynamic_batch=(1, 8),
     )
     spec_b2 = build_feature_abi_spec(
+        torchlens_version="2.18.0",
+        model_family="toy",
+        model_name="ToyNet",
+        canonical_split_key="after:x",
+        graph_signature="graph",
+        boundary="after:x",
+        boundary_tensor_labels=["x"],
+        boundary_schema=schema_b2,
+        feature_layout=cuda_layout,
+        trace_batch_mode="batch_gt1",
+        dynamic_batch=(1, 8),
+    )
+    assert feature_abi_id(spec_b1) == feature_abi_id(spec_b2)
+    assert "tensor(" not in stable_json(spec_b1)
+
+    sample_a = build_feature_abi_spec(
         model_family="toy",
         canonical_split_key="after:x",
         graph_signature="graph",
-        boundary_tensor_labels=["x"],
-        boundary_schema=schema_b2,
-        feature_layout=layout,
+        preprocessing_abi={"sample": torch.tensor([[1.0, 2.0]])},
     )
-    assert feature_abi_id(spec_b1) == feature_abi_id(spec_b2)
+    sample_b = build_feature_abi_spec(
+        model_family="toy",
+        canonical_split_key="after:x",
+        graph_signature="graph",
+        preprocessing_abi={"sample": torch.tensor([[9.0, 8.0]])},
+    )
+    encoded_sample = stable_json(sample_a)
+    assert feature_abi_id(sample_a) == feature_abi_id(sample_b)
+    assert "tensor(" not in encoded_sample
+    assert "1.0" not in encoded_sample
+    assert "2.0" not in encoded_sample
 
     edge_contract = build_runtime_contract(
         model_family="toy",
+        model_name="ToyNet",
         canonical_split_key="after:x",
         graph_signature="graph",
         boundary_tensor_labels=["x"],
         boundary_schema=schema_b1,
         feature_layout=layout,
-        runtime_version="2.17.0",
+        torchlens_version="2.18.0",
+        runtime_version="2.18.0",
         trace_batch_size=1,
     )
     cloud_contract = build_runtime_contract(
         model_family="toy",
+        model_name="ToyNet",
         canonical_split_key="after:x",
         graph_signature="graph",
         boundary_tensor_labels=["x"],
         boundary_schema=schema_b2,
-        feature_layout=layout,
-        runtime_version="2.17.1",
+        feature_layout=cuda_layout,
+        torchlens_version="2.18.0",
+        runtime_version="2.18.0",
         trace_batch_size=2,
     )
     compatibility = classify_contract_compatibility(edge_contract, cloud_contract)
     assert compatibility["compatible"] is True
     assert compatibility["reason"] == "runtime_identity_changed_but_feature_abi_compatible"
+    assert edge_contract["torchlens_version"] == "2.18.0"
 
 
 def test_feature_abi_rejects_label_order_dtype_and_shape_changes() -> None:

@@ -7,17 +7,55 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping
 
+import numpy as np
+import torch
 
-FEATURE_ABI_VERSION = "feature-abi.v1"
-RUNTIME_CONTRACT_VERSION = "splitfleet-torchlens-runtime-contract.v1"
+
+FEATURE_ABI_VERSION = "feature-abi.v2"
+RUNTIME_CONTRACT_VERSION = "splitfleet-torchlens-runtime-contract.v2"
+TORCHLENS_NATIVE_RUNTIME_BACKEND = "torchlens_native"
 
 
 def stable_json(payload: object) -> str:
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return json.dumps(_json_safe(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def stable_digest(payload: object) -> str:
+    return hashlib.sha1(stable_json(payload).encode("utf-8")).hexdigest()
+
+
+def _json_safe(value: Any) -> Any:
+    if hasattr(value, "to_dict") and callable(value.to_dict):
+        return _json_safe(value.to_dict())
+    if hasattr(value, "__dataclass_fields__"):
+        return _json_safe(asdict(value))
+    if isinstance(value, torch.Tensor):
+        return {
+            "kind": "torch.Tensor",
+            "dtype": _normalise_dtype(value.dtype),
+            "symbolic_shape": _symbolize_batch_shape(tuple(int(dim) for dim in value.shape)),
+            "requires_grad": bool(value.requires_grad),
+        }
+    if isinstance(value, np.ndarray):
+        return {
+            "kind": "numpy.ndarray",
+            "dtype": str(value.dtype),
+            "symbolic_shape": _symbolize_batch_shape(tuple(int(dim) for dim in value.shape)),
+        }
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
 
 
 def _normalise_dtype(value: object) -> str:
-    return str(value or "").replace("torch.", "")
+    text = str(value or "")
+    return text.replace("torch.", "")
 
 
 def _normalise_shape_dim(value: object) -> int | str:
@@ -34,8 +72,17 @@ def _symbolize_batch_shape(shape: object, *, batch_symbol: str = "B") -> list[in
     return [batch_symbol, *[_normalise_shape_dim(dim) for dim in dims[1:]]]
 
 
+def _normalise_dynamic_batch(value: Any) -> list[int] | None:
+    if value is None:
+        return None
+    low, high = list(value)
+    return [int(low), int(high)]
+
+
 def _normalise_boundary_schema(
     boundary_schema: Mapping[str, Any] | None,
+    *,
+    batch_symbol: str = "B",
 ) -> dict[str, dict[str, Any]]:
     normalised: dict[str, dict[str, Any]] = {}
     for label, spec in dict(boundary_schema or {}).items():
@@ -57,7 +104,8 @@ def _normalise_boundary_schema(
             "module_path": str(payload.get("module_path") or ""),
             "op_type": str(payload.get("op_type") or payload.get("op") or ""),
             "symbolic_shape": _symbolize_batch_shape(
-                payload.get("symbolic_shape") or payload.get("shape") or ()
+                payload.get("symbolic_shape") or payload.get("shape") or (),
+                batch_symbol=batch_symbol,
             ),
             "dtype": _normalise_dtype(payload.get("dtype")),
             "requires_grad": bool(payload.get("requires_grad", False)),
@@ -93,6 +141,8 @@ def _ordered_boundary_tensors(
                 "dtype": _normalise_dtype(spec.get("dtype")),
                 "rank": int(spec.get("rank") or len(shape_without_batch) + 1),
                 "shape_without_batch": shape_without_batch,
+                "requires_grad": bool(spec.get("requires_grad", False)),
+                "device_policy": str(spec.get("device_policy") or "runtime"),
             }
         )
     return tensors
@@ -101,61 +151,94 @@ def _ordered_boundary_tensors(
 @dataclass(frozen=True)
 class FeatureAbiSpec:
     version: str
+    runtime_backend: str
+    torchlens_version: str
     model_family: str
+    model_name: str
+    adapter_version: str
+    runtime_version: str
     canonical_split_key: str
     graph_signature: str
+    boundary: str
     boundary_tensor_labels: list[str]
     boundary_tensors: list[dict[str, Any]]
     boundary_schema: dict[str, dict[str, Any]]
+    passthrough_specs: dict[str, Any]
     preprocessing_abi: dict[str, Any]
-    passthrough_specs: dict[str, Any] = field(default_factory=dict)
+    trace_batch_mode: str
+    dynamic_batch: list[int] | None
+    batch_symbol: str
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return _json_safe(asdict(self))
 
 
 def build_feature_abi_spec(
     *,
+    runtime_backend: str = TORCHLENS_NATIVE_RUNTIME_BACKEND,
+    torchlens_version: str = "",
     model_family: str = "",
+    model_name: str = "",
     adapter_version: str = "",
     runtime_version: str = "",
     canonical_split_key: str = "",
     graph_signature: str = "",
+    boundary: str = "",
     boundary_tensor_labels: list[str] | tuple[str, ...] | None = None,
     boundary_schema: Mapping[str, Any] | None = None,
     feature_layout: Mapping[str, Mapping[str, Any]] | None = None,
     preprocessing_abi: Mapping[str, Any] | None = None,
     passthrough_specs: Mapping[str, Any] | None = None,
+    trace_batch_mode: str = "",
+    dynamic_batch: tuple[int, int] | list[int] | None = None,
+    batch_symbol: str = "B",
 ) -> FeatureAbiSpec:
-    _ = (adapter_version, runtime_version)
     labels = [str(label) for label in list(boundary_tensor_labels or [])]
     preprocessing = dict(preprocessing_abi or {})
     if "input_tensor_shape" in preprocessing:
-        preprocessing["input_tensor_shape"] = _symbolize_batch_shape(preprocessing["input_tensor_shape"])
+        preprocessing["input_tensor_shape"] = _symbolize_batch_shape(
+            preprocessing["input_tensor_shape"],
+            batch_symbol=batch_symbol,
+        )
     return FeatureAbiSpec(
         version=FEATURE_ABI_VERSION,
+        runtime_backend=str(runtime_backend or TORCHLENS_NATIVE_RUNTIME_BACKEND),
+        torchlens_version=str(torchlens_version or runtime_version or ""),
         model_family=str(model_family or ""),
-        canonical_split_key=str(canonical_split_key or ""),
+        model_name=str(model_name or ""),
+        adapter_version=str(adapter_version or ""),
+        runtime_version=str(runtime_version or torchlens_version or ""),
+        canonical_split_key=str(canonical_split_key or boundary or ""),
         graph_signature=str(graph_signature or ""),
+        boundary=str(boundary or canonical_split_key or ""),
         boundary_tensor_labels=labels,
         boundary_tensors=_ordered_boundary_tensors(feature_layout, labels),
-        boundary_schema=_normalise_boundary_schema(boundary_schema),
-        preprocessing_abi=preprocessing,
-        passthrough_specs=dict(passthrough_specs or {}),
+        boundary_schema=_normalise_boundary_schema(boundary_schema, batch_symbol=batch_symbol),
+        passthrough_specs=_json_safe(dict(passthrough_specs or {})),
+        preprocessing_abi=_json_safe(preprocessing),
+        trace_batch_mode=str(trace_batch_mode or ""),
+        dynamic_batch=_normalise_dynamic_batch(dynamic_batch),
+        batch_symbol=str(batch_symbol or "B"),
     )
 
 
 def feature_abi_id(spec: FeatureAbiSpec | Mapping[str, Any]) -> str:
     payload = spec.to_dict() if isinstance(spec, FeatureAbiSpec) else dict(spec)
-    return hashlib.sha1(stable_json(payload).encode("utf-8")).hexdigest()
+    return stable_digest(payload)
 
 
 def feature_layout_id(layout: Mapping[str, Any]) -> str:
-    return hashlib.sha1(stable_json(dict(layout)).encode("utf-8")).hexdigest()
+    return stable_digest(dict(layout))
 
 
 def runtime_identity_id(identity: Mapping[str, Any]) -> str:
-    return hashlib.sha1(stable_json(dict(identity)).encode("utf-8")).hexdigest()
+    return stable_digest(dict(identity))
+
+
+def runtime_contract_digest(contract: Mapping[str, Any]) -> str:
+    payload = dict(contract)
+    payload.pop("runtime_contract_digest", None)
+    return stable_digest(payload)
 
 
 def build_runtime_contract(
@@ -168,63 +251,93 @@ def build_runtime_contract(
     feature_layout: Mapping[str, Mapping[str, Any]] | None = None,
     preprocessing_abi: Mapping[str, Any] | None = None,
     passthrough_specs: Mapping[str, Any] | None = None,
-    runtime_backend: str = "torchlens_native",
+    runtime_backend: str = TORCHLENS_NATIVE_RUNTIME_BACKEND,
+    torchlens_version: str = "",
+    model_name: str = "",
     adapter_version: str = "",
     runtime_version: str = "",
+    boundary: str = "",
     trace_batch_mode: str = "",
-    dynamic_batch: tuple[int, int] | None = None,
+    dynamic_batch: tuple[int, int] | list[int] | None = None,
     trace_batch_size: int | None = None,
+    batch_symbol: str = "B",
 ) -> dict[str, Any]:
     labels = [str(label) for label in list(boundary_tensor_labels or [])]
+    resolved_torchlens_version = str(torchlens_version or runtime_version or "")
     abi_spec = build_feature_abi_spec(
+        runtime_backend=runtime_backend,
+        torchlens_version=resolved_torchlens_version,
         model_family=model_family,
+        model_name=model_name,
         adapter_version=adapter_version,
-        runtime_version=runtime_version,
+        runtime_version=runtime_version or resolved_torchlens_version,
         canonical_split_key=canonical_split_key,
         graph_signature=graph_signature,
+        boundary=boundary or canonical_split_key,
         boundary_tensor_labels=labels,
         boundary_schema=boundary_schema,
         feature_layout=feature_layout,
         preprocessing_abi=preprocessing_abi,
         passthrough_specs=passthrough_specs,
+        trace_batch_mode=trace_batch_mode,
+        dynamic_batch=dynamic_batch,
+        batch_symbol=batch_symbol,
     )
     layout = {
-        str(label): dict(spec)
+        str(label): _json_safe(dict(spec))
         for label, spec in dict(feature_layout or {}).items()
         if isinstance(spec, Mapping)
     }
     identity = {
         "runtime_backend": runtime_backend,
+        "torchlens_version": resolved_torchlens_version,
         "adapter_version": adapter_version,
-        "runtime_version": runtime_version,
+        "runtime_version": runtime_version or resolved_torchlens_version,
         "canonical_split_key": canonical_split_key,
         "graph_signature": graph_signature,
+        "boundary": boundary or canonical_split_key,
         "trace_batch_mode": trace_batch_mode,
-        "dynamic_batch": dynamic_batch,
+        "dynamic_batch": _normalise_dynamic_batch(dynamic_batch),
         "trace_batch_size": trace_batch_size,
+        "batch_symbol": batch_symbol,
     }
-    return {
+    contract = {
         "contract_version": RUNTIME_CONTRACT_VERSION,
         "runtime_backend": runtime_backend,
-        "canonical_split_key": canonical_split_key,
-        "graph_signature": graph_signature,
+        "torchlens_version": resolved_torchlens_version,
+        "model_family": str(model_family or ""),
+        "model_name": str(model_name or ""),
+        "adapter_version": str(adapter_version or ""),
+        "runtime_version": str(runtime_version or resolved_torchlens_version),
+        "canonical_split_key": str(canonical_split_key or ""),
+        "graph_signature": str(graph_signature or ""),
+        "boundary": str(boundary or canonical_split_key or ""),
         "boundary_tensor_labels": labels,
         "boundary_schema": abi_spec.boundary_schema,
         "feature_layout": layout,
         "feature_layout_id": feature_layout_id(layout) if layout else "",
         "feature_abi_spec": abi_spec.to_dict(),
         "feature_abi_id": feature_abi_id(abi_spec),
-        "runtime_identity": identity,
+        "runtime_identity": _json_safe(identity),
         "runtime_identity_id": runtime_identity_id(identity),
-        "trace_batch_mode": trace_batch_mode,
-        "dynamic_batch": dynamic_batch,
+        "trace_batch_mode": str(trace_batch_mode or ""),
+        "dynamic_batch": _normalise_dynamic_batch(dynamic_batch),
         "trace_batch_size": trace_batch_size,
+        "batch_symbol": str(batch_symbol or "B"),
     }
+    contract["runtime_contract_digest"] = runtime_contract_digest(contract)
+    return _json_safe(contract)
 
 
 def _contract_payload(contract: Mapping[str, Any] | object | None) -> dict[str, Any]:
     if contract is None:
         return {}
+    if isinstance(contract, str):
+        try:
+            value = json.loads(contract)
+        except json.JSONDecodeError:
+            return {}
+        return dict(value) if isinstance(value, Mapping) else {}
     if isinstance(contract, Mapping):
         return dict(contract)
     to_dict = getattr(contract, "to_dict", None)
@@ -299,3 +412,20 @@ def classify_contract_compatibility(
         "edge_boundary_tensor_labels": [str(label) for label in list(edge.get("boundary_tensor_labels") or [])],
         "cloud_boundary_tensor_labels": [str(label) for label in list(cloud.get("boundary_tensor_labels") or [])],
     }
+
+
+__all__ = [
+    "FEATURE_ABI_VERSION",
+    "RUNTIME_CONTRACT_VERSION",
+    "TORCHLENS_NATIVE_RUNTIME_BACKEND",
+    "FeatureAbiSpec",
+    "build_feature_abi_spec",
+    "build_runtime_contract",
+    "classify_contract_compatibility",
+    "feature_abi_id",
+    "feature_layout_id",
+    "runtime_contract_digest",
+    "runtime_identity_id",
+    "stable_digest",
+    "stable_json",
+]

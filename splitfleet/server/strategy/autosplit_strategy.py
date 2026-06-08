@@ -21,6 +21,7 @@ from splitfleet.autosplit import (
     ReplicaScopePolicy,
     WorkerSpec,
 )
+from splitfleet.autosplit.torchlens_contract import runtime_contract_digest, stable_json
 from splitfleet.server.client_selection import (
     ClientSelector,
     OortSelector,
@@ -32,12 +33,21 @@ from splitfleet.common.constants import (
     AUTOSPLIT_BACKEND_CONFIG_KEY,
     AUTOSPLIT_BACKEND_VALUE_TORCHLENS,
     AUTOSPLIT_BOUNDARY_CONFIG_KEY,
+    AUTOSPLIT_BOUNDARY_TENSOR_LABELS_CONFIG_KEY,
     AUTOSPLIT_CLIENT_STAGE_COUNT_CONFIG_KEY,
+    AUTOSPLIT_DYNAMIC_BATCH_CONFIG_KEY,
+    AUTOSPLIT_FEATURE_ABI_ID_CONFIG_KEY,
     AUTOSPLIT_GRAPH_SIGNATURE_CONFIG_KEY,
     AUTOSPLIT_MODE_CONFIG_KEY,
     AUTOSPLIT_PLAN_ID_CONFIG_KEY,
+    AUTOSPLIT_RUNTIME_BACKEND_CONFIG_KEY,
+    AUTOSPLIT_RUNTIME_BACKEND_VALUE_TORCHLENS_NATIVE,
+    AUTOSPLIT_RUNTIME_CONTRACT_CONFIG_KEY,
+    AUTOSPLIT_RUNTIME_CONTRACT_DIGEST_CONFIG_KEY,
     AUTOSPLIT_SPLIT_ID_CONFIG_KEY,
     AUTOSPLIT_STAGE_COUNT_CONFIG_KEY,
+    AUTOSPLIT_TORCHLENS_VERSION_CONFIG_KEY,
+    AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY,
 )
 from splitfleet.server.server_model.autosplit_tail_server_model import AutoSplitTailServerModel
 from splitfleet.server.server_model.autosplit_server_model import AutoSplitServerModel
@@ -234,15 +244,24 @@ class AutoSplitStrategy(PlainSlStrategy):
 
     def _autosplit_config(self) -> Dict[str, Any]:
         placement = self.get_or_create_placement_plan()
+        contract = dict(placement.runtime_contract or {})
         return {
             AUTOSPLIT_BACKEND_CONFIG_KEY: AUTOSPLIT_BACKEND_VALUE_TORCHLENS,
+            AUTOSPLIT_RUNTIME_BACKEND_CONFIG_KEY: AUTOSPLIT_RUNTIME_BACKEND_VALUE_TORCHLENS_NATIVE,
+            AUTOSPLIT_TORCHLENS_VERSION_CONFIG_KEY: placement.torchlens_version,
             AUTOSPLIT_PLAN_ID_CONFIG_KEY: placement.plan_id,
             AUTOSPLIT_SPLIT_ID_CONFIG_KEY: placement.split_id,
             AUTOSPLIT_GRAPH_SIGNATURE_CONFIG_KEY: placement.graph_signature,
             AUTOSPLIT_BOUNDARY_CONFIG_KEY: placement.boundary,
+            AUTOSPLIT_BOUNDARY_TENSOR_LABELS_CONFIG_KEY: stable_json(placement.boundary_tensor_labels),
             AUTOSPLIT_MODE_CONFIG_KEY: placement.mode,
             AUTOSPLIT_STAGE_COUNT_CONFIG_KEY: 2,
             AUTOSPLIT_CLIENT_STAGE_COUNT_CONFIG_KEY: 1,
+            AUTOSPLIT_FEATURE_ABI_ID_CONFIG_KEY: placement.feature_abi_id,
+            AUTOSPLIT_RUNTIME_CONTRACT_CONFIG_KEY: stable_json(contract),
+            AUTOSPLIT_RUNTIME_CONTRACT_DIGEST_CONFIG_KEY: runtime_contract_digest(contract),
+            AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY: placement.trace_batch_mode,
+            AUTOSPLIT_DYNAMIC_BATCH_CONFIG_KEY: stable_json(placement.dynamic_batch),
         }
 
     def configure_fit(self, server_round, parameters, client_manager):

@@ -7,6 +7,11 @@ from typing import Any, Optional
 
 from splitfleet.autosplit import SplitRuntimeHandle
 from splitfleet.autosplit.runtime import AutoSplitSession
+from splitfleet.autosplit.torchlens_contract import (
+    classify_contract_compatibility,
+    runtime_contract_digest,
+    stable_json,
+)
 from splitfleet.autosplit.types import SplitPlan, WorkerSpec
 from splitfleet.server.server_model.manager.grpc_manager import GrpcServerModelManager
 from splitfleet.server.server_model.manager.manager import ServerModelManager
@@ -34,6 +39,7 @@ class StageRuntimeManager(ServerModelManager):
         self.worker_registry = worker_registry or GLOBAL_WORKER_REGISTRY
         self._placement_plan: Optional[SplitPlan] = None
         self._runtime_handle: Optional[SplitRuntimeHandle] = None
+        self._clone_runtime_cache: dict[str, SplitRuntimeHandle] = {}
         self._delegate = (
             GrpcServerModelManager(init_server_model_fn=init_server_model_fn)
             if init_server_model_fn is not None
@@ -51,6 +57,7 @@ class StageRuntimeManager(ServerModelManager):
 
     def bind_runtime_handle(self, runtime_handle: SplitRuntimeHandle) -> None:
         self._runtime_handle = runtime_handle
+        self._clone_runtime_cache.clear()
         self.autosplit_session._runtime_handles[runtime_handle.plan.plan_id] = runtime_handle
 
     def register_worker(self, worker_spec: WorkerSpec) -> WorkerSpec:
@@ -71,6 +78,10 @@ class StageRuntimeManager(ServerModelManager):
         suffix: str = "",
     ) -> SplitRuntimeHandle:
         base = self._require_runtime_handle()
+        cache_key = self._clone_runtime_cache_key(base, model=model, suffix=suffix)
+        cached = self._clone_runtime_cache.get(cache_key)
+        if cached is not None:
+            return cached
         sample_inputs = base.plan.metadata.get("_example_inputs")
         if sample_inputs is None:
             raise RuntimeError("The active TorchLens runtime does not retain sample inputs.")
@@ -83,12 +94,50 @@ class StageRuntimeManager(ServerModelManager):
             dynamic_batch=base.plan.dynamic_batch,
             trace_batch_mode=base.plan.trace_batch_mode,
         )
+        compatibility = classify_contract_compatibility(
+            base.plan.runtime_contract,
+            handle.plan.runtime_contract,
+        )
+        if not bool(compatibility.get("compatible")):
+            raise RuntimeError(
+                "TorchLens cloned runtime feature ABI is incompatible with the base runtime: "
+                f"{compatibility}."
+            )
         if suffix:
             original_plan_id = handle.plan.plan_id
             handle.plan.plan_id = f"{handle.plan.plan_id}_{suffix}"
             self.autosplit_session._runtime_handles.pop(original_plan_id, None)
             self.autosplit_session._runtime_handles[handle.plan.plan_id] = handle
+        self._clone_runtime_cache[cache_key] = handle
         return handle
+
+    def _clone_runtime_cache_key(
+        self,
+        runtime_handle: SplitRuntimeHandle,
+        *,
+        model,
+        suffix: str = "",
+    ) -> str:
+        plan = runtime_handle.plan
+        return stable_json(
+            {
+                "plan_id": plan.plan_id,
+                "split_id": plan.split_id,
+                "feature_abi_id": plan.feature_abi_id,
+                "boundary": plan.boundary,
+                "graph_signature": plan.graph_signature,
+                "torchlens_version": plan.torchlens_version,
+                "runtime_backend": plan.runtime_backend,
+                "backend": plan.backend,
+                "mode": plan.mode,
+                "trace_batch_mode": plan.trace_batch_mode,
+                "dynamic_batch": list(plan.dynamic_batch) if plan.dynamic_batch is not None else None,
+                "module_mode": "train" if getattr(model, "training", False) else "eval",
+                "runtime_contract_digest": runtime_contract_digest(plan.runtime_contract or {}),
+                "model_id": id(model),
+                "suffix": suffix,
+            }
+        )
 
     def clone_placement_plan(
         self,

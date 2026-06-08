@@ -1,7 +1,7 @@
 # SplitFleet
 
 SplitFleet is a PyTorch split learning framework built on top of [Flower](https://flower.ai/).
-The autosplit runtime is now backed by the published `torchlens` package, so SplitFleet focuses on Flower strategy integration, client/server transport, server-tail replicas, and aggregation policy.
+The autosplit runtime is backed by the repository-local `torchlens-2.18.0-py3-none-any.whl` via `uv.sources`, so SplitFleet focuses on Flower strategy integration, client/server transport, server-tail replicas, and aggregation policy.
 
 ## What This Project Does
 
@@ -30,6 +30,14 @@ Python `3.10` is required.
 
 ```bash
 uv sync --extra dev
+```
+
+When the repository-local TorchLens wheel or lockfile changes, force uv to forget any cached TorchLens install before validating runtime behavior:
+
+```bash
+uv lock
+uv cache clean
+uv sync --extra dev --reinstall-package torchlens
 ```
 
 Install the real-model integration dependencies when validating the model matrix:
@@ -114,27 +122,60 @@ client = AutoSplitSplitLearningClient(
 - [`splitfleet/server/server_model/autosplit_tail_server_model.py`](splitfleet/server/server_model/autosplit_tail_server_model.py): server suffix model bridge.
 - [`splitfleet/client/autosplit_split_client.py`](splitfleet/client/autosplit_split_client.py): client prefix execution and boundary payload exchange.
 
+## Runtime Invariants
+
+- Runtime validation must prove `torchlens.__version__ == "2.18.0"` from the installed package, not only from wheel metadata.
+- Final runtimes are prepared through TorchLens `prepare_split` or `prepare_split_replay`; low-level TorchLens graph APIs are reserved for read-only candidate probing.
+- `BoundaryPayload` serialization is self-contained: tensors plus a stable `BoundarySpec` must be enough to recover after cross-process transport, and the optional native TorchLens object is not required after serde.
+- Feature ABI identifiers are schema-only. They include labels, dtype, symbolic shape, layout, passthrough/preprocessing schema, trace mode, dynamic batch, model/runtime identifiers, and TorchLens version, but exclude sample tensor values, concrete sample batch values, target values, device, temporary runtime ids, and validation inputs.
+- Flower autosplit config is JSON-stable. Strategy, client, and server code exchange deterministic runtime contract JSON, contract digests, feature ABI ids, boundary labels, trace batch mode, dynamic batch, backend, and TorchLens version.
+- Boundary uploads are rejected before suffix execution when runtime backend, TorchLens version, feature ABI id, runtime contract digest, boundary label order, batch size, trace batch mode, or dynamic batch do not match the prepared server runtime.
+- `backward_prefix` delegates to TorchLens split training support. If neither the prepared runtime nor TorchLens exposes a real implementation, SplitFleet raises a clear `RuntimeError` instead of fabricating gradients.
+
 ## Validation
+
+TorchLens 2.18 wheel and API checks:
+
+```bash
+uv lock
+uv cache clean
+uv sync --extra dev --reinstall-package torchlens
+uv run python -c "import torchlens as tl; print(tl.__file__); print(tl.__version__); assert tl.__version__ == '2.18.0'"
+uv run python -c "from torchlens.split import prepare_split, prepare_split_replay, ReplayBoundary, SplitRuntime, SplitSpec; print('torchlens 2.18 split api ok')"
+```
 
 Default checks:
 
 ```bash
 uv run --no-sync pytest -q
+uv run --no-sync pytest tests/unit/test_torchlens_218_api.py -q
 uv run --no-sync pytest tests/unit/test_torchlens_boundary_serde.py -q
+uv run --no-sync pytest tests/unit/test_torchlens_candidate_contract.py -q
+uv run --no-sync pytest tests/unit/test_stage_runtime_contract.py -q
 ```
 
 Integration checks:
 
 ```bash
+uv run --no-sync pytest tests/integration/test_torchlens_runtime_replay.py -q
 uv run --no-sync pytest tests/integration/test_torchlens_real_task_matrix.py -q
 SPLITFLEET_RUN_HEAVY_REAL_MODELS=1 uv run --no-sync pytest tests/integration/test_torchlens_real_detection_optional.py -q
 ```
 
+ResNet18 training correctness check:
+
+```bash
+uv sync --extra dev --extra integration --reinstall-package torchlens
+uv run --no-sync pytest tests/integration/test_torchlens_real_task_matrix.py -k "torchvision_resnet18" -q
+```
+
+The ResNet18 check verifies that a split training step matches the full-model step, including loss, BatchNorm state, and parameter updates after the optimizer step.
+
 Cleanup checks:
 
 ```bash
-grep -R "<old-runtime-package>" -n splitfleet tests pyproject.toml README.md || true
-grep -R "<old-model-package>" -n splitfleet tests pyproject.toml README.md || true
+rg "torchlens-2\.1[7]\.0|2\.1[7]\.0" splitfleet tests examples README.md pyproject.toml uv.lock
+rg -i "[a]riadne" splitfleet tests examples README.md pyproject.toml uv.lock
 ```
 
 ## Paper

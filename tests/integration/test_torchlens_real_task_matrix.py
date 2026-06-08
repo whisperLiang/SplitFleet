@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import copy
+
 import pytest
 import torch
 from torch import nn
 
+from splitfleet.autosplit import prepare_torchlens_runtime
 from tests.integration.torchlens_real_model_helpers import (
     nested_tensor_loss,
     run_split_inference_equivalence,
@@ -205,6 +208,73 @@ def test_real_image_classification_models(name, builder, input_shape, boundary) 
         nn.CrossEntropyLoss(),
         boundary=boundary,
     )
+
+
+def test_torchvision_resnet18_split_training_step_matches_full_model_state() -> None:
+    torch.manual_seed(918)
+    model, num_classes = build_torchvision_resnet18()
+    model.train()
+    initial_state = {
+        key: value.detach().clone()
+        for key, value in model.state_dict().items()
+    }
+    full_model = copy.deepcopy(model).train()
+    split_model = copy.deepcopy(model).train()
+    trace_inputs = torch.randn(2, 3, 96, 96)
+    runtime_inputs = torch.randn(3, 3, 96, 96)
+    labels = torch.randint(0, num_classes, (3,))
+    loss_fn = nn.CrossEntropyLoss()
+    learning_rate = 1e-4
+
+    handle = prepare_torchlens_runtime(
+        split_model,
+        trace_inputs,
+        boundary="50%",
+        trainable=True,
+        dynamic_batch=(2, 3),
+    )
+    # Runtime preparation traces in train mode, so reset both models before
+    # comparing the actual single training step.
+    full_model.load_state_dict(initial_state)
+    split_model.load_state_dict(initial_state)
+    full_model.train()
+    split_model.train()
+
+    full_optimizer = torch.optim.SGD(
+        [param for param in full_model.parameters() if param.requires_grad],
+        lr=learning_rate,
+    )
+    split_optimizer = torch.optim.SGD(
+        [param for param in split_model.parameters() if param.requires_grad],
+        lr=learning_rate,
+    )
+
+    full_optimizer.zero_grad(set_to_none=True)
+    full_loss = loss_fn(full_model(runtime_inputs), labels)
+    full_loss.backward()
+    full_optimizer.step()
+
+    boundary_payload = handle.backend.run_prefix(runtime_inputs, training=True)
+    split_loss, boundary_grads = handle.backend.train_suffix(
+        boundary_payload,
+        labels,
+        loss_fn=loss_fn,
+        optimizer=split_optimizer,
+    )
+    handle.backend.backward_prefix(
+        boundary_payload,
+        boundary_grads=boundary_grads,
+        optimizer=split_optimizer,
+    )
+
+    assert torch.allclose(full_loss.detach(), split_loss.detach(), rtol=1e-5, atol=1e-7)
+    assert boundary_grads
+    for key, full_tensor in full_model.state_dict().items():
+        split_tensor = split_model.state_dict()[key]
+        if full_tensor.is_floating_point() or full_tensor.is_complex():
+            assert torch.allclose(full_tensor, split_tensor, rtol=1e-5, atol=1e-7), key
+        else:
+            assert torch.equal(full_tensor, split_tensor), key
 
 
 @pytest.mark.parametrize("name,builder,boundary", TEXT_CLASSIFICATION_MODELS)

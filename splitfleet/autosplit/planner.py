@@ -80,6 +80,28 @@ def _candidate_satisfies_constraints(
     return True
 
 
+def _rejection_reason(
+    candidate: SplitCandidate,
+    validation: dict[str, Any],
+    constraints: PlacementConstraint,
+) -> str:
+    if candidate.estimated_payload_bytes > constraints.max_payload_bytes:
+        return "max_payload_bytes"
+    if constraints.require_trainable_tail and not candidate.is_trainable_tail:
+        return "suffix_not_trainable"
+    if constraints.max_privacy_leakage is not None and (
+        candidate.privacy_leakage > float(constraints.max_privacy_leakage)
+    ):
+        return "max_privacy_leakage"
+    if constraints.max_layer_freezing_ratio is not None and (
+        candidate.layer_freezing_ratio > float(constraints.max_layer_freezing_ratio)
+    ):
+        return "max_layer_freezing_ratio"
+    if not bool(validation.get("success")):
+        return "replay_validation_failed"
+    return "unknown"
+
+
 def _build_placement(
     runtime_handle: TorchLensRuntimeHandle,
     *,
@@ -115,6 +137,7 @@ def _build_placement(
         "runtime_contract": contract,
         "feature_layout_id": contract.get("feature_layout_id", ""),
         "feature_abi_id": contract.get("feature_abi_id", ""),
+        "torchlens_version": runtime_handle.plan.torchlens_version,
         "_runtime_handle": runtime_handle,
     }
     return SplitPlan(
@@ -128,6 +151,9 @@ def _build_placement(
         score=score,
         backend="torchlens",
         runtime_backend="torchlens_native",
+        torchlens_version=runtime_handle.plan.torchlens_version,
+        model_name=model_name or runtime_handle.plan.model_name,
+        model_family=runtime_handle.plan.model_family,
         candidate_id=candidate.candidate_id,
         split_label=candidate.split_label,
         boundary_tensor_labels=list(candidate.boundary_tensor_labels),
@@ -214,10 +240,13 @@ class AutoSplitPlanner:
             rejected.append(
                 {
                     "candidate_id": candidate.candidate_id,
-                    "payload_bytes": candidate.estimated_payload_bytes,
-                    "trainable_tail": candidate.is_trainable_tail,
-                    "validation_success": bool(validation.get("success")),
+                    "boundary": candidate.boundary,
+                    "estimated_payload_bytes": candidate.estimated_payload_bytes,
+                    "boundary_count": candidate.boundary_count,
                     "validation_error": validation.get("error"),
+                    "max_abs_diff": validation.get("max_abs_diff"),
+                    "max_rel_diff": validation.get("max_rel_diff"),
+                    "reason": _rejection_reason(candidate, validation, constraints),
                 }
             )
             if constraints.max_candidates and checked >= constraints.max_candidates:

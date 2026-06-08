@@ -75,6 +75,14 @@ class SplitRuntimePlan:
     candidate_id: str
     split_label: str
     boundary_tensor_labels: list[str]
+    backend: str = "torchlens"
+    runtime_backend: str = "torchlens_native"
+    torchlens_version: str = ""
+    model_name: str = ""
+    model_family: str = ""
+    canonical_split_key: str = ""
+    feature_layout_id: str = ""
+    feature_abi_id: str = ""
     runtime_contract: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -93,6 +101,9 @@ class SplitPlan:
     score: float
     backend: str = "torchlens"
     runtime_backend: str = "torchlens_native"
+    torchlens_version: str = ""
+    model_name: str = ""
+    model_family: str = ""
     candidate_id: str = ""
     split_label: str = ""
     boundary_tensor_labels: list[str] = field(default_factory=list)

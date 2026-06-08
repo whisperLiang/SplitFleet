@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 import torch
 from torch import nn
@@ -10,13 +12,23 @@ from splitfleet.common.constants import (
     AUTOSPLIT_BACKEND_CONFIG_KEY,
     AUTOSPLIT_BACKEND_VALUE_TORCHLENS,
     AUTOSPLIT_BOUNDARY_CONFIG_KEY,
+    AUTOSPLIT_BOUNDARY_TENSOR_LABELS_CONFIG_KEY,
     AUTOSPLIT_CLIENT_STAGE_COUNT_CONFIG_KEY,
+    AUTOSPLIT_DYNAMIC_BATCH_CONFIG_KEY,
+    AUTOSPLIT_FEATURE_ABI_ID_CONFIG_KEY,
     AUTOSPLIT_GRAPH_SIGNATURE_CONFIG_KEY,
     AUTOSPLIT_MODE_CONFIG_KEY,
     AUTOSPLIT_PLAN_ID_CONFIG_KEY,
+    AUTOSPLIT_RUNTIME_BACKEND_CONFIG_KEY,
+    AUTOSPLIT_RUNTIME_BACKEND_VALUE_TORCHLENS_NATIVE,
+    AUTOSPLIT_RUNTIME_CONTRACT_CONFIG_KEY,
+    AUTOSPLIT_RUNTIME_CONTRACT_DIGEST_CONFIG_KEY,
     AUTOSPLIT_SPLIT_ID_CONFIG_KEY,
     AUTOSPLIT_STAGE_COUNT_CONFIG_KEY,
+    AUTOSPLIT_TORCHLENS_VERSION_CONFIG_KEY,
+    AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY,
 )
+from splitfleet.autosplit.torchlens_contract import runtime_contract_digest
 from splitfleet.server.server_model.server_model import ServerModel
 from splitfleet.server.strategy import AutoSplitStrategy
 
@@ -58,13 +70,22 @@ def test_autosplit_strategy_generates_torchlens_metadata() -> None:
     config = strategy._autosplit_config()
 
     assert config[AUTOSPLIT_BACKEND_CONFIG_KEY] == AUTOSPLIT_BACKEND_VALUE_TORCHLENS
+    assert config[AUTOSPLIT_RUNTIME_BACKEND_CONFIG_KEY] == AUTOSPLIT_RUNTIME_BACKEND_VALUE_TORCHLENS_NATIVE
+    assert config[AUTOSPLIT_TORCHLENS_VERSION_CONFIG_KEY] == "2.18.0"
     assert config[AUTOSPLIT_PLAN_ID_CONFIG_KEY].startswith("torchlens_")
     assert config[AUTOSPLIT_SPLIT_ID_CONFIG_KEY]
     assert config[AUTOSPLIT_GRAPH_SIGNATURE_CONFIG_KEY]
     assert config[AUTOSPLIT_BOUNDARY_CONFIG_KEY].startswith("after:")
+    assert json.loads(config[AUTOSPLIT_BOUNDARY_TENSOR_LABELS_CONFIG_KEY])
     assert config[AUTOSPLIT_MODE_CONFIG_KEY] == "generated_eager"
     assert config[AUTOSPLIT_STAGE_COUNT_CONFIG_KEY] == 2
     assert config[AUTOSPLIT_CLIENT_STAGE_COUNT_CONFIG_KEY] == 1
+    assert config[AUTOSPLIT_FEATURE_ABI_ID_CONFIG_KEY]
+    contract = json.loads(config[AUTOSPLIT_RUNTIME_CONTRACT_CONFIG_KEY])
+    assert runtime_contract_digest(contract) == config[AUTOSPLIT_RUNTIME_CONTRACT_DIGEST_CONFIG_KEY]
+    assert config[AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY] in {"batch_gt1", "batch_1"}
+    assert json.loads(config[AUTOSPLIT_DYNAMIC_BATCH_CONFIG_KEY]) is not None
+    json.dumps(config, sort_keys=True)
 
 
 def test_autosplit_strategy_splitfed_defaults_to_per_client_tail() -> None:

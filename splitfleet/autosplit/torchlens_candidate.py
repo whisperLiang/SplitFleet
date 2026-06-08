@@ -101,6 +101,8 @@ def feature_layout_from_specs(specs: Mapping[str, Any]) -> dict[str, dict[str, A
             "dtype": str(getattr(spec, "dtype", "") or ""),
             "shape_without_batch": [str(dim) for dim in shape[1:]],
             "rank": len(shape),
+            "requires_grad": bool(getattr(spec, "requires_grad", False)),
+            "device_policy": str(getattr(spec, "device_policy", "runtime") or "runtime"),
         }
     return layout
 

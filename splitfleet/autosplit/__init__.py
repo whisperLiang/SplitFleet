@@ -41,7 +41,9 @@ from splitfleet.autosplit.torchlens_contract import (
     build_runtime_contract,
     classify_contract_compatibility,
     feature_abi_id,
+    runtime_contract_digest,
     runtime_identity_id,
+    stable_json,
 )
 from splitfleet.autosplit.torchlens_runtime import (
     SplitRuntime,
@@ -111,7 +113,9 @@ __all__ = [
     "run_suffix",
     "run_training_prefix",
     "runtime_identity_id",
+    "runtime_contract_digest",
     "serialize_plan_descriptor",
+    "stable_json",
     "to_torchlens_boundary",
     "torchlens_runtime_version",
     "train_suffix",
