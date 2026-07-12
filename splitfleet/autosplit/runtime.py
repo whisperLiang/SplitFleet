@@ -14,7 +14,7 @@ from splitfleet.autosplit.torchlens_backend import (
     backward_prefix,
     prepare_torchlens_runtime,
 )
-from splitfleet.autosplit.torchlens_runtime import normalize_example_inputs, require_torchlens_218
+from splitfleet.autosplit.torchlens_runtime import normalize_example_inputs, require_torchlens_231
 from splitfleet.autosplit.types import SplitPlan
 
 
@@ -72,7 +72,7 @@ class AutoSplitSession:
     ) -> None:
         if backend != "torchlens":
             raise ValueError(f"Only the TorchLens autosplit backend is supported, got {backend!r}.")
-        require_torchlens_218()
+        require_torchlens_231()
         self.planner = planner or AutoSplitPlanner()
         self.cache_store = cache_store
         self.device = device

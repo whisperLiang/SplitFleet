@@ -209,7 +209,10 @@ def build_feature_abi_spec(
         adapter_version=str(adapter_version or ""),
         runtime_version=str(runtime_version or torchlens_version or ""),
         canonical_split_key=str(canonical_split_key or boundary or ""),
-        graph_signature=str(graph_signature or ""),
+        # The full graph can legitimately differ between train and eval mode
+        # while exposing the same split-boundary ABI (for example BatchNorm).
+        # Graph identity is tracked separately by the runtime contract.
+        graph_signature="",
         boundary=str(boundary or canonical_split_key or ""),
         boundary_tensor_labels=labels,
         boundary_tensors=_ordered_boundary_tensors(feature_layout, labels),

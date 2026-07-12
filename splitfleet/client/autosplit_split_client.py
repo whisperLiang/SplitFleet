@@ -2,62 +2,47 @@
 
 from __future__ import annotations
 
-import copy
 import json
 import time
-from collections import OrderedDict
+import uuid
 from typing import Any, Callable, Iterable, Optional
 
 import numpy as np
 import torch
 
 from splitfleet.autosplit import AutoSplitSession, SplitRuntimeHandle, normalize_inputs
-from splitfleet.autosplit.serde import dumps_torch_object, loads_torch_object
-from splitfleet.autosplit.torchlens_contract import (
-    classify_contract_compatibility,
-    runtime_contract_digest,
-    stable_json,
-)
+from splitfleet.backends import TorchBackendAdapter
+from splitfleet.runtime import PrefixContextStore
+from splitfleet.split_engine.contracts import GraphContract, ModelVersionContract, validate_contract
+from splitfleet.split_engine import graph_contract_for_runtime_handle
+from splitfleet.autosplit.torchlens_runtime import torchlens_runtime_version
+from splitfleet.transport import decode_gradients, encode_boundary, encode_bundle_wire
+from splitfleet.transport.split_wire import boundary_to_envelope, envelope_to_gradients
 from splitfleet.client.numpy_client import NumPyClient
 from splitfleet.common import BatchData, ControlCode
 from splitfleet.common.constants import (
     AUTOSPLIT_BACKEND_CONFIG_KEY,
     AUTOSPLIT_BACKEND_VALUE_TORCHLENS,
     AUTOSPLIT_BOUNDARY_CONFIG_KEY,
-    AUTOSPLIT_BOUNDARY_TENSOR_LABELS_CONFIG_KEY,
     AUTOSPLIT_CLIENT_STAGE_COUNT_CONFIG_KEY,
-    AUTOSPLIT_DYNAMIC_BATCH_CONFIG_KEY,
-    AUTOSPLIT_FEATURE_ABI_ID_CONFIG_KEY,
     AUTOSPLIT_GRAPH_SIGNATURE_CONFIG_KEY,
+    AUTOSPLIT_GRAPH_CONTRACT_CONFIG_KEY,
+    AUTOSPLIT_GRAPH_CONTRACT_DIGEST_CONFIG_KEY,
+    AUTOSPLIT_MODEL_VERSION_CONFIG_KEY,
+    AUTOSPLIT_MODEL_VERSION_CONTRACT_CONFIG_KEY,
     AUTOSPLIT_MODE_CONFIG_KEY,
     AUTOSPLIT_PLAN_ID_CONFIG_KEY,
-    AUTOSPLIT_RUNTIME_BACKEND_CONFIG_KEY,
-    AUTOSPLIT_RUNTIME_BACKEND_VALUE_TORCHLENS_NATIVE,
-    AUTOSPLIT_RUNTIME_CONTRACT_CONFIG_KEY,
-    AUTOSPLIT_RUNTIME_CONTRACT_DIGEST_CONFIG_KEY,
     AUTOSPLIT_SPLIT_ID_CONFIG_KEY,
-    AUTOSPLIT_TORCHLENS_VERSION_CONFIG_KEY,
-    AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY,
 )
+from splitfleet.common.constants import CLIENT_ID_CONFIG_KEY
 
 
 def _model_to_ndarrays(model: torch.nn.Module) -> list[np.ndarray]:
-    return [tensor.detach().cpu().numpy() for tensor in model.state_dict().values()]
+    return TorchBackendAdapter().export_ndarrays(model)
 
 
 def _load_model_from_ndarrays(model: torch.nn.Module, ndarrays: list[np.ndarray]) -> None:
-    if not ndarrays:
-        return
-    state_dict = model.state_dict()
-    if len(state_dict) != len(ndarrays):
-        raise ValueError(
-            "TorchLens split client parameter mismatch: "
-            f"expected {len(state_dict)} tensors, received {len(ndarrays)}."
-        )
-    loaded_state = OrderedDict()
-    for (name, reference), array in zip(state_dict.items(), ndarrays):
-        loaded_state[name] = torch.as_tensor(array, dtype=reference.dtype, device=reference.device)
-    model.load_state_dict(loaded_state, strict=True)
+    TorchBackendAdapter().load_ndarrays(model, ndarrays)
 
 
 def _move_to_device(value: Any, device: str) -> Any:
@@ -89,30 +74,6 @@ def _batch_size(value: Any) -> int:
     return 1
 
 
-def _decode_json_value(value: Any, default: Any = None, *, field_name: str = "autosplit config") -> Any:
-    if value in (None, ""):
-        return default
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Malformed JSON for {field_name}.") from exc
-    return value
-
-
-def _decode_dynamic_batch(value: Any) -> tuple[int, int] | None:
-    decoded = _decode_json_value(value, field_name=AUTOSPLIT_DYNAMIC_BATCH_CONFIG_KEY)
-    if decoded is None:
-        return None
-    low, high = list(decoded)
-    return int(low), int(high)
-
-
-def _decode_runtime_contract(value: Any) -> dict[str, Any]:
-    decoded = _decode_json_value(value, default={}, field_name=AUTOSPLIT_RUNTIME_CONTRACT_CONFIG_KEY)
-    return dict(decoded) if isinstance(decoded, dict) else {}
-
-
 class AutoSplitSplitLearningClient(NumPyClient):
     """Run a TorchLens prefix locally and delegate suffix work to the server model."""
 
@@ -131,7 +92,8 @@ class AutoSplitSplitLearningClient(NumPyClient):
     ) -> None:
         if sample_kwargs:
             raise ValueError("TorchLens autosplit backend accepts positional model inputs only.")
-        self.model = copy.deepcopy(model).to(device)
+        self.backend_adapter = TorchBackendAdapter()
+        self.model = self.backend_adapter.move_model(self.backend_adapter.clone_model(model), device)
         self.train_data = train_data
         self.evaluate_data = evaluate_data if evaluate_data is not None else train_data
         self.sample_inputs = sample_inputs
@@ -140,6 +102,8 @@ class AutoSplitSplitLearningClient(NumPyClient):
         self.autosplit_session = autosplit_session or AutoSplitSession(device=device)
         self.device = device
         self._runtime_cache: dict[str, SplitRuntimeHandle] = {}
+        self._context_store = PrefixContextStore()
+        self._round_config: dict[str, Any] = {}
 
     def get_parameters(self, config):
         _ = config
@@ -165,16 +129,41 @@ class AutoSplitSplitLearningClient(NumPyClient):
                 *normalize_inputs(torch_inputs),
                 training=True,
             )
+            step_id = uuid.uuid4().hex
+            round_id = int(config.get(AUTOSPLIT_MODEL_VERSION_CONFIG_KEY, 0))
+            client_id = str(config.get(CLIENT_ID_CONFIG_KEY, ""))
+            self._context_store.put(round_id, client_id, step_id, boundary)
+            contract = graph_contract_for_runtime_handle(runtime_handle)
+            wire_boundary = boundary_to_envelope(
+                boundary,
+                round_id=round_id,
+                client_id=client_id,
+                step_id=step_id,
+                plan_id=str(config[AUTOSPLIT_PLAN_ID_CONFIG_KEY]),
+                split_id=contract.split_id,
+                canonical_graph_hash=contract.canonical_graph_hash,
+                boundary_schema_hash=contract.boundary_schema_hash,
+                model_version=round_id,
+            )
             response = self._call_tail(
                 method_name="train_tail",
-                runtime_handle=runtime_handle,
-                boundary=boundary,
+                boundary=wire_boundary,
                 targets=torch_targets,
                 num_examples=_batch_size(torch_inputs),
             )
+            gradient_envelope = response["gradients"]
+            if (
+                gradient_envelope.round_id,
+                gradient_envelope.client_id,
+                gradient_envelope.step_id,
+            ) != (round_id, client_id, step_id):
+                raise RuntimeError("Gradient response step identity mismatch")
+            if gradient_envelope.model_version != round_id:
+                raise RuntimeError("Gradient response model version mismatch")
+            local_boundary = self._context_store.pop(round_id, client_id, step_id)
             runtime_handle.backend.backward_prefix(
-                boundary,
-                boundary_grads=response["boundary_grads"],
+                local_boundary,
+                boundary_grads=envelope_to_gradients(gradient_envelope, self.device),
                 optimizer=prefix_optimizer,
             )
 
@@ -202,10 +191,21 @@ class AutoSplitSplitLearningClient(NumPyClient):
                 torch_inputs = _move_to_device(inputs, self.device)
                 torch_targets = _move_to_device(targets, self.device)
                 boundary = runtime_handle.backend.run_prefix(*normalize_inputs(torch_inputs))
+                contract = graph_contract_for_runtime_handle(runtime_handle)
+                wire_boundary = boundary_to_envelope(
+                    boundary,
+                    round_id=int(config.get(AUTOSPLIT_MODEL_VERSION_CONFIG_KEY, 0)),
+                    client_id=str(config.get(CLIENT_ID_CONFIG_KEY, "")),
+                    step_id=uuid.uuid4().hex,
+                    plan_id=str(config[AUTOSPLIT_PLAN_ID_CONFIG_KEY]),
+                    split_id=contract.split_id,
+                    canonical_graph_hash=contract.canonical_graph_hash,
+                    boundary_schema_hash=contract.boundary_schema_hash,
+                    model_version=int(config.get(AUTOSPLIT_MODEL_VERSION_CONFIG_KEY, 0)),
+                )
                 response = self._call_tail(
                     method_name="evaluate_tail",
-                    runtime_handle=runtime_handle,
-                    boundary=boundary,
+                    boundary=wire_boundary,
                     targets=torch_targets,
                     num_examples=_batch_size(torch_inputs),
                 )
@@ -218,14 +218,26 @@ class AutoSplitSplitLearningClient(NumPyClient):
         return float(average_loss), num_examples, {"loss": average_loss}
 
     def _prepare_round(self, parameters, config, *, training: bool) -> SplitRuntimeHandle:
-        if config.get(AUTOSPLIT_BACKEND_CONFIG_KEY) not in (None, AUTOSPLIT_BACKEND_VALUE_TORCHLENS):
-            raise ValueError("AutoSplitSplitLearningClient only supports the TorchLens backend.")
+        if config.get(AUTOSPLIT_BACKEND_CONFIG_KEY) != AUTOSPLIT_BACKEND_VALUE_TORCHLENS:
+            raise ValueError("Split config must explicitly declare backend='torchlens'.")
         client_stage_count = int(config.get(AUTOSPLIT_CLIENT_STAGE_COUNT_CONFIG_KEY, 1))
         if client_stage_count != 1:
             raise ValueError(
                 "TorchLens autosplit backend supports exactly one client-local prefix stage."
             )
         _load_model_from_ndarrays(self.model, parameters)
+        previous_round = int(self._round_config.get(AUTOSPLIT_MODEL_VERSION_CONFIG_KEY, -1))
+        current_round = int(config.get(AUTOSPLIT_MODEL_VERSION_CONFIG_KEY, 0))
+        if previous_round >= 0 and previous_round != current_round:
+            self._context_store.discard_round(previous_round)
+        self._round_config = dict(config)
+        raw_version_contract = config.get(AUTOSPLIT_MODEL_VERSION_CONTRACT_CONFIG_KEY)
+        if raw_version_contract:
+            version_contract = ModelVersionContract.from_json(raw_version_contract)
+            if version_contract.round_model_version != current_round:
+                raise RuntimeError("Round model version contract mismatch")
+            if version_contract.state_schema_hash != self.backend_adapter.state_manifest(self.model).schema_hash:
+                raise RuntimeError("Client model state schema mismatch")
         if training:
             self.model.train()
         else:
@@ -236,50 +248,12 @@ class AutoSplitSplitLearningClient(NumPyClient):
         plan_id = str(config[AUTOSPLIT_PLAN_ID_CONFIG_KEY])
         split_id = str(config.get(AUTOSPLIT_SPLIT_ID_CONFIG_KEY, ""))
         graph_signature = str(config.get(AUTOSPLIT_GRAPH_SIGNATURE_CONFIG_KEY, ""))
-        boundary = str(config.get(AUTOSPLIT_BOUNDARY_CONFIG_KEY, "50%"))
-        runtime_backend = str(
-            config.get(
-                AUTOSPLIT_RUNTIME_BACKEND_CONFIG_KEY,
-                AUTOSPLIT_RUNTIME_BACKEND_VALUE_TORCHLENS_NATIVE,
-            )
-        )
-        torchlens_version = str(config.get(AUTOSPLIT_TORCHLENS_VERSION_CONFIG_KEY, ""))
-        feature_abi_id = str(config.get(AUTOSPLIT_FEATURE_ABI_ID_CONFIG_KEY, ""))
-        trace_batch_mode = str(config.get(AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY, "") or "")
-        dynamic_batch = _decode_dynamic_batch(config.get(AUTOSPLIT_DYNAMIC_BATCH_CONFIG_KEY))
-        server_contract = _decode_runtime_contract(config.get(AUTOSPLIT_RUNTIME_CONTRACT_CONFIG_KEY))
-        server_contract_digest = str(config.get(AUTOSPLIT_RUNTIME_CONTRACT_DIGEST_CONFIG_KEY, "") or "")
-        if runtime_backend != AUTOSPLIT_RUNTIME_BACKEND_VALUE_TORCHLENS_NATIVE:
-            raise ValueError(
-                "AutoSplitSplitLearningClient only supports TorchLens native runtime backend, "
-                f"got {runtime_backend!r}."
-            )
-        if torchlens_version and torchlens_version != "2.18.0":
-            raise ValueError(
-                f"AutoSplitSplitLearningClient requires torchlens_version='2.18.0', got {torchlens_version!r}."
-            )
-        if server_contract and server_contract_digest:
-            actual_digest = runtime_contract_digest(server_contract)
-            if actual_digest != server_contract_digest:
-                raise RuntimeError(
-                    "TorchLens runtime contract digest mismatch in server config: "
-                    f"computed {actual_digest}, expected {server_contract_digest}."
-                )
         module_mode = "train" if self.model.training else "eval"
-        cache_key = "|".join(
-            [
-                plan_id,
-                split_id,
-                boundary,
-                graph_signature,
-                feature_abi_id,
-                runtime_backend,
-                torchlens_version,
-                trace_batch_mode,
-                stable_json(dynamic_batch),
-                module_mode,
-            ]
-        )
+        state_schema = self.backend_adapter.state_manifest(self.model).schema_hash
+        cache_key = "|".join([
+            "torch", torchlens_runtime_version(), self.model.__class__.__qualname__,
+            state_schema, plan_id, split_id, graph_signature, str(self.device), module_mode,
+        ])
         cached = self._runtime_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -287,11 +261,9 @@ class AutoSplitSplitLearningClient(NumPyClient):
         handle = self.autosplit_session.prepare_runtime(
             self.model,
             self.sample_inputs,
-            boundary=boundary,
+            boundary=str(config.get(AUTOSPLIT_BOUNDARY_CONFIG_KEY, "50%")),
             mode=str(config.get(AUTOSPLIT_MODE_CONFIG_KEY, "generated_eager")),
             trainable=True,
-            dynamic_batch=dynamic_batch,
-            trace_batch_mode=trace_batch_mode or None,
         )
         if split_id and handle.plan.split_id != split_id:
             raise RuntimeError(
@@ -302,18 +274,12 @@ class AutoSplitSplitLearningClient(NumPyClient):
                 "TorchLens graph signature mismatch: "
                 f"prepared {handle.plan.graph_signature}, expected {graph_signature}."
             )
-        if feature_abi_id and handle.feature_abi_id != feature_abi_id:
-            raise RuntimeError(
-                "TorchLens feature ABI mismatch: "
-                f"prepared {handle.feature_abi_id}, expected {feature_abi_id}."
-            )
-        if server_contract:
-            compatibility = classify_contract_compatibility(handle.runtime_contract, server_contract)
-            if not bool(compatibility.get("compatible")):
-                raise RuntimeError(
-                    "TorchLens runtime contract mismatch: "
-                    f"{compatibility}."
-                )
+        raw_contract = config.get(AUTOSPLIT_GRAPH_CONTRACT_CONFIG_KEY)
+        if raw_contract:
+            expected = GraphContract.from_json(raw_contract)
+            if config.get(AUTOSPLIT_GRAPH_CONTRACT_DIGEST_CONFIG_KEY) != expected.digest:
+                raise RuntimeError("Configured graph contract digest is invalid")
+            validate_contract(expected, graph_contract_for_runtime_handle(handle))
         self._runtime_cache[cache_key] = handle
         return handle
 
@@ -321,77 +287,26 @@ class AutoSplitSplitLearningClient(NumPyClient):
         self,
         *,
         method_name: str,
-        runtime_handle: SplitRuntimeHandle,
         boundary,
         targets,
         num_examples: int,
     ):
-        self._stamp_boundary_payload(boundary, runtime_handle)
-        dynamic_batch = (
-            list(runtime_handle.plan.dynamic_batch)
-            if runtime_handle.plan.dynamic_batch is not None
-            else None
-        )
-        contract_digest = runtime_contract_digest(runtime_handle.runtime_contract or {})
-        payload = {
-            "boundary": boundary,
-            "targets": targets,
-            "num_examples": num_examples,
-            "feature_abi_id": runtime_handle.feature_abi_id,
-            "runtime_contract_digest": contract_digest,
-            "boundary_tensor_labels": list(runtime_handle.plan.boundary_tensor_labels),
-            "batch_size": getattr(boundary, "batch_size", None),
-            "torchlens_version": runtime_handle.torchlens_version,
-            "runtime_backend": runtime_handle.plan.runtime_backend,
-            "trace_batch_mode": runtime_handle.plan.trace_batch_mode,
-            "dynamic_batch": dynamic_batch,
-            AUTOSPLIT_RUNTIME_BACKEND_CONFIG_KEY: runtime_handle.plan.runtime_backend,
-            AUTOSPLIT_TORCHLENS_VERSION_CONFIG_KEY: runtime_handle.torchlens_version,
-            AUTOSPLIT_FEATURE_ABI_ID_CONFIG_KEY: runtime_handle.feature_abi_id,
-            AUTOSPLIT_RUNTIME_CONTRACT_DIGEST_CONFIG_KEY: contract_digest,
-            AUTOSPLIT_BOUNDARY_TENSOR_LABELS_CONFIG_KEY: list(runtime_handle.plan.boundary_tensor_labels),
-            AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY: runtime_handle.plan.trace_batch_mode,
-            AUTOSPLIT_DYNAMIC_BATCH_CONFIG_KEY: dynamic_batch,
-        }
         request = BatchData(
-            data={"payload": dumps_torch_object(payload)},
+            data={
+                "boundary": encode_boundary(boundary),
+                "targets": encode_bundle_wire(targets),
+                "metadata": json.dumps({"num_examples": num_examples}).encode("utf-8"),
+            },
             control_code=ControlCode.OK,
         )
         response = getattr(self._require_server_model_proxy(), method_name)(
             request,
             _streams_=False,
         )
-        return loads_torch_object(response.data["payload"], map_location=self.device)
-
-    def _stamp_boundary_payload(self, boundary, runtime_handle: SplitRuntimeHandle) -> None:
-        if not hasattr(boundary, "metadata"):
-            return
-        metadata = dict(getattr(boundary, "metadata", {}) or {})
-        dynamic_batch = (
-            list(runtime_handle.plan.dynamic_batch)
-            if runtime_handle.plan.dynamic_batch is not None
-            else None
-        )
-        contract_digest = runtime_contract_digest(runtime_handle.runtime_contract or {})
-        metadata["feature_abi_id"] = runtime_handle.feature_abi_id
-        metadata["runtime_contract_digest"] = contract_digest
-        metadata["boundary_tensor_labels"] = list(runtime_handle.plan.boundary_tensor_labels)
-        metadata["batch_size"] = getattr(boundary, "batch_size", None)
-        metadata["torchlens_version"] = runtime_handle.torchlens_version
-        metadata["runtime_backend"] = runtime_handle.plan.runtime_backend
-        metadata["trace_batch_mode"] = runtime_handle.plan.trace_batch_mode
-        metadata["dynamic_batch"] = dynamic_batch
-        metadata[AUTOSPLIT_RUNTIME_BACKEND_CONFIG_KEY] = runtime_handle.plan.runtime_backend
-        metadata[AUTOSPLIT_TORCHLENS_VERSION_CONFIG_KEY] = runtime_handle.torchlens_version
-        metadata[AUTOSPLIT_FEATURE_ABI_ID_CONFIG_KEY] = runtime_handle.feature_abi_id
-        metadata[AUTOSPLIT_RUNTIME_CONTRACT_DIGEST_CONFIG_KEY] = contract_digest
-        metadata[AUTOSPLIT_BOUNDARY_TENSOR_LABELS_CONFIG_KEY] = list(runtime_handle.plan.boundary_tensor_labels)
-        metadata[AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY] = runtime_handle.plan.trace_batch_mode
-        metadata[AUTOSPLIT_DYNAMIC_BATCH_CONFIG_KEY] = dynamic_batch
-        boundary.metadata = metadata
-        spec = getattr(boundary, "spec", None)
-        if spec is not None:
-            spec.feature_abi_id = runtime_handle.feature_abi_id
+        metadata = json.loads(response.data["metadata"].decode("utf-8"))
+        if "gradients" in response.data:
+            metadata["gradients"] = decode_gradients(response.data["gradients"])
+        return metadata
 
     def _build_optimizer(self):
         if self.optimizer_fn is not None:
@@ -399,7 +314,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
         trainable = [param for param in self.model.parameters() if param.requires_grad]
         if not trainable:
             return None
-        return torch.optim.SGD(trainable, lr=0.01)
+        return self.backend_adapter.build_optimizer(self.model, {"name": "sgd", "lr": 0.01})
 
     def _require_server_model_proxy(self):
         proxy = getattr(self, "server_model_proxy", None)

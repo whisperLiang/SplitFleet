@@ -1,7 +1,7 @@
 # SplitFleet
 
 SplitFleet is a PyTorch split learning framework built on top of [Flower](https://flower.ai/).
-The autosplit runtime is backed by the repository-local `torchlens-2.18.0-py3-none-any.whl` via `uv.sources`, so SplitFleet focuses on Flower strategy integration, client/server transport, server-tail replicas, and aggregation policy.
+The autosplit runtime is backed by the repository-local `torchlens-2.31.0-py3-none-any.whl` via `uv.sources`, so SplitFleet focuses on Flower strategy integration, client/server transport, server-tail replicas, and aggregation policy.
 
 ## What This Project Does
 
@@ -124,7 +124,7 @@ client = AutoSplitSplitLearningClient(
 
 ## Runtime Invariants
 
-- Runtime validation must prove `torchlens.__version__ == "2.18.0"` from the installed package, not only from wheel metadata.
+- Runtime validation must prove `torchlens.__version__ == "2.31.0"` from the installed package, not only from wheel metadata.
 - Final runtimes are prepared through TorchLens `prepare_split` or `prepare_split_replay`; low-level TorchLens graph APIs are reserved for read-only candidate probing.
 - `BoundaryPayload` serialization is self-contained: tensors plus a stable `BoundarySpec` must be enough to recover after cross-process transport, and the optional native TorchLens object is not required after serde.
 - Feature ABI identifiers are schema-only. They include labels, dtype, symbolic shape, layout, passthrough/preprocessing schema, trace mode, dynamic batch, model/runtime identifiers, and TorchLens version, but exclude sample tensor values, concrete sample batch values, target values, device, temporary runtime ids, and validation inputs.
@@ -134,14 +134,14 @@ client = AutoSplitSplitLearningClient(
 
 ## Validation
 
-TorchLens 2.18 wheel and API checks:
+TorchLens 2.31 wheel and API checks:
 
 ```bash
 uv lock
 uv cache clean
 uv sync --extra dev --reinstall-package torchlens
-uv run python -c "import torchlens as tl; print(tl.__file__); print(tl.__version__); assert tl.__version__ == '2.18.0'"
-uv run python -c "from torchlens.split import prepare_split, prepare_split_replay, ReplayBoundary, SplitRuntime, SplitSpec; print('torchlens 2.18 split api ok')"
+uv run python -c "import torchlens as tl; print(tl.__file__); print(tl.__version__); assert tl.__version__ == '2.31.0'"
+uv run python -c "from torchlens.split import ReplayBoundary, prepare; print('torchlens 2.31 split api ok')"
 ```
 
 Default checks:

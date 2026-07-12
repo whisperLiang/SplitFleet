@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import warnings
 from dataclasses import asdict
 from typing import Any, Dict, Optional
 
@@ -37,6 +38,12 @@ def dumps_torch_object(
     Returns:
         Serialized bytes with optional compression header.
     """
+    warnings.warn(
+        "dumps_torch_object is deprecated and must not be used for split wire payloads; "
+        "use splitfleet.transport envelopes instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     buffer = io.BytesIO()
     torch.save(value, buffer, _use_new_zipfile_serialization=True)
     data = buffer.getvalue()
@@ -64,6 +71,12 @@ def loads_torch_object(
     Returns:
         Deserialized object.
     """
+    warnings.warn(
+        "loads_torch_object is deprecated and unsafe for untrusted wire payloads; "
+        "use splitfleet.transport envelopes instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if not value:
         raise ValueError("Cannot deserialize empty bytes")
 
@@ -118,9 +131,9 @@ def serialize_plan_descriptor(placement_plan: PlacementPlan) -> bytes:
 
     descriptor = {
         "plan_id": placement_plan.plan_id,
-        "backend": getattr(placement_plan, "backend", "torchlens"),
-        "runtime_backend": getattr(placement_plan, "runtime_backend", "torchlens_native"),
-        "torchlens_version": getattr(placement_plan, "torchlens_version", ""),
+        "engine": placement_plan.engine,
+        "backend": placement_plan.backend,
+        "runtime_backend": placement_plan.runtime_backend,
         "graph_signature": placement_plan.graph_signature,
         "split_id": placement_plan.split_id,
         "boundary": placement_plan.boundary,
@@ -130,8 +143,6 @@ def serialize_plan_descriptor(placement_plan: PlacementPlan) -> bytes:
         "payload_bytes": int(getattr(placement_plan, "payload_bytes", 0) or 0),
         "feature_abi_id": getattr(placement_plan, "feature_abi_id", ""),
         "runtime_contract": dict(getattr(placement_plan, "runtime_contract", {}) or {}),
-        "trace_batch_mode": getattr(placement_plan, "trace_batch_mode", ""),
-        "dynamic_batch": list(getattr(placement_plan, "dynamic_batch", None) or []),
         "stage_count": placement_plan.stage_count,
         "client_stage_count": 1,
         "stage_to_worker": dict(placement_plan.stage_to_worker),
@@ -152,4 +163,10 @@ def deserialize_plan_descriptor(payload: bytes) -> Dict[str, Any]:
 
     if not payload:
         return {}
-    return json.loads(payload.decode("utf-8"))
+    descriptor = json.loads(payload.decode("utf-8"))
+    for field_name in ("engine", "backend", "runtime_backend", "plan_id", "split_id"):
+        if not descriptor.get(field_name):
+            raise ValueError(f"Split placement descriptor is missing {field_name!r}")
+    if descriptor["engine"] != "torchlens" or descriptor["backend"] != "torchlens":
+        raise ValueError("Only explicit TorchLens placement descriptors are supported")
+    return descriptor

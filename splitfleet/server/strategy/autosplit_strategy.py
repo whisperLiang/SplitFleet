@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from logging import ERROR
 from typing import Any, Dict, Optional, Sequence
 
@@ -21,7 +22,6 @@ from splitfleet.autosplit import (
     ReplicaScopePolicy,
     WorkerSpec,
 )
-from splitfleet.autosplit.torchlens_contract import runtime_contract_digest, stable_json
 from splitfleet.server.client_selection import (
     ClientSelector,
     OortSelector,
@@ -29,6 +29,10 @@ from splitfleet.server.client_selection import (
     RandomSelector,
 )
 from splitfleet.autosplit.planner import validate_stage_counts
+from splitfleet.autosplit.torchlens_contract import runtime_contract_digest, stable_json
+from splitfleet.split_engine import graph_contract_for_runtime_handle
+from splitfleet.split_engine.contracts import ModelVersionContract
+from splitfleet.backends import TorchBackendAdapter
 from splitfleet.common.constants import (
     AUTOSPLIT_BACKEND_CONFIG_KEY,
     AUTOSPLIT_BACKEND_VALUE_TORCHLENS,
@@ -38,14 +42,18 @@ from splitfleet.common.constants import (
     AUTOSPLIT_DYNAMIC_BATCH_CONFIG_KEY,
     AUTOSPLIT_FEATURE_ABI_ID_CONFIG_KEY,
     AUTOSPLIT_GRAPH_SIGNATURE_CONFIG_KEY,
+    AUTOSPLIT_GRAPH_CONTRACT_CONFIG_KEY,
+    AUTOSPLIT_GRAPH_CONTRACT_DIGEST_CONFIG_KEY,
+    AUTOSPLIT_MODEL_VERSION_CONFIG_KEY,
+    AUTOSPLIT_MODEL_VERSION_CONTRACT_CONFIG_KEY,
     AUTOSPLIT_MODE_CONFIG_KEY,
     AUTOSPLIT_PLAN_ID_CONFIG_KEY,
+    AUTOSPLIT_SPLIT_ID_CONFIG_KEY,
+    AUTOSPLIT_STAGE_COUNT_CONFIG_KEY,
     AUTOSPLIT_RUNTIME_BACKEND_CONFIG_KEY,
     AUTOSPLIT_RUNTIME_BACKEND_VALUE_TORCHLENS_NATIVE,
     AUTOSPLIT_RUNTIME_CONTRACT_CONFIG_KEY,
     AUTOSPLIT_RUNTIME_CONTRACT_DIGEST_CONFIG_KEY,
-    AUTOSPLIT_SPLIT_ID_CONFIG_KEY,
-    AUTOSPLIT_STAGE_COUNT_CONFIG_KEY,
     AUTOSPLIT_TORCHLENS_VERSION_CONFIG_KEY,
     AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY,
 )
@@ -242,31 +250,53 @@ class AutoSplitStrategy(PlainSlStrategy):
             device=self.runtime_device,
         )
 
-    def _autosplit_config(self) -> Dict[str, Any]:
+    def _autosplit_config(self, model_version: int = 0, *, training: bool = True) -> Dict[str, Any]:
         placement = self.get_or_create_placement_plan()
-        contract = dict(placement.runtime_contract or {})
+        reference_model = copy.deepcopy(self.model)
+        reference_model.train(training)
+        reference_handle = self.autosplit_session.prepare_runtime(
+            reference_model,
+            self.sample_inputs,
+            boundary=placement.boundary,
+            mode=placement.mode,
+            trainable=True,
+            dynamic_batch=placement.dynamic_batch,
+            trace_batch_mode=placement.trace_batch_mode,
+        )
+        contract = graph_contract_for_runtime_handle(reference_handle)
+        state_schema_hash = TorchBackendAdapter().state_manifest(reference_model).schema_hash
+        version_contract = ModelVersionContract(
+            round_model_version=int(model_version),
+            prefix_state_version=int(model_version),
+            suffix_state_version=int(model_version),
+            state_schema_hash=state_schema_hash,
+        )
         return {
             AUTOSPLIT_BACKEND_CONFIG_KEY: AUTOSPLIT_BACKEND_VALUE_TORCHLENS,
             AUTOSPLIT_RUNTIME_BACKEND_CONFIG_KEY: AUTOSPLIT_RUNTIME_BACKEND_VALUE_TORCHLENS_NATIVE,
             AUTOSPLIT_TORCHLENS_VERSION_CONFIG_KEY: placement.torchlens_version,
             AUTOSPLIT_PLAN_ID_CONFIG_KEY: placement.plan_id,
-            AUTOSPLIT_SPLIT_ID_CONFIG_KEY: placement.split_id,
-            AUTOSPLIT_GRAPH_SIGNATURE_CONFIG_KEY: placement.graph_signature,
+            AUTOSPLIT_SPLIT_ID_CONFIG_KEY: reference_handle.plan.split_id,
+            AUTOSPLIT_GRAPH_SIGNATURE_CONFIG_KEY: reference_handle.plan.graph_signature,
             AUTOSPLIT_BOUNDARY_CONFIG_KEY: placement.boundary,
             AUTOSPLIT_BOUNDARY_TENSOR_LABELS_CONFIG_KEY: stable_json(placement.boundary_tensor_labels),
             AUTOSPLIT_MODE_CONFIG_KEY: placement.mode,
             AUTOSPLIT_STAGE_COUNT_CONFIG_KEY: 2,
             AUTOSPLIT_CLIENT_STAGE_COUNT_CONFIG_KEY: 1,
             AUTOSPLIT_FEATURE_ABI_ID_CONFIG_KEY: placement.feature_abi_id,
-            AUTOSPLIT_RUNTIME_CONTRACT_CONFIG_KEY: stable_json(contract),
-            AUTOSPLIT_RUNTIME_CONTRACT_DIGEST_CONFIG_KEY: runtime_contract_digest(contract),
+            AUTOSPLIT_RUNTIME_CONTRACT_CONFIG_KEY: stable_json(placement.runtime_contract),
+            AUTOSPLIT_RUNTIME_CONTRACT_DIGEST_CONFIG_KEY: runtime_contract_digest(placement.runtime_contract),
             AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY: placement.trace_batch_mode,
             AUTOSPLIT_DYNAMIC_BATCH_CONFIG_KEY: stable_json(placement.dynamic_batch),
+            AUTOSPLIT_GRAPH_CONTRACT_CONFIG_KEY: contract.to_json().decode("utf-8"),
+            AUTOSPLIT_GRAPH_CONTRACT_DIGEST_CONFIG_KEY: contract.digest,
+            AUTOSPLIT_MODEL_VERSION_CONFIG_KEY: int(model_version),
+            AUTOSPLIT_MODEL_VERSION_CONTRACT_CONFIG_KEY: version_contract.to_json().decode("utf-8"),
         }
 
     def configure_fit(self, server_round, parameters, client_manager):
         instructions = super().configure_fit(server_round, parameters, client_manager)
-        autosplit_config = self._autosplit_config()
+        autosplit_config = self._autosplit_config(server_round, training=True)
         for _, fit_ins in instructions:
             fit_ins.config.update(autosplit_config)
         return instructions
@@ -332,14 +362,14 @@ class AutoSplitStrategy(PlainSlStrategy):
 
     def configure_evaluate(self, server_round, parameters, client_manager):
         instructions = super().configure_evaluate(server_round, parameters, client_manager)
-        autosplit_config = self._autosplit_config()
+        autosplit_config = self._autosplit_config(server_round, training=False)
         for _, evaluate_ins in instructions:
             evaluate_ins.config.update(autosplit_config)
         return instructions
 
     def configure_server_fit(self, server_round, parameters, cids):
         server_configs = super().configure_server_fit(server_round, parameters, cids)
-        autosplit_config = self._autosplit_config()
+        autosplit_config = self._autosplit_config(server_round, training=True)
         for config in server_configs:
             config.config["sid"] = config.sid
             config.config.update(autosplit_config)
@@ -347,7 +377,7 @@ class AutoSplitStrategy(PlainSlStrategy):
 
     def configure_server_evaluate(self, server_round, parameters, cids):
         server_configs = super().configure_server_evaluate(server_round, parameters, cids)
-        autosplit_config = self._autosplit_config()
+        autosplit_config = self._autosplit_config(server_round, training=False)
         for config in server_configs:
             config.config["sid"] = config.sid
             config.config.update(autosplit_config)

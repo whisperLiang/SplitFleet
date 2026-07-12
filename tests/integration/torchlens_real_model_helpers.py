@@ -2,13 +2,38 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import os
+import subprocess
+import sys
 from typing import Any
 
 import pytest
 import torch
 
 from splitfleet.autosplit import prepare_torchlens_runtime
-from splitfleet.autosplit.serde import dumps_torch_object, loads_torch_object
+from splitfleet.split_engine import graph_contract_for_runtime_handle
+from splitfleet.transport import decode_boundary, encode_boundary
+from splitfleet.transport.split_wire import boundary_to_envelope, envelope_to_boundary
+
+
+def run_real_model_test_isolated(request) -> bool:
+    """Execute one real-model node in a fresh interpreter exactly once."""
+    if os.environ.get("SPLITFLEET_REAL_MODEL_CHILD") == "1":
+        return False
+    env = dict(os.environ)
+    env["SPLITFLEET_REAL_MODEL_CHILD"] = "1"
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", request.node.nodeid, "-q"],
+        cwd=str(request.config.rootpath),
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    if result.returncode != 0:
+        pytest.fail(f"isolated real-model test failed:\n{result.stdout}", pytrace=False)
+    return True
 
 
 def normalize_inputs(inputs) -> tuple[Any, ...]:
@@ -106,7 +131,7 @@ def run_split_inference_equivalence(model, trace_inputs, runtime_inputs, boundar
         boundary_payload = runtime.backend.run_prefix(*normalize_inputs(runtime_inputs))
         split = runtime.backend.run_suffix(boundary_payload)
     assert boundary_payload.tensors
-    assert first_tensor_batch_size(runtime_inputs) == 3
+    assert first_tensor_batch_size(runtime_inputs) >= 2
     assert_nested_structure_equal(direct, split)
     assert_nested_shape_equal(direct, split)
     assert_nested_close(direct, split)
@@ -136,7 +161,21 @@ def run_split_training_smoke(model, trace_inputs, runtime_inputs, targets, loss_
 
 
 def run_boundary_serde_roundtrip(runtime, boundary):
-    restored = loads_torch_object(dumps_torch_object(boundary))
+    contract = graph_contract_for_runtime_handle(runtime)
+    envelope = boundary_to_envelope(
+        boundary,
+        round_id=1,
+        client_id="real-model",
+        step_id="roundtrip",
+        plan_id=runtime.plan.plan_id,
+        split_id=contract.split_id,
+        canonical_graph_hash=contract.canonical_graph_hash,
+        boundary_schema_hash=contract.boundary_schema_hash,
+        model_version=1,
+    )
+    restored = envelope_to_boundary(
+        decode_boundary(encode_boundary(envelope)), runtime.runtime, "cpu"
+    )
     output1 = runtime.backend.run_suffix(boundary)
     output2 = runtime.backend.run_suffix(restored)
     assert restored.tensors

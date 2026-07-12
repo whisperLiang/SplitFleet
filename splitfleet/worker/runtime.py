@@ -50,6 +50,8 @@ class StageWorkerRuntime:
         model_state: bytes = b"",
     ) -> SplitPlan:
         _ = model_state
+        if descriptor.get("engine") != "torchlens" or descriptor.get("backend") != "torchlens":
+            raise ValueError("Worker requires an explicit TorchLens placement descriptor")
         placement_plan = SplitPlan(
             plan_id=str(descriptor["plan_id"]),
             split_id=str(descriptor.get("split_id", "")),
@@ -59,8 +61,9 @@ class StageWorkerRuntime:
             prefix_worker_id="client",
             suffix_worker_id=self.worker_spec.worker_id,
             score=float(descriptor.get("score", 0.0)),
-            backend=str(descriptor.get("backend", "torchlens")),
-            runtime_backend=str(descriptor.get("runtime_backend", "torchlens_native")),
+            engine=str(descriptor["engine"]),
+            backend=str(descriptor["backend"]),
+            runtime_backend=str(descriptor["runtime_backend"]),
             candidate_id=str(descriptor.get("candidate_id", "")),
             boundary_tensor_labels=[
                 str(label) for label in list(descriptor.get("boundary_tensor_labels") or [])

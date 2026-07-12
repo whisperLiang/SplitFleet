@@ -113,7 +113,7 @@ def test_feature_abi_is_batch_symbolic_and_runtime_identity_tolerant() -> None:
     layout = {"x": {"dtype": "torch.float32", "shape_without_batch": [8], "rank": 2}}
     cuda_layout = {"x": {"dtype": "torch.float32", "shape_without_batch": [8], "rank": 2, "device": "cuda:0"}}
     spec_b1 = build_feature_abi_spec(
-        torchlens_version="2.18.0",
+        torchlens_version="2.31.0",
         model_family="toy",
         model_name="ToyNet",
         canonical_split_key="after:x",
@@ -126,7 +126,7 @@ def test_feature_abi_is_batch_symbolic_and_runtime_identity_tolerant() -> None:
         dynamic_batch=(1, 8),
     )
     spec_b2 = build_feature_abi_spec(
-        torchlens_version="2.18.0",
+        torchlens_version="2.31.0",
         model_family="toy",
         model_name="ToyNet",
         canonical_split_key="after:x",
@@ -167,8 +167,8 @@ def test_feature_abi_is_batch_symbolic_and_runtime_identity_tolerant() -> None:
         boundary_tensor_labels=["x"],
         boundary_schema=schema_b1,
         feature_layout=layout,
-        torchlens_version="2.18.0",
-        runtime_version="2.18.0",
+        torchlens_version="2.31.0",
+        runtime_version="2.31.0",
         trace_batch_size=1,
     )
     cloud_contract = build_runtime_contract(
@@ -179,14 +179,14 @@ def test_feature_abi_is_batch_symbolic_and_runtime_identity_tolerant() -> None:
         boundary_tensor_labels=["x"],
         boundary_schema=schema_b2,
         feature_layout=cuda_layout,
-        torchlens_version="2.18.0",
-        runtime_version="2.18.0",
+        torchlens_version="2.31.0",
+        runtime_version="2.31.0",
         trace_batch_size=2,
     )
     compatibility = classify_contract_compatibility(edge_contract, cloud_contract)
     assert compatibility["compatible"] is True
     assert compatibility["reason"] == "runtime_identity_changed_but_feature_abi_compatible"
-    assert edge_contract["torchlens_version"] == "2.18.0"
+    assert edge_contract["torchlens_version"] == "2.31.0"
 
 
 def test_feature_abi_rejects_label_order_dtype_and_shape_changes() -> None:

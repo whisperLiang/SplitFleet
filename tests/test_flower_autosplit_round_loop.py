@@ -5,9 +5,8 @@ import pytest
 import torch
 from torch import nn
 
-from splitfleet.autosplit.serde import dumps_torch_object
 from splitfleet.client.autosplit_split_client import AutoSplitSplitLearningClient
-from splitfleet.common import BatchData, ControlCode, ServerModelFitIns
+from splitfleet.common import ServerModelFitIns
 from splitfleet.server.server_model.autosplit_tail_server_model import AutoSplitTailServerModel
 from splitfleet.server.server_model.proxy.server_model_proxy import ServerModelProxy
 from splitfleet.server.stage_runtime.manager import StageRuntimeManager
@@ -66,24 +65,6 @@ class InProcessServerModelProxy(ServerModelProxy):
 
 def _model_to_ndarrays(model: nn.Module):
     return [tensor.detach().cpu().numpy() for tensor in model.state_dict().values()]
-
-
-def _valid_boundary_upload_payload(server_model, boundary, targets):
-    handle = server_model.runtime_handle
-    dynamic_batch = list(handle.plan.dynamic_batch) if handle.plan.dynamic_batch is not None else None
-    return {
-        "boundary": boundary,
-        "targets": targets,
-        "num_examples": getattr(boundary, "batch_size", 3),
-        "feature_abi_id": handle.feature_abi_id,
-        "runtime_backend": handle.plan.runtime_backend,
-        "torchlens_version": handle.torchlens_version,
-        "runtime_contract_digest": handle.plan.metadata["runtime_contract_digest"],
-        "boundary_tensor_labels": list(handle.plan.boundary_tensor_labels),
-        "batch_size": getattr(boundary, "batch_size", 3),
-        "trace_batch_mode": handle.plan.trace_batch_mode,
-        "dynamic_batch": dynamic_batch,
-    }
 
 
 def test_torchlens_split_learning_client_and_tail_exchange_boundary_payloads() -> None:
@@ -197,92 +178,15 @@ def test_autosplit_tail_server_model_prepares_runtime_after_train_mode() -> None
     assert torch.allclose(split, expected, atol=1e-5, rtol=1e-5)
 
 
-def test_autosplit_tail_server_model_rejects_contract_digest_mismatch() -> None:
-    torch.manual_seed(41)
-    base_model = DeepNet().eval()
-    strategy = AutoSplitStrategy(
-        model=base_model,
-        sample_inputs=torch.randn(2, 4),
-        boundary="50%",
-        loss_fn=nn.MSELoss(),
-    )
-    manager = StageRuntimeManager(autosplit_session=strategy.autosplit_session)
-    strategy.bind_stage_runtime_manager(manager)
-    manager.set_placement_plan(strategy.get_or_create_placement_plan())
-    server_model = AutoSplitTailServerModel(
-        runtime_manager=manager,
-        model=base_model,
-        loss_fn=nn.MSELoss(),
-    )
-    server_model.configure_fit(
-        ServerModelFitIns(
-            parameters=_model_to_ndarrays(base_model),
-            config=strategy._autosplit_config(),
-            sid="",
-        )
-    )
-    boundary = server_model.runtime_handle.backend.run_prefix(torch.randn(3, 4))
-    payload = _valid_boundary_upload_payload(server_model, boundary, torch.randn(3, 2))
-    payload["runtime_contract_digest"] = "bad-digest"
+def test_tail_step_ids_are_consume_once_and_failed_steps_can_retry() -> None:
+    server_model = AutoSplitTailServerModel(runtime_manager=object(), model=DeepNet())
+    key = (3, "client-a", "step-1")
 
-    with pytest.raises(RuntimeError, match="runtime contract digest mismatch"):
-        server_model.train_tail(
-            [
-                BatchData(
-                    data={"payload": dumps_torch_object(payload)},
-                    control_code=ControlCode.OK,
-                )
-            ]
-        )
-
-
-@pytest.mark.parametrize(
-    ("field", "value", "message"),
-    [
-        ("boundary_tensor_labels", ["wrong_label"], "boundary tensor labels mismatch"),
-        ("batch_size", 99, "batch size mismatch"),
-        ("trace_batch_mode", "batch_1", "trace batch mode mismatch"),
-        ("dynamic_batch", [1, 99], "dynamic batch mismatch"),
-    ],
-)
-def test_autosplit_tail_server_model_rejects_boundary_upload_metadata_mismatch(
-    field,
-    value,
-    message,
-) -> None:
-    torch.manual_seed(43)
-    base_model = DeepNet().eval()
-    strategy = AutoSplitStrategy(
-        model=base_model,
-        sample_inputs=torch.randn(2, 4),
-        boundary="50%",
-        loss_fn=nn.MSELoss(),
-    )
-    manager = StageRuntimeManager(autosplit_session=strategy.autosplit_session)
-    strategy.bind_stage_runtime_manager(manager)
-    manager.set_placement_plan(strategy.get_or_create_placement_plan())
-    server_model = AutoSplitTailServerModel(
-        runtime_manager=manager,
-        model=base_model,
-        loss_fn=nn.MSELoss(),
-    )
-    server_model.configure_fit(
-        ServerModelFitIns(
-            parameters=_model_to_ndarrays(base_model),
-            config=strategy._autosplit_config(),
-            sid="",
-        )
-    )
-    boundary = server_model.runtime_handle.backend.run_prefix(torch.randn(3, 4))
-    payload = _valid_boundary_upload_payload(server_model, boundary, torch.randn(3, 2))
-    payload[field] = value
-
-    with pytest.raises(RuntimeError, match=message):
-        server_model.train_tail(
-            [
-                BatchData(
-                    data={"payload": dumps_torch_object(payload)},
-                    control_code=ControlCode.OK,
-                )
-            ]
-        )
+    server_model._begin_step(key)
+    with pytest.raises(ValueError, match="Duplicate split step"):
+        server_model._begin_step(key)
+    server_model._abort_step(key)
+    server_model._begin_step(key)
+    server_model._complete_step(key)
+    with pytest.raises(ValueError, match="Duplicate split step"):
+        server_model._begin_step(key)

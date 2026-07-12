@@ -17,6 +17,7 @@ from splitfleet.autosplit.types import (
     SplitPlan,
     WorkerSpec,
 )
+from splitfleet.split_engine import graph_contract_for_runtime_handle
 
 
 TWO_STAGE_ERROR = "TorchLens autosplit backend supports prefix/suffix two-stage split only."
@@ -140,6 +141,7 @@ def _build_placement(
         "torchlens_version": runtime_handle.plan.torchlens_version,
         "_runtime_handle": runtime_handle,
     }
+    graph_contract = graph_contract_for_runtime_handle(runtime_handle)
     return SplitPlan(
         plan_id=runtime_handle.plan.plan_id,
         split_id=runtime_handle.plan.split_id,
@@ -150,6 +152,11 @@ def _build_placement(
         suffix_worker_id=suffix_worker.worker_id,
         score=score,
         backend="torchlens",
+        engine="torchlens",
+        split_request={"boundary": runtime_handle.plan.boundary, "mode": runtime_handle.plan.mode},
+        canonical_graph_hash=graph_contract.canonical_graph_hash,
+        boundary_schema_hash=graph_contract.boundary_schema_hash,
+        capabilities={"contract_digest": graph_contract.capability_hash},
         runtime_backend="torchlens_native",
         torchlens_version=runtime_handle.plan.torchlens_version,
         model_name=model_name or runtime_handle.plan.model_name,

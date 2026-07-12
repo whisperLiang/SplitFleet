@@ -10,8 +10,6 @@ import grpc
 
 from splitfleet.autosplit.serde import (
     deserialize_plan_descriptor,
-    dumps_torch_object,
-    loads_torch_object,
 )
 from splitfleet.autosplit.types import WorkerSpec
 from splitfleet.proto import stage_worker_pb2, stage_worker_pb2_grpc
@@ -41,46 +39,10 @@ class StageWorkerServicer(stage_worker_pb2_grpc.StageWorkerServicer):
         )
 
     def ExecuteStage(self, request, context):
-        _ = context
-        seeded_values = loads_torch_object(
-            request.seeded_values,
-            map_location=self.runtime.worker_spec.device,
-        )
-        result = self.runtime.execute_stage(
-            plan_id=request.plan_id,
-            stage_id=request.stage_id,
-            execution_id=request.execution_id,
-            seeded_values=seeded_values,
-            differentiable=request.differentiable,
-            detach_boundary=request.detach_boundary,
-        )
-        return stage_worker_pb2.StageExecutionResponse(
-            available_updates=dumps_torch_object(result.available_updates),
-            stored_updates=dumps_torch_object(result.stored_updates),
-            metadata={
-                "worker_id": self.runtime.worker_spec.worker_id,
-                "client_id": request.client_id,
-                "round_id": str(request.round_id),
-                **dict(request.metadata),
-            },
-        )
+        context.abort(grpc.StatusCode.UNIMPLEMENTED, "Node-level remote stage execution is inactive")
 
     def BackwardStage(self, request, context):
-        _ = context
-        upstream_grads = loads_torch_object(
-            request.upstream_grads,
-            map_location=self.runtime.worker_spec.device,
-        )
-        result = self.runtime.backward_stage(
-            plan_id=request.plan_id,
-            stage_id=request.stage_id,
-            execution_id=request.execution_id,
-            upstream_grads=upstream_grads,
-        )
-        return stage_worker_pb2.StageBackwardResponse(
-            input_grads=dumps_torch_object(result.input_grads),
-            parameter_grads=dumps_torch_object(result.parameter_grads),
-        )
+        context.abort(grpc.StatusCode.UNIMPLEMENTED, "Node-level remote stage execution is inactive")
 
     def ClearExecution(self, request, context):
         _ = context

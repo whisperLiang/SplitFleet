@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 import grpc
 
-from splitfleet.autosplit.serde import dumps_torch_object, loads_torch_object, serialize_plan_descriptor
+from splitfleet.autosplit.serde import serialize_plan_descriptor
 from splitfleet.autosplit.types import PlacementPlan, WorkerSpec
 from splitfleet.proto import stage_worker_pb2, stage_worker_pb2_grpc
 
@@ -123,7 +123,7 @@ class RemoteStageExecutor(StageExecutor):
         )
 
     def run_stage_forward(self, *args, **kwargs):
-        _ = (args, kwargs, dumps_torch_object, loads_torch_object)
+        _ = (args, kwargs)
         raise NotImplementedError(REMOTE_STAGE_ERROR)
 
     def run_stage_backward(self, *args, **kwargs):

@@ -88,7 +88,7 @@ class SplitRuntimePlan:
 
 
 @dataclass
-class SplitPlan:
+class SplitPlacementPlan:
     """Concrete two-stage SplitFleet placement backed by TorchLens native split."""
 
     plan_id: str
@@ -100,6 +100,11 @@ class SplitPlan:
     suffix_worker_id: str
     score: float
     backend: str = "torchlens"
+    engine: str = "torchlens"
+    split_request: dict[str, Any] = field(default_factory=dict)
+    canonical_graph_hash: str = ""
+    boundary_schema_hash: str = ""
+    capabilities: dict[str, Any] = field(default_factory=dict)
     runtime_backend: str = "torchlens_native"
     torchlens_version: str = ""
     model_name: str = ""
@@ -139,4 +144,6 @@ class SplitPlan:
         }
 
 
-PlacementPlan = SplitPlan
+# Deprecated aliases retained while callers migrate to the control-plane name.
+SplitPlan = SplitPlacementPlan
+PlacementPlan = SplitPlacementPlan

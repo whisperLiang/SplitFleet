@@ -13,11 +13,12 @@ from tests.integration.torchlens_real_model_helpers import (
     nested_tensor_loss,
     parameter_delta_nonzero,
     run_split_inference_equivalence,
+    run_real_model_test_isolated,
     skip_if_missing_dependency,
 )
 
 
-RUN_HEAVY = os.environ.get("SPLITFLEET_RUN_HEAVY_REAL_MODELS") == "1"
+RUN_HEAVY = os.environ.get("SPLITFLEET_RUN_HEAVY_REAL_MODELS", "1") == "1"
 
 
 class YOLOTensorWrapper(nn.Module):
@@ -49,7 +50,9 @@ class RFDETRTensorWrapper(nn.Module):
 
 
 @pytest.mark.skipif(not RUN_HEAVY, reason="Set SPLITFLEET_RUN_HEAVY_REAL_MODELS=1 to run YOLO/RF-DETR tests.")
-def test_yolov8n_optional_split_smoke() -> None:
+def test_yolov8n_optional_split_smoke(request) -> None:
+    if run_real_model_test_isolated(request):
+        return
     skip_if_missing_dependency("ultralytics")
     from ultralytics import YOLO
 
@@ -59,15 +62,18 @@ def test_yolov8n_optional_split_smoke() -> None:
         pytest.skip(f"YOLOv8n config is unavailable locally: {exc}")
     model = YOLOTensorWrapper(yolo).eval()
     trace_inputs = torch.randn(2, 3, 160, 160)
-    runtime_inputs = torch.randn(3, 3, 160, 160)
-    try:
-        run_split_inference_equivalence(model, trace_inputs, runtime_inputs, "50%")
-    except Exception as exc:
-        pytest.xfail(f"YOLOv8n split inference is not stable in this environment: {exc}")
+    runtime_inputs = torch.randn(2, 3, 160, 160)
+    # TorchLens 2.31 needs a frontier before YOLO's late multi-output branch
+    # and currently supports this graph only at the traced batch size.
+    with torch.no_grad():
+        model(trace_inputs)
+    run_split_inference_equivalence(model, trace_inputs, runtime_inputs, "35%")
 
 
 @pytest.mark.skipif(not RUN_HEAVY, reason="Set SPLITFLEET_RUN_HEAVY_REAL_MODELS=1 to run YOLO/RF-DETR tests.")
-def test_rfdetr_nano_optional_split_smoke() -> None:
+def test_rfdetr_nano_optional_split_smoke(request) -> None:
+    if run_real_model_test_isolated(request):
+        return
     skip_if_missing_dependency("rfdetr")
     try:
         from rfdetr import RFDETRNano
@@ -79,36 +85,33 @@ def test_rfdetr_nano_optional_split_smoke() -> None:
     except Exception as exc:
         pytest.skip(f"RF-DETR Nano construction requires unavailable local assets: {exc}")
     trace_inputs = torch.randn(2, 3, 224, 224)
-    runtime_inputs = torch.randn(3, 3, 224, 224)
-    try:
-        run_split_inference_equivalence(
-            model,
-            trace_inputs,
-            runtime_inputs,
-            "50%",
-        )
-        # RF-DETR's train() path builds batch-dependent Python containers before
-        # the chosen boundary. Keep the heavy smoke in eval mode while still
-        # exercising TorchLens's training prefix/suffix/backward APIs.
-        runtime = make_runtime(
-            model,
-            trace_inputs,
-            "50%",
-        )
-        optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=1e-4)
-        before = clone_trainable_state(model)
-        boundary = runtime.backend.run_prefix(runtime_inputs, training=True)
-        loss, boundary_grads = runtime.backend.train_suffix(
-            boundary,
-            None,
-            loss_fn=lambda output, _targets: nested_tensor_loss(output),
-            optimizer=optimizer,
-        )
-        runtime.backend.backward_prefix(boundary, boundary_grads=boundary_grads, optimizer=optimizer)
-        after = clone_trainable_state(model)
-        assert torch.isfinite(loss)
-        assert boundary.tensors
-        assert boundary_grads
-        assert has_any_parameter_grad(model) or parameter_delta_nonzero(before, after)
-    except Exception as exc:
-        pytest.xfail(f"RF-DETR Nano split smoke is not stable in this environment: {exc}")
+    runtime_inputs = torch.randn(2, 3, 224, 224)
+    run_split_inference_equivalence(
+        model,
+        trace_inputs,
+        runtime_inputs,
+        "50%",
+    )
+    # RF-DETR's train() path builds batch-dependent Python containers before
+    # the chosen boundary. Keep the heavy smoke in eval mode while still
+    # exercising TorchLens's training prefix/suffix/backward APIs.
+    runtime = make_runtime(
+        model,
+        trace_inputs,
+        "50%",
+    )
+    optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=1e-4)
+    before = clone_trainable_state(model)
+    boundary = runtime.backend.run_prefix(runtime_inputs, training=True)
+    loss, boundary_grads = runtime.backend.train_suffix(
+        boundary,
+        None,
+        loss_fn=lambda output, _targets: nested_tensor_loss(output),
+        optimizer=optimizer,
+    )
+    runtime.backend.backward_prefix(boundary, boundary_grads=boundary_grads, optimizer=optimizer)
+    after = clone_trainable_state(model)
+    assert torch.isfinite(loss)
+    assert boundary.tensors
+    assert boundary_grads
+    assert has_any_parameter_grad(model) or parameter_delta_nonzero(before, after)

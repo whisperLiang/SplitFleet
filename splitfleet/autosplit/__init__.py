@@ -6,6 +6,7 @@ from splitfleet.autosplit.boundary import (
     from_torchlens_boundary,
     to_torchlens_boundary,
 )
+from splitfleet.runtime import PrefixContextKey, PrefixContextStore
 from splitfleet.autosplit.cache import PlanCacheEntry, PlanCacheStore
 from splitfleet.autosplit.policies import (
     AggregationPolicy,
@@ -61,6 +62,7 @@ from splitfleet.autosplit.types import (
     PlacementPlan,
     ReplicaScope,
     SplitPlan,
+    SplitPlacementPlan,
     SplitRuntimePlan,
     WorkerSpec,
 )
@@ -70,6 +72,8 @@ __all__ = [
     "AutoSplitPlanner",
     "AutoSplitSession",
     "BoundaryPayload",
+    "PrefixContextKey",
+    "PrefixContextStore",
     "BoundarySpec",
     "ExecutionSchedulePolicy",
     "FeatureAbiSpec",
@@ -83,6 +87,7 @@ __all__ = [
     "ReplicaScopePolicy",
     "SplitCandidate",
     "SplitPlan",
+    "SplitPlacementPlan",
     "SplitRuntime",
     "SplitRuntimeHandle",
     "SplitRuntimePlan",

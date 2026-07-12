@@ -69,9 +69,12 @@ def shape_numel(shape: Sequence[Any] | Any) -> int:
 def payload_bytes_from_specs(specs: Mapping[str, Any]) -> int:
     total = 0
     for spec in dict(specs or {}).values():
-        total += shape_numel(getattr(spec, "shape", None) or ()) * torch_dtype_size(
-            getattr(spec, "dtype", None)
-        )
+        shape = getattr(spec, "shape", None)
+        shape = getattr(shape, "dims", shape) or ()
+        dtype = getattr(spec, "dtype", None)
+        if isinstance(dtype, str):
+            dtype = getattr(torch, dtype.removeprefix("torch."), None)
+        total += shape_numel(shape) * torch_dtype_size(dtype)
     return int(total)
 
 
@@ -83,7 +86,7 @@ def boundary_schema_summary(specs: Mapping[str, Any]) -> dict[str, dict[str, Any
             "torchlens_label": str(getattr(spec, "torchlens_label", label) or label),
             "module_path": str(getattr(spec, "module_path", "") or ""),
             "op_type": str(getattr(spec, "op_type", "") or ""),
-            "symbolic_shape": [str(dim) for dim in list(getattr(spec, "shape", ()) or ())],
+            "symbolic_shape": [str(dim) for dim in list(getattr(getattr(spec, "shape", ()), "dims", getattr(spec, "shape", ())) or ())],
             "dtype": str(getattr(spec, "dtype", "") or ""),
             "requires_grad": bool(getattr(spec, "requires_grad", False)),
             "role": str(getattr(spec, "role", "") or ""),
@@ -96,7 +99,8 @@ def boundary_schema_summary(specs: Mapping[str, Any]) -> dict[str, dict[str, Any
 def feature_layout_from_specs(specs: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     layout: dict[str, dict[str, Any]] = {}
     for label, spec in dict(specs or {}).items():
-        shape = list(getattr(spec, "shape", ()) or ())
+        raw_shape = getattr(spec, "shape", ())
+        shape = list(getattr(raw_shape, "dims", raw_shape) or ())
         layout[str(label)] = {
             "dtype": str(getattr(spec, "dtype", "") or ""),
             "shape_without_batch": [str(dim) for dim in shape[1:]],
@@ -138,10 +142,10 @@ def parameter_count_for_nodes(
     total = 0
     if graph is None:
         return 0
-    for node in graph.ordered_nodes():
-        if str(getattr(node, "torchlens_label", "")) not in selected:
+    for node in graph.nodes:
+        if str(getattr(node, "canonical_id", "")) not in selected:
             continue
-        for log in _parameter_logs_for_node(node):
+        for log in list(getattr(node, "param_refs", ()) or ()) or _parameter_logs_for_node(node):
             param = _parameter_from_log(log, named_parameters)
             if param is not None:
                 if trainable_only and not bool(param.requires_grad):
@@ -171,14 +175,14 @@ def candidate_from_plan(
     graph_signature: str = "",
 ) -> SplitCandidate:
     graph = getattr(runtime, "trace_graph", None)
-    prefix_nodes = [str(node) for node in list(getattr(plan, "prefix_nodes", ()) or ())]
-    suffix_nodes = [str(node) for node in list(getattr(plan, "suffix_nodes", ()) or ())]
-    boundary_labels = [str(node) for node in list(getattr(plan, "boundary_nodes", ()) or ())]
-    specs = dict(getattr(plan, "boundary_specs", {}) or {})
+    prefix_nodes = [str(node) for node in list(getattr(plan, "prefix_node_ids", getattr(plan, "prefix_nodes", ())) or ())]
+    suffix_nodes = [str(node) for node in list(getattr(plan, "suffix_node_ids", getattr(plan, "suffix_nodes", ())) or ())]
+    boundary_labels = [str(node) for node in list(getattr(plan, "boundary_node_ids", getattr(plan, "boundary_nodes", ())) or ())]
+    specs = dict(getattr(plan, "boundary_spec", getattr(plan, "boundary_specs", {})) or {})
     payload_bytes = payload_bytes_from_specs(specs)
     all_nodes = [
-        str(getattr(node, "torchlens_label", ""))
-        for node in graph.ordered_nodes()
+        str(getattr(node, "canonical_id", ""))
+        for node in graph.nodes
     ] if graph is not None else []
     edge_params = parameter_count_for_nodes(runtime, prefix_nodes)
     suffix_params = parameter_count_for_nodes(runtime, suffix_nodes)
@@ -190,7 +194,13 @@ def candidate_from_plan(
     total_params = parameter_count_for_nodes(runtime, all_nodes)
     freezing_ratio = float(edge_params) / float(total_params) if total_params else 0.0
     privacy_leakage = 1.0 / float(edge_params) if edge_params > 0 else float("inf")
-    split_label = str(getattr(plan, "split_label", "") or "")
+    target_id = str(getattr(plan, "target_node_id", "") or "")
+    target_node = next((node for node in graph.nodes if node.canonical_id == target_id), None) if graph is not None else None
+    suffix_compute_nodes = [
+        node_id for node_id in suffix_nodes
+        if not bool(getattr(next((node for node in graph.nodes if node.canonical_id == node_id), None), "is_output", False))
+    ] if graph is not None else suffix_nodes
+    split_label = str(getattr(plan, "split_label", "") or getattr(target_node, "label", "") or "")
     boundary = str(getattr(plan, "split_id", "") or getattr(split_spec, "boundary", "") or "")
     if boundary and not boundary.startswith("after:") and split_label:
         boundary = f"after:{split_label}"
@@ -203,7 +213,7 @@ def candidate_from_plan(
         "boundary_schema": boundary_schema_summary(specs),
         "feature_layout": feature_layout_from_specs(specs),
         "prefix_node_count": len(prefix_nodes),
-        "suffix_node_count": len(suffix_nodes),
+        "suffix_node_count": len(suffix_compute_nodes),
         "trainable_suffix_parameter_count": trainable_suffix_params,
         "torchlens_split_id": getattr(plan, "split_id", None),
         "torchlens_split_label": getattr(plan, "split_label", None),

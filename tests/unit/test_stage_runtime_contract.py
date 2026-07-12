@@ -50,7 +50,7 @@ def test_clone_runtime_preserves_feature_abi_and_cache_key() -> None:
     assert key["feature_abi_id"] == placement.feature_abi_id
     assert key["boundary"] == placement.boundary
     assert key["graph_signature"] == placement.graph_signature
-    assert key["torchlens_version"] == "2.18.0"
+    assert key["torchlens_version"] == "2.31.0"
     assert key["runtime_backend"] == "torchlens_native"
     assert key["trace_batch_mode"] == placement.trace_batch_mode
     assert key["dynamic_batch"] == list(placement.dynamic_batch)

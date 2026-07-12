@@ -71,7 +71,7 @@ def test_autosplit_strategy_generates_torchlens_metadata() -> None:
 
     assert config[AUTOSPLIT_BACKEND_CONFIG_KEY] == AUTOSPLIT_BACKEND_VALUE_TORCHLENS
     assert config[AUTOSPLIT_RUNTIME_BACKEND_CONFIG_KEY] == AUTOSPLIT_RUNTIME_BACKEND_VALUE_TORCHLENS_NATIVE
-    assert config[AUTOSPLIT_TORCHLENS_VERSION_CONFIG_KEY] == "2.18.0"
+    assert config[AUTOSPLIT_TORCHLENS_VERSION_CONFIG_KEY] == "2.31.0"
     assert config[AUTOSPLIT_PLAN_ID_CONFIG_KEY].startswith("torchlens_")
     assert config[AUTOSPLIT_SPLIT_ID_CONFIG_KEY]
     assert config[AUTOSPLIT_GRAPH_SIGNATURE_CONFIG_KEY]
