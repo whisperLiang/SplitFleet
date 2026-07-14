@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import importlib.metadata
 import uuid
-from dataclasses import asdict, is_dataclass
+from dataclasses import fields, is_dataclass
 from enum import Enum
 from typing import Any
 
 import torch
 from torchlens.split import ReplayBoundary, prepare
 
-from splitfleet.backends import TorchBackendAdapter
+from splitfleet.backends import BACKEND_ADAPTERS
 from splitfleet.runtime import PrefixContextStore
 from splitfleet.runtime.torch_suffix_training import train_torch_suffix
 from splitfleet.split_engine.base import PrefixContextToken, SplitRuntimeHandle, SuffixResult
@@ -19,9 +19,7 @@ from splitfleet.split_engine.contracts import GraphContract, contract_hash
 from splitfleet.transport import (
     BoundaryEnvelope,
     GradientEnvelope,
-    decode_tensor,
     encode_bundle,
-    encode_tensor,
 )
 
 
@@ -31,7 +29,14 @@ def _value(value: Any) -> Any:
     if isinstance(value, Enum):
         return value.value
     if is_dataclass(value):
-        return _value(asdict(value))
+        # dataclasses.asdict() deep-copies every non-container leaf. JAX graph
+        # records can contain jaxlib Traceback objects, which intentionally
+        # cannot be pickled/deep-copied. Walk fields directly for the
+        # JSON-compatible contract projection.
+        return {
+            field.name: _value(getattr(value, field.name))
+            for field in fields(value)
+        }
     if isinstance(value, dict):
         return {str(k): _value(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -39,7 +44,8 @@ def _value(value: Any) -> Any:
     if hasattr(value, "to_dict"):
         return _value(value.to_dict())
     if hasattr(value, "__dict__"):
-        return {k: _value(v) for k, v in vars(value).items() if not k.startswith("_")}
+        public = {k: _value(v) for k, v in vars(value).items() if not k.startswith("_")}
+        return public if public else str(value)
     return str(value)
 
 
@@ -59,7 +65,6 @@ class TorchLensSplitEngine:
 
     def __init__(self, *, context_store: PrefixContextStore | None = None) -> None:
         self.context_store = context_store or PrefixContextStore()
-        self.backend_adapter = TorchBackendAdapter()
 
     def prepare(self, model: Any, sample_inputs: Any, request: Any, *, sample_kwargs: dict[str, Any] | None = None) -> SplitRuntimeHandle:
         runtime = prepare(model, sample_inputs, request, input_kwargs=sample_kwargs)
@@ -80,7 +85,6 @@ class TorchLensSplitEngine:
                 known = {name: raw[name] for name in GraphContract.__dataclass_fields__ if name in raw}
                 known.setdefault("backend", handle.backend)
                 return GraphContract(**known)
-        graph = _value(_attr(runtime, "graph_ir", "split_graph", "graph", "ir", default={}))
         boundary = _value(_attr(runtime, "boundary_schema", default={}))
         request = _value(_attr(runtime, "request", "split_request", default={}))
         capabilities = _value(_attr(runtime, "capabilities", "capability_report", default={}))
@@ -89,9 +93,21 @@ class TorchLensSplitEngine:
         except importlib.metadata.PackageNotFoundError:
             version = "unknown"
         model = handle.metadata.get("model")
-        state_schema_hash = self.backend_adapter.state_manifest(model).schema_hash if isinstance(model, torch.nn.Module) else ""
+        try:
+            state_schema_hash = BACKEND_ADAPTERS.create(handle.backend).state_manifest(model).schema_hash
+        except (KeyError, TypeError, AttributeError):
+            state_schema_hash = ""
         input_schema = _tensor_schema(handle.metadata.get("sample_inputs"))
-        graph_hash = str(getattr(getattr(runtime, "graph_ir", None), "graph_hash", "") or "")
+        graph_hash = str(
+            _attr(runtime, "canonical_graph_hash", default="")
+            or getattr(getattr(runtime, "graph_ir", None), "graph_hash", "")
+            or ""
+        )
+        if not graph_hash:
+            graph = _value(
+                _attr(runtime, "graph_ir", "split_graph", "graph", "ir", default={})
+            )
+            graph_hash = contract_hash(graph)
         profile = getattr(runtime, "model_profile", None)
         model_profile_id = str(getattr(profile, "id", "") or "")
         model_revision = str(
@@ -106,7 +122,7 @@ class TorchLensSplitEngine:
             model_revision=model_revision,
             model_state_schema_hash=state_schema_hash,
             input_schema_hash=contract_hash(input_schema),
-            canonical_graph_hash=str(_attr(runtime, "canonical_graph_hash", default="")) or graph_hash or contract_hash(graph),
+            canonical_graph_hash=graph_hash,
             split_id=str(_attr(runtime, "split_id")),
             boundary_schema_hash=str(_attr(runtime, "boundary_schema_hash", default="")) or contract_hash(boundary),
             split_request_hash=contract_hash(request),
@@ -132,8 +148,18 @@ class TorchLensSplitEngine:
         if training:
             self.context_store.put(round_id, client_id, step_id, native)
             token = PrefixContextToken(round_id, client_id, step_id)
-        tensors = tuple(encode_tensor(name, tensor) for name, tensor in native.tensors.items())
-        batch_size = next((int(t.shape[0]) for t in native.tensors.values() if getattr(t, "ndim", 0)), 0)
+        adapter = BACKEND_ADAPTERS.create(handle.backend)
+        tensors = tuple(
+            adapter.encode_tensor(name, tensor) for name, tensor in native.tensors.items()
+        )
+        batch_size = next(
+            (
+                int(tensor.shape[0])
+                for tensor in native.tensors.values()
+                if tuple(getattr(tensor, "shape", ()) or ())
+            ),
+            0,
+        )
         envelope = BoundaryEnvelope(
             tensors=tensors,
             engine=self.engine_name,
@@ -162,8 +188,12 @@ class TorchLensSplitEngine:
             raise ValueError("Boundary canonical graph hash mismatch")
         if boundary.boundary_schema_hash != contract.boundary_schema_hash:
             raise ValueError("Boundary schema hash mismatch")
-        device = next(iter(runtime.model.parameters()), torch.empty(0)).device
-        tensors = {item.tensor_id: decode_tensor(item, device) for item in boundary.tensors}
+        adapter = BACKEND_ADAPTERS.create(handle.backend)
+        device = _runtime_device(handle)
+        tensors = {
+            item.tensor_id: adapter.decode_tensor(item, device)
+            for item in boundary.tensors
+        }
         return ReplayBoundary(
             backend=handle.backend,
             tensors=tensors,
@@ -185,12 +215,23 @@ class TorchLensSplitEngine:
         native = self._native_boundary(handle, boundary)
         if targets is None:
             outputs = handle.runtime.run_suffix(native)
-            return SuffixResult(outputs=encode_bundle(outputs), num_examples=boundary.batch_size)
-        loss, gradients = train_torch_suffix(
-            handle.runtime, native, targets, optimizer=optimizer
-        )
+            return SuffixResult(
+                outputs=encode_bundle(outputs, backend=handle.backend),
+                num_examples=boundary.batch_size,
+            )
+        if handle.backend == "torch":
+            loss, gradients = train_torch_suffix(
+                handle.runtime, native, targets, optimizer=optimizer
+            )
+        else:
+            loss, gradients = handle.runtime.train_suffix(
+                native, targets, optimizer=optimizer
+            )
+        adapter = BACKEND_ADAPTERS.create(handle.backend)
         gradient_envelope = GradientEnvelope(
-            tensors=tuple(encode_tensor(name, value) for name, value in gradients.items()),
+            tensors=tuple(
+                adapter.encode_tensor(name, value) for name, value in gradients.items()
+            ),
             backend=handle.backend,
             round_id=boundary.round_id,
             client_id=boundary.client_id,
@@ -202,7 +243,7 @@ class TorchLensSplitEngine:
         return SuffixResult(
             outputs=None,
             gradients=gradient_envelope,
-            loss=self.backend_adapter.scalar_value(loss),
+            loss=BACKEND_ADAPTERS.create(handle.backend).scalar_value(loss),
             num_examples=boundary.batch_size,
         )
 
@@ -220,9 +261,40 @@ class TorchLensSplitEngine:
         native = self.context_store.pop(
             context_token.round_id, context_token.client_id, context_token.step_id
         )
-        device = next(iter(handle.runtime.model.parameters()), torch.empty(0)).device
-        decoded = {item.tensor_id: decode_tensor(item, device) for item in gradients.tensors}
+        adapter = BACKEND_ADAPTERS.create(handle.backend)
+        device = _runtime_device(handle)
+        decoded = {
+            item.tensor_id: adapter.decode_tensor(item, device)
+            for item in gradients.tensors
+        }
         return handle.runtime.backward_prefix(native, decoded, optimizer=optimizer)
+
+
+def _iter_tensor_values(value: Any):
+    if hasattr(value, "shape") and hasattr(value, "dtype"):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _iter_tensor_values(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_tensor_values(item)
+
+
+def _runtime_device(handle: SplitRuntimeHandle) -> Any:
+    """Infer the native device used to reconstruct wire tensors."""
+    if handle.backend == "torch":
+        return next(iter(handle.runtime.model.parameters()), torch.empty(0)).device
+    for tensor in _iter_tensor_values(handle.metadata.get("sample_inputs")):
+        device = getattr(tensor, "device", None)
+        if callable(device):
+            device = device()
+        if device is not None:
+            return device
+        place = getattr(tensor, "place", None)
+        if place is not None:
+            return place
+    return None
 
 
 def _tensor_schema(value: Any) -> Any:

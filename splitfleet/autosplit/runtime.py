@@ -22,15 +22,75 @@ def normalize_inputs(inputs: Any) -> tuple[Any, ...]:
     return normalize_example_inputs(inputs)
 
 
-def _nested_tensor_loss(value: Any) -> torch.Tensor:
-    losses: list[torch.Tensor] = []
+def _tensor_backend(value: Any) -> str | None:
+    module = type(value).__module__.lower()
+    if isinstance(value, torch.Tensor):
+        return "torch"
+    if hasattr(value, "shape") and hasattr(value, "dtype"):
+        if module.startswith(("tensorflow", "keras")):
+            return "tf"
+        if module.startswith(("jax", "jaxlib")):
+            return "jax"
+        if module.startswith("paddle"):
+            return "paddle"
+        if module.startswith("tinygrad"):
+            return "tinygrad"
+    return None
+
+
+def _mean_square(value: Any) -> Any:
+    backend = _tensor_backend(value)
+    if backend == "torch":
+        return value.float().square().mean()
+    if backend == "tf":
+        import tensorflow as tf
+
+        value = tf.cast(value, tf.float32)
+        return tf.reduce_mean(tf.square(value))
+    if backend == "jax":
+        import jax.numpy as jnp
+
+        value = jnp.asarray(value, dtype=jnp.float32)
+        return jnp.mean(jnp.square(value))
+    if backend == "paddle":
+        import paddle
+
+        value = paddle.cast(value, "float32")
+        return paddle.mean(paddle.square(value))
+    if backend == "tinygrad":
+        return (value * value).mean()
+    raise TypeError(f"Unsupported tensor type {type(value).__name__}")
+
+
+def _mse_loss(outputs: Any, targets: Any) -> Any:
+    backend = _tensor_backend(outputs)
+    if backend is None or _tensor_backend(targets) != backend:
+        raise TypeError("Default MSE requires output and target tensors from the same backend.")
+    if backend == "torch":
+        return torch.nn.functional.mse_loss(outputs, targets)
+    if backend == "tf":
+        import tensorflow as tf
+
+        return tf.reduce_mean(tf.math.squared_difference(outputs, targets))
+    if backend == "jax":
+        import jax.numpy as jnp
+
+        return jnp.mean(jnp.square(outputs - targets))
+    if backend == "paddle":
+        import paddle.nn.functional as functional
+
+        return functional.mse_loss(outputs, targets)
+    if backend == "tinygrad":
+        return ((outputs - targets) ** 2).mean()
+    raise TypeError(f"Unsupported tensor backend {backend!r}")
+
+
+def _nested_tensor_loss(value: Any) -> Any:
+    losses: list[Any] = []
 
     def visit(item: Any) -> None:
-        if isinstance(item, torch.Tensor):
-            if item.is_floating_point() or item.is_complex():
-                losses.append(item.float().square().mean())
-            else:
-                losses.append(item.float().mean())
+        if _tensor_backend(item) is not None:
+            losses.append(_mean_square(item))
             return
         if isinstance(item, dict):
             for child in item.values():
@@ -49,13 +109,13 @@ def _nested_tensor_loss(value: Any) -> torch.Tensor:
     return total
 
 
-def compute_loss(outputs: Any, targets: Any = None, loss_fn=None) -> torch.Tensor:
+def compute_loss(outputs: Any, targets: Any = None, loss_fn=None) -> Any:
     if loss_fn is not None:
         if targets is None:
             return loss_fn(outputs)
         return loss_fn(outputs, targets)
-    if targets is not None and isinstance(outputs, torch.Tensor) and isinstance(targets, torch.Tensor):
-        return torch.nn.functional.mse_loss(outputs, targets)
+    if targets is not None and _tensor_backend(outputs) is not None:
+        return _mse_loss(outputs, targets)
     return _nested_tensor_loss(outputs)
 
 

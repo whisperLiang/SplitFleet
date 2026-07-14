@@ -8,10 +8,9 @@ from typing import Any
 from threading import RLock
 
 import numpy as np
-import torch
 
 from splitfleet.autosplit import SplitRuntimeHandle
-from splitfleet.backends import TorchBackendAdapter
+from splitfleet.backends.utils import adapter_for
 from splitfleet.split_engine.contracts import GraphContract, ModelVersionContract, validate_contract
 from splitfleet.split_engine import graph_contract_for_runtime_handle
 from splitfleet.transport import (
@@ -32,12 +31,13 @@ from splitfleet.common.constants import (
 from splitfleet.server.server_model.server_model import ServerModel
 
 
-def _load_model_from_ndarrays(model: torch.nn.Module, ndarrays: list[np.ndarray]) -> None:
-    TorchBackendAdapter().load_ndarrays(model, ndarrays)
+def _load_model_from_ndarrays(model: Any, ndarrays: list[np.ndarray], adapter=None) -> None:
+    (adapter or adapter_for(model, ())).load_ndarrays(model, ndarrays)
 
 
-def _model_to_ndarrays(model: torch.nn.Module) -> list[np.ndarray]:
-    return TorchBackendAdapter().export_ndarrays(model)
+def _model_to_ndarrays(model: Any, adapter=None) -> list[np.ndarray]:
+    adapter = adapter or adapter_for(model, ())
+    return adapter.export_ndarrays(model)
 
 
 def _batch_size_from_boundary(boundary: Any) -> int:
@@ -45,8 +45,9 @@ def _batch_size_from_boundary(boundary: Any) -> int:
     if batch_size is not None:
         return int(batch_size)
     for tensor in getattr(boundary, "tensors", {}).values():
-        if isinstance(tensor, torch.Tensor) and tensor.ndim > 0:
-            return int(tensor.shape[0])
+        shape = tuple(getattr(tensor, "shape", ()) or ())
+        if shape:
+            return int(shape[0])
     return 1
 
 
@@ -57,7 +58,7 @@ class AutoSplitTailServerModel(ServerModel):
         self,
         *,
         runtime_manager,
-        model: torch.nn.Module,
+        model: Any,
         optimizer_fn=None,
         loss_fn=None,
         boundary: str = "50%",
@@ -70,7 +71,11 @@ class AutoSplitTailServerModel(ServerModel):
         self.boundary = boundary
         self.mode = mode
         self.device = device
-        self.backend_adapter = TorchBackendAdapter()
+        try:
+            sample_inputs = runtime_manager._require_runtime_handle().plan.metadata.get("_example_inputs")
+        except AttributeError:
+            sample_inputs = ()
+        self.backend_adapter = adapter_for(model, sample_inputs)
         self.model = self.backend_adapter.move_model(self.backend_adapter.clone_model(model), device)
         self.optimizer = None
         self.runtime_handle: SplitRuntimeHandle | None = None
@@ -85,18 +90,15 @@ class AutoSplitTailServerModel(ServerModel):
         self._runtime_cache: dict[tuple[str, str, bool, str], SplitRuntimeHandle] = {}
 
     def get_parameters(self):
-        return _model_to_ndarrays(self.model)
+        return _model_to_ndarrays(self.model, self.backend_adapter)
 
     def configure_fit(self, ins: ServerModelFitIns) -> None:
         self._configure_common(ins.parameters, ins.config, sid=ins.sid, training=True)
-        trainable = [param for param in self.model.parameters() if param.requires_grad]
-        self.optimizer = (
-            self.optimizer_fn(self.model)
-            if self.optimizer_fn is not None and trainable
-            else self.backend_adapter.build_optimizer(self.model, {"name": "sgd", "lr": 0.01})
-            if trainable
-            else None
-        )
+        if self.optimizer_fn is not None:
+            self.optimizer = self.optimizer_fn(self.model)
+        else:
+            try: self.optimizer = self.backend_adapter.build_optimizer(self.model, {"name": "sgd", "lr": 0.01})
+            except (NotImplementedError, ValueError): self.optimizer = None
 
     def get_fit_result(self) -> ServerModelFitRes:
         average_loss = self.loss_total / max(self.num_examples, 1)
@@ -194,7 +196,7 @@ class AutoSplitTailServerModel(ServerModel):
         self._inflight_steps.clear()
         self.model_version = int(config.get(AUTOSPLIT_MODEL_VERSION_CONFIG_KEY, 0))
         self.plan_id = str(config.get(AUTOSPLIT_PLAN_ID_CONFIG_KEY, ""))
-        _load_model_from_ndarrays(self.model, parameters)
+        _load_model_from_ndarrays(self.model, parameters, self.backend_adapter)
         raw_version_contract = config.get(AUTOSPLIT_MODEL_VERSION_CONTRACT_CONFIG_KEY)
         if raw_version_contract:
             version_contract = ModelVersionContract.from_json(raw_version_contract)
@@ -202,10 +204,7 @@ class AutoSplitTailServerModel(ServerModel):
                 raise RuntimeError("Round model version contract mismatch")
             if version_contract.state_schema_hash != self.backend_adapter.state_manifest(self.model).schema_hash:
                 raise RuntimeError("Suffix model state schema mismatch")
-        if training:
-            self.model.train()
-        else:
-            self.model.eval()
+        self.backend_adapter.set_training(self.model, training)
         runtime_key = (
             self.plan_id,
             self.backend_adapter.state_manifest(self.model).schema_hash,
@@ -230,7 +229,7 @@ class AutoSplitTailServerModel(ServerModel):
     def _validate_wire_identity(self, boundary) -> None:
         runtime_handle = self._require_runtime_handle()
         contract = graph_contract_for_runtime_handle(runtime_handle)
-        if boundary.engine != "torchlens" or boundary.backend != "torch":
+        if boundary.engine != "torchlens" or boundary.backend != self.backend_adapter.backend_name:
             raise ValueError("Unsupported split engine/backend boundary")
         if boundary.plan_id != self.plan_id:
             raise ValueError("Boundary placement plan mismatch")

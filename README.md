@@ -1,7 +1,16 @@
 # SplitFleet
 
-SplitFleet is a PyTorch split learning framework built on top of [Flower](https://flower.ai/).
+SplitFleet is a TorchLens-backed split learning framework built on top of [Flower](https://flower.ai/).
 The autosplit runtime is backed by the repository-local `torchlens-2.31.0-py3-none-any.whl` via `uv.sources`, so SplitFleet focuses on Flower strategy integration, client/server transport, server-tail replicas, and aggregation policy.
+
+TorchLens-backed split replay and training can also be enabled for TensorFlow, JAX,
+Paddle, and tinygrad through the corresponding optional dependency groups
+(`tensorflow`, `jax`, `paddle`, `tinygrad`, or `multibackend`). MLX and ONNX are
+not registered because TorchLens 2.31 does not provide training-capable split
+adapters for them. JAX callers provide `functional_update_fn` on the split client
+when model parameters require an external functional update.
+The TorchLens tinygrad adapter is pinned to tinygrad 0.13 and SplitFleet uses
+Python 3.11 so the adapter can be exercised alongside the other backends.
 
 ## What This Project Does
 
@@ -26,7 +35,7 @@ Currently not supported:
 
 ## Installation
 
-Python `3.10` is required.
+Python `3.11` is required.
 
 ```bash
 uv sync --extra dev
@@ -44,6 +53,12 @@ Install the real-model integration dependencies when validating the model matrix
 
 ```bash
 uv sync --extra dev --extra integration
+```
+
+Install every training backend when validating cross-framework split learning:
+
+```bash
+uv sync --extra dev --extra integration --extra multibackend --reinstall-package torchlens
 ```
 
 ## Quick Start
@@ -72,11 +87,34 @@ Run the real-model task matrix:
 uv run --no-sync pytest tests/integration/test_torchlens_real_task_matrix.py -q
 ```
 
+The matrix actively validates timm Swin, Hugging Face BERT/DistilBERT/RoBERTa,
+CNN classifiers, torchvision detection heads, and semantic-segmentation models.
+
+Run exhaustive split-node training on the cross-backend task models (YOLO-style
+detection, FCN segmentation, RetinaNet-style detection, OCR, and foreground-mask
+segmentation):
+
+```bash
+uv run --no-sync pytest tests/integration/test_all_split_nodes_training.py -q
+```
+
+The gated ResNet-18 exhaustive check limits native numerical libraries to one
+CPU thread per backend subprocess by default. Increase the limit explicitly only
+on a suitable host:
+
+```bash
+SPLITFLEET_RUN_RESNET18_ALL_NODES=1 SPLITFLEET_RESNET18_THREADS=2 \
+  uv run --no-sync pytest tests/integration/test_resnet18_all_backends_all_nodes.py -q -s
+```
+
 Run optional heavy detection checks:
 
 ```bash
 SPLITFLEET_RUN_HEAVY_REAL_MODELS=1 uv run --no-sync pytest tests/integration/test_torchlens_real_detection_optional.py -q
 ```
+
+The heavy checks validate YOLOv8 and RF-DETR in addition to the default
+torchvision Faster R-CNN and RetinaNet coverage.
 
 ## Example: AutoSplit Strategy
 

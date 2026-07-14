@@ -3,10 +3,26 @@ from __future__ import annotations
 import copy
 import pytest
 import torch
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from torchlens.split import SplitFeatures, SplitRequest, percent
 
 from splitfleet.split_engine import TorchLensSplitEngine
+from splitfleet.split_engine.torchlens_engine import _value
+
+
+def test_contract_projection_does_not_deepcopy_dataclass_leaves() -> None:
+    class NonCopyable:
+        def __deepcopy__(self, _memo):
+            raise TypeError("cannot deepcopy runtime traceback")
+
+        def __str__(self) -> str:
+            return "runtime-traceback"
+
+    @dataclass
+    class GraphRecord:
+        traceback: object
+
+    assert _value(GraphRecord(NonCopyable())) == {"traceback": "runtime-traceback"}
 
 
 def _request(training: bool = True) -> SplitRequest:

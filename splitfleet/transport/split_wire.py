@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import torch
-
 from splitfleet.autosplit.boundary import BoundaryPayload, BoundarySpec
 from splitfleet.backends import BACKEND_ADAPTERS
 from splitfleet.transport.envelopes import (
@@ -26,11 +24,12 @@ def boundary_to_envelope(
     boundary_schema_hash: str,
     model_version: int,
 ) -> BoundaryEnvelope:
-    adapter = BACKEND_ADAPTERS.create("torch")
+    backend = str(payload.metadata.get("backend", "torch"))
+    adapter = BACKEND_ADAPTERS.create(backend)
     return BoundaryEnvelope(
         tensors=tuple(adapter.encode_tensor(name, value) for name, value in payload.tensors.items()),
         engine="torchlens",
-        backend="torch",
+        backend=backend,
         round_id=round_id,
         client_id=client_id,
         step_id=step_id,
@@ -55,13 +54,14 @@ def envelope_to_boundary(envelope: BoundaryEnvelope, runtime: Any, device: Any) 
             "split_id": envelope.split_id,
             "graph_shape_hash": envelope.canonical_graph_hash,
             "batch_size": envelope.batch_size,
+            "backend": envelope.backend,
         },
         batch_size=envelope.batch_size,
         spec=BoundarySpec(envelope.split_id, list(tensors)),
     )
 
 
-def gradients_to_envelope(boundary: BoundaryEnvelope, gradients: dict[str, torch.Tensor]) -> GradientEnvelope:
+def gradients_to_envelope(boundary: BoundaryEnvelope, gradients: dict[str, Any]) -> GradientEnvelope:
     adapter = BACKEND_ADAPTERS.create(boundary.backend)
     return GradientEnvelope(
         tensors=tuple(adapter.encode_tensor(name, value) for name, value in gradients.items()),
@@ -75,6 +75,6 @@ def gradients_to_envelope(boundary: BoundaryEnvelope, gradients: dict[str, torch
     )
 
 
-def envelope_to_gradients(envelope: GradientEnvelope, device: Any) -> dict[str, torch.Tensor]:
+def envelope_to_gradients(envelope: GradientEnvelope, device: Any) -> dict[str, Any]:
     adapter = BACKEND_ADAPTERS.create(envelope.backend)
     return {item.tensor_id: adapter.decode_tensor(item, device) for item in envelope.tensors}

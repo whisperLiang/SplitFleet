@@ -8,7 +8,7 @@ version = "0.2.0"
 authors = [
     {name="Boris Radovic", email="radovic.brs@gmail.com"}
 ]
-requires-python = ">=3.10,<3.11"
+requires-python = ">=3.11,<3.12"
 description = "Unified split learning framework with autosplitting built on top of Flower."
 readme = "README.md"
 classifiers = [
@@ -42,6 +42,18 @@ integration = [
     "ultralytics>=8.4.41",
     "rfdetr>=1.6.5",
     "transformers>=4.0.0",
+]
+
+tensorflow = ["tensorflow>=2.16"]
+jax = ["jax>=0.4.30", "optax>=0.2.3"]
+paddle = ["paddlepaddle>=3.0"]
+tinygrad = ["tinygrad==0.13.0; python_version >= '3.11'"]
+multibackend = [
+    "tensorflow>=2.16",
+    "jax>=0.4.30",
+    "optax>=0.2.3",
+    "paddlepaddle>=3.0",
+    "tinygrad==0.13.0; python_version >= '3.11'",
 ]
 
 [tool.uv.sources]

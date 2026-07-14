@@ -1,6 +1,7 @@
 CLIENT_ID_CONFIG_KEY = "__hidden_client_id__"
 AUTOSPLIT_BACKEND_CONFIG_KEY = "autosplit_backend"
 AUTOSPLIT_BACKEND_VALUE_TORCHLENS = "torchlens"
+AUTOSPLIT_FRAMEWORK_BACKEND_CONFIG_KEY = "autosplit_framework_backend"
 AUTOSPLIT_RUNTIME_BACKEND_CONFIG_KEY = "autosplit_runtime_backend"
 AUTOSPLIT_RUNTIME_BACKEND_VALUE_TORCHLENS_NATIVE = "torchlens_native"
 AUTOSPLIT_TORCHLENS_VERSION_CONFIG_KEY = "autosplit_torchlens_version"

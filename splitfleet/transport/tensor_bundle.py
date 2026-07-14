@@ -26,13 +26,15 @@ class TensorBundle:
     structure: bytes
 
 
-def encode_bundle(value: Any) -> TensorBundle:
+def encode_bundle(value: Any, *, backend: str = "torch") -> TensorBundle:
+    from splitfleet.backends import BACKEND_ADAPTERS
     tensors: list[TensorEnvelope] = []
+    adapter = BACKEND_ADAPTERS.create(backend)
 
     def visit(item: Any) -> Any:
-        if isinstance(item, torch.Tensor):
+        if hasattr(item, "shape") and hasattr(item, "dtype"):
             index = len(tensors)
-            tensors.append(encode_tensor(str(index), item))
+            tensors.append(adapter.encode_tensor(str(index), item))
             return {"tensor": index}
         if item is None or isinstance(item, (bool, int, float, str)):
             return {"scalar": item}
@@ -48,7 +50,9 @@ def encode_bundle(value: Any) -> TensorBundle:
     return TensorBundle(tuple(tensors), structure)
 
 
-def decode_bundle(bundle: TensorBundle, device: str | torch.device = "cpu") -> Any:
+def decode_bundle(bundle: TensorBundle, device: Any = "cpu", *, backend: str = "torch") -> Any:
+    from splitfleet.backends import BACKEND_ADAPTERS
+    adapter = BACKEND_ADAPTERS.create(backend)
     if len(bundle.structure) > 1024 * 1024:
         raise ValueError("Tensor bundle structure exceeds size limit")
     tree = json.loads(bundle.structure.decode("utf-8"))
@@ -58,7 +62,7 @@ def decode_bundle(bundle: TensorBundle, device: str | torch.device = "cpu") -> A
             index = int(node["tensor"])
             if index < 0 or index >= len(bundle.tensors):
                 raise ValueError("Tensor bundle references missing tensor")
-            return decode_tensor(bundle.tensors[index], device)
+            return adapter.decode_tensor(bundle.tensors[index], device)
         if "scalar" in node:
             return node["scalar"]
         if "dict" in node:
@@ -72,13 +76,13 @@ def decode_bundle(bundle: TensorBundle, device: str | torch.device = "cpu") -> A
     return visit(tree)
 
 
-def encode_bundle_wire(value: Any, *, compression: str = "none") -> bytes:
-    bundle = encode_bundle(value)
+def encode_bundle_wire(value: Any, *, compression: str = "none", backend: str = "torch") -> bytes:
+    bundle = encode_bundle(value, backend=backend)
     return encode_boundary(
         BoundaryEnvelope(
             tensors=bundle.tensors,
             engine="bundle",
-            backend="torch",
+            backend=backend,
             metadata={"structure": bundle.structure.decode("utf-8")},
         ),
         compression=compression,
@@ -97,4 +101,4 @@ def decode_bundle_wire(
     structure = envelope.metadata.get("structure")
     if not isinstance(structure, str):
         raise ValueError("Tensor bundle is missing structure metadata")
-    return decode_bundle(TensorBundle(envelope.tensors, structure.encode("utf-8")), device)
+    return decode_bundle(TensorBundle(envelope.tensors, structure.encode("utf-8")), device, backend=envelope.backend)

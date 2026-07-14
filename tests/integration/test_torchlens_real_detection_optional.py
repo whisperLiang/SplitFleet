@@ -18,7 +18,7 @@ from tests.integration.torchlens_real_model_helpers import (
 )
 
 
-RUN_HEAVY = os.environ.get("SPLITFLEET_RUN_HEAVY_REAL_MODELS", "1") == "1"
+RUN_HEAVY = os.environ.get("SPLITFLEET_RUN_HEAVY_REAL_MODELS", "0") == "1"
 
 
 class YOLOTensorWrapper(nn.Module):
@@ -67,7 +67,9 @@ def test_yolov8n_optional_split_smoke(request) -> None:
     # and currently supports this graph only at the traced batch size.
     with torch.no_grad():
         model(trace_inputs)
-    run_split_inference_equivalence(model, trace_inputs, runtime_inputs, "35%")
+    run_split_inference_equivalence(
+        model, trace_inputs, runtime_inputs, "35%", dynamic_batch=(2, 2),
+    )
 
 
 @pytest.mark.skipif(not RUN_HEAVY, reason="Set SPLITFLEET_RUN_HEAVY_REAL_MODELS=1 to run YOLO/RF-DETR tests.")

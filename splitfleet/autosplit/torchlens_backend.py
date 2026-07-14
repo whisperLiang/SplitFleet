@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 import torch
+import numpy as np
 from torchlens.split import after
 
 from splitfleet.autosplit.boundary import (
@@ -27,10 +28,13 @@ from splitfleet.autosplit.torchlens_runtime import (
     make_split_spec,
     normalize_example_inputs,
     prepare_split_runtime,
+    repartition_split_runtime,
     torchlens_runtime_version,
     trace_signature,
 )
 from splitfleet.autosplit.types import SplitRuntimePlan
+from splitfleet.backends import BACKEND_ADAPTERS
+from splitfleet.backends.utils import inference_context
 from splitfleet.runtime.torch_suffix_training import train_torch_suffix
 
 
@@ -61,7 +65,7 @@ def _make_plan_id(graph_signature: str, split_id: str, boundary: str, mode: str)
 
 
 def _iter_tensors(value: Any):
-    if isinstance(value, torch.Tensor):
+    if hasattr(value, "shape") and hasattr(value, "dtype"):
         yield value
         return
     if isinstance(value, Mapping):
@@ -99,7 +103,8 @@ def _move_to_device(value: Any, device: torch.device | str | None) -> Any:
 
 def _boundary_batch_matches(payload: BoundaryPayload, batch_size: int) -> bool:
     for tensor in payload.tensors.values():
-        if isinstance(tensor, torch.Tensor) and tensor.ndim > 0 and int(tensor.shape[0]) == batch_size:
+        shape = tuple(getattr(tensor, "shape", ()) or ())
+        if shape and int(shape[0]) == batch_size:
             return True
     return False
 
@@ -122,26 +127,29 @@ def _flatten_tensors(value: Any) -> list[torch.Tensor]:
     return list(_iter_tensors(value))
 
 
-def _compare_outputs(expected: Any, actual: Any) -> tuple[bool, float, float]:
+def _compare_outputs(expected: Any, actual: Any, backend: str = "torch") -> tuple[bool, float, float]:
     max_abs = 0.0
     max_rel = 0.0
     success = True
 
     def visit(left: Any, right: Any) -> None:
         nonlocal max_abs, max_rel, success
-        if isinstance(left, torch.Tensor):
-            if not isinstance(right, torch.Tensor) or tuple(left.shape) != tuple(right.shape):
+        if hasattr(left, "shape") and hasattr(left, "dtype"):
+            if not (hasattr(right, "shape") and hasattr(right, "dtype")) or tuple(left.shape) != tuple(right.shape):
                 success = False
                 max_abs = float("inf")
                 max_rel = float("inf")
                 return
-            diff = (left.detach().float() - right.detach().float()).abs()
-            abs_value = float(diff.max().item()) if diff.numel() else 0.0
-            denom = right.detach().float().abs().clamp_min(1e-12)
-            rel_value = float((diff / denom).max().item()) if diff.numel() else 0.0
+            adapter = BACKEND_ADAPTERS.create(backend)
+            left_array = np.asarray(adapter._to_numpy(left) if hasattr(adapter, "_to_numpy") else left.detach().cpu().numpy())
+            right_array = np.asarray(adapter._to_numpy(right) if hasattr(adapter, "_to_numpy") else right.detach().cpu().numpy())
+            diff = np.abs(left_array.astype(np.float64) - right_array.astype(np.float64))
+            abs_value = float(diff.max()) if diff.size else 0.0
+            denom = np.maximum(np.abs(right_array.astype(np.float64)), 1e-12)
+            rel_value = float((diff / denom).max()) if diff.size else 0.0
             max_abs = max(max_abs, abs_value)
             max_rel = max(max_rel, rel_value)
-            if not torch.allclose(left, right, atol=1e-5, rtol=1e-4):
+            if not np.allclose(left_array, right_array, atol=1e-5, rtol=1e-4):
                 success = False
             return
         if isinstance(left, Mapping):
@@ -174,7 +182,7 @@ class TorchLensSplitBackend:
         device: str | torch.device = "cpu",
         model_name: str | None = None,
         model_family: str | None = None,
-    ) -> None:
+    ) -> Any:
         self.device = torch.device(device)
         self.model: torch.nn.Module | None = None
         self.runtime: Any | None = None
@@ -186,6 +194,7 @@ class TorchLensSplitBackend:
         self.model_family = model_family
         self.trace_batch_size: int | None = None
         self.validation: dict[str, Any] | None = None
+        self.framework_backend = "torch"
 
     def trace(
         self,
@@ -206,6 +215,8 @@ class TorchLensSplitBackend:
         self.model_name = model_name or self.model_name or model.__class__.__name__
         self.model_family = model_family or self.model_family or self.model_name
         self.trace_sample_input = normalize_example_inputs(sample_inputs)
+        from splitfleet.backends.utils import detect_torchlens_backend
+        self.framework_backend = detect_torchlens_backend(model, self.trace_sample_input)
         self.trace_batch_size = first_tensor_batch_size(self.trace_sample_input)
         resolved_trace_batch_mode = trace_batch_mode or infer_trace_batch_mode(self.trace_sample_input)
         if dynamic_batch is None:
@@ -217,6 +228,7 @@ class TorchLensSplitBackend:
             trainable=trainable,
             trace_batch_mode=resolved_trace_batch_mode,
             mode=mode,
+            backend=self.framework_backend,
         )
         self.runtime = prepare_split_runtime(
             model,
@@ -257,14 +269,19 @@ class TorchLensSplitBackend:
         candidates: list[SplitCandidate] = []
         for node_index, node in enumerate(graph.nodes):
             label = str(getattr(node, "label", "") or "")
-            if not label or bool(getattr(node, "is_input", False)) or bool(getattr(node, "is_output", False)):
+            if (
+                not label
+                or bool(getattr(node, "is_input", False))
+                or bool(getattr(node, "is_output", False))
+            ):
                 continue
             try:
                 spec = make_split_spec(
                     after(label), dynamic_batch=self.split_spec.dynamic_batch,
                     trainable=self.split_spec.trainable,
+                    backend=self.framework_backend,
                 )
-                candidate_runtime = prepare_split_runtime(self._ensure_model(), self.trace_sample_input, spec)
+                candidate_runtime = repartition_split_runtime(runtime, spec)
             except Exception:
                 continue
             candidate = candidate_from_plan(
@@ -292,6 +309,27 @@ class TorchLensSplitBackend:
         self.candidates = candidates
         return candidates
 
+    def repartition(self, boundary: str) -> TorchLensRuntimeHandle:
+        """Select another boundary while reusing the existing model capture."""
+        runtime = self._ensure_runtime()
+        if self.split_spec is None:
+            raise RuntimeError("TorchLens split backend has not been traced.")
+        spec = make_split_spec(
+            boundary,
+            dynamic_batch=self.split_spec.dynamic_batch,
+            trainable=self.split_spec.trainable,
+            backend=self.framework_backend,
+        )
+        self.runtime = repartition_split_runtime(runtime, spec)
+        self.split_spec = spec
+        self.current_candidate = candidate_from_plan(
+            self.runtime,
+            spec,
+            self.runtime.plan,
+            graph_signature=trace_signature(self.runtime),
+        )
+        return self.make_handle()
+
     def split(self, candidate: SplitCandidate | None = None) -> SplitCandidate:
         chosen = candidate or self.current_candidate
         if chosen is None:
@@ -302,6 +340,7 @@ class TorchLensSplitBackend:
         self.split_spec = make_split_spec(
             chosen.boundary, dynamic_batch=self.split_spec.dynamic_batch,
             trainable=self.split_spec.trainable,
+            backend=self.framework_backend,
         )
         self.runtime = prepare_split_runtime(model, self.trace_sample_input, self.split_spec)
         self.current_candidate = candidate_from_plan(
@@ -345,9 +384,9 @@ class TorchLensSplitBackend:
         if device is not None:
             native = native.to(device)
             targets = _move_to_device(targets, device)
-        return train_torch_suffix(
-            runtime, native, targets, loss_fn=loss_fn, optimizer=optimizer
-        )
+        if self.framework_backend == "torch":
+            return train_torch_suffix(runtime, native, targets, loss_fn=loss_fn, optimizer=optimizer)
+        return runtime.train_suffix(native, targets, loss_fn=loss_fn, optimizer=optimizer)
 
     def backward_prefix(
         self,
@@ -355,7 +394,7 @@ class TorchLensSplitBackend:
         boundary_grads: Any,
         *,
         optimizer=None,
-    ) -> None:
+    ) -> Any:
         runtime = self._ensure_runtime()
         backward = getattr(runtime, "backward_prefix", None)
         if not callable(backward):
@@ -365,7 +404,7 @@ class TorchLensSplitBackend:
         if device is not None:
             native = native.to(device)
             boundary_grads = _move_to_device(boundary_grads, device)
-        backward(native, boundary_grads=boundary_grads, optimizer=optimizer)
+        return backward(native, boundary_grads=boundary_grads, optimizer=optimizer)
 
     def validate_candidate(self, candidate: SplitCandidate | None = None) -> dict[str, Any]:
         chosen = candidate or self.current_candidate
@@ -393,11 +432,11 @@ class TorchLensSplitBackend:
         model = self._ensure_model()
         inputs = normalize_example_inputs(self.trace_sample_input)
         try:
-            with torch.no_grad():
+            with inference_context(self.framework_backend):
                 boundary = self.run_prefix(*inputs)
                 replay_output = self.run_suffix(boundary)
                 expected_output = model(*inputs)
-            success, max_abs, max_rel = _compare_outputs(expected_output, replay_output)
+            success, max_abs, max_rel = _compare_outputs(expected_output, replay_output, self.framework_backend)
         except Exception as exc:
             return {
                 "success": False,
@@ -547,8 +586,8 @@ def backward_prefix(
     boundary_grads: Any,
     *,
     optimizer=None,
-) -> None:
-    handle.backend.backward_prefix(
+) -> Any:
+    return handle.backend.backward_prefix(
         boundary,
         boundary_grads,
         optimizer=optimizer,

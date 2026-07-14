@@ -75,7 +75,7 @@ class TorchBackendAdapter:
         return float(value.detach().item() if isinstance(value, torch.Tensor) else value)
 
     def export_ndarrays(self, model: torch.nn.Module) -> list[np.ndarray]:
-        return [value.detach().cpu().numpy() for value in model.state_dict().values()]
+        return [value.detach().cpu().numpy().copy() for value in model.state_dict().values()]
 
     def load_ndarrays(self, model: torch.nn.Module, values: list[np.ndarray]) -> None:
         if not values:

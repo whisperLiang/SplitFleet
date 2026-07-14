@@ -105,7 +105,10 @@ def encode_tensor(tensor_id: str, tensor: torch.Tensor) -> TensorEnvelope:
     value = tensor.detach().to("cpu").contiguous()
     # Viewing as bytes also supports bfloat16, which NumPy cannot represent on
     # all supported versions.
-    payload = value.view(torch.uint8).numpy().tobytes()
+    # PyTorch does not allow a zero-dimensional tensor to be reinterpreted as
+    # a dtype with a different element size. Flattening first preserves the raw
+    # storage while allowing scalar boundary metadata to use the same codec.
+    payload = value.reshape(-1).view(torch.uint8).numpy().tobytes()
     return TensorEnvelope(
         tensor_id=str(tensor_id),
         shape=tuple(int(dim) for dim in value.shape),

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 from logging import ERROR
 from typing import Any, Dict, Optional, Sequence
 
@@ -32,10 +31,11 @@ from splitfleet.autosplit.planner import validate_stage_counts
 from splitfleet.autosplit.torchlens_contract import runtime_contract_digest, stable_json
 from splitfleet.split_engine import graph_contract_for_runtime_handle
 from splitfleet.split_engine.contracts import ModelVersionContract
-from splitfleet.backends import TorchBackendAdapter
+from splitfleet.backends.utils import adapter_for
 from splitfleet.common.constants import (
     AUTOSPLIT_BACKEND_CONFIG_KEY,
     AUTOSPLIT_BACKEND_VALUE_TORCHLENS,
+    AUTOSPLIT_FRAMEWORK_BACKEND_CONFIG_KEY,
     AUTOSPLIT_BOUNDARY_CONFIG_KEY,
     AUTOSPLIT_BOUNDARY_TENSOR_LABELS_CONFIG_KEY,
     AUTOSPLIT_CLIENT_STAGE_COUNT_CONFIG_KEY,
@@ -125,6 +125,7 @@ class AutoSplitStrategy(PlainSlStrategy):
         )
         self.model = model
         self.sample_inputs = sample_inputs
+        self.backend_adapter = adapter_for(model, sample_inputs)
         self.sample_kwargs = {}
         self.worker_specs = list(worker_specs or [WorkerSpec(worker_id="coordinator", device="cpu")])
         self.autosplit_session = autosplit_session or AutoSplitSession(
@@ -202,11 +203,11 @@ class AutoSplitStrategy(PlainSlStrategy):
     def initialize_parameters(self, client_manager):
         _ = client_manager
         return ndarrays_to_parameters(
-            [tensor.detach().cpu().numpy() for tensor in self.model.state_dict().values()]
+            self.backend_adapter.export_ndarrays(self.model)
         )
 
     def initialize_server_parameters(self):
-        return [tensor.detach().cpu().numpy() for tensor in self.model.state_dict().values()]
+        return self.backend_adapter.export_ndarrays(self.model)
 
     def get_or_create_placement_plan(self):
         if self._placement_plan is None:
@@ -252,8 +253,8 @@ class AutoSplitStrategy(PlainSlStrategy):
 
     def _autosplit_config(self, model_version: int = 0, *, training: bool = True) -> Dict[str, Any]:
         placement = self.get_or_create_placement_plan()
-        reference_model = copy.deepcopy(self.model)
-        reference_model.train(training)
+        reference_model = self.backend_adapter.clone_model(self.model)
+        self.backend_adapter.set_training(reference_model, training)
         reference_handle = self.autosplit_session.prepare_runtime(
             reference_model,
             self.sample_inputs,
@@ -264,7 +265,7 @@ class AutoSplitStrategy(PlainSlStrategy):
             trace_batch_mode=placement.trace_batch_mode,
         )
         contract = graph_contract_for_runtime_handle(reference_handle)
-        state_schema_hash = TorchBackendAdapter().state_manifest(reference_model).schema_hash
+        state_schema_hash = self.backend_adapter.state_manifest(reference_model).schema_hash
         version_contract = ModelVersionContract(
             round_model_version=int(model_version),
             prefix_state_version=int(model_version),
@@ -273,6 +274,7 @@ class AutoSplitStrategy(PlainSlStrategy):
         )
         return {
             AUTOSPLIT_BACKEND_CONFIG_KEY: AUTOSPLIT_BACKEND_VALUE_TORCHLENS,
+            AUTOSPLIT_FRAMEWORK_BACKEND_CONFIG_KEY: self.backend_adapter.backend_name,
             AUTOSPLIT_RUNTIME_BACKEND_CONFIG_KEY: AUTOSPLIT_RUNTIME_BACKEND_VALUE_TORCHLENS_NATIVE,
             AUTOSPLIT_TORCHLENS_VERSION_CONFIG_KEY: placement.torchlens_version,
             AUTOSPLIT_PLAN_ID_CONFIG_KEY: placement.plan_id,

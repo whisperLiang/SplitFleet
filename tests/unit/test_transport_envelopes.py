@@ -51,6 +51,18 @@ def test_gradient_envelope_detects_corruption() -> None:
         decode_gradients(bytes(payload))
 
 
+@pytest.mark.parametrize(
+    "source",
+    [torch.tensor(7, dtype=torch.int64), torch.tensor(1.25, dtype=torch.float32)],
+)
+def test_scalar_tensor_envelope_round_trip(source: torch.Tensor) -> None:
+    restored = decode_tensor(encode_tensor("scalar", source))
+
+    assert restored.shape == source.shape
+    assert restored.dtype == source.dtype
+    assert torch.equal(restored, source)
+
+
 def test_prefix_context_store_consumes_context_once_and_cleans_round() -> None:
     store = PrefixContextStore()
     first = object()

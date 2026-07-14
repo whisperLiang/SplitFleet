@@ -19,7 +19,7 @@ class BoundarySpec:
 
 @dataclass
 class BoundaryPayload:
-    tensors: dict[str, torch.Tensor]
+    tensors: dict[str, Any]
     metadata: dict[str, Any] = field(default_factory=dict)
     passthrough_inputs: tuple[Any, ...] = ()
     batch_size: int | None = None
@@ -77,13 +77,22 @@ def _boundary_schema(specs: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     return schema
 
 
-def _infer_batch_size(tensors: Mapping[str, torch.Tensor], metadata: Mapping[str, Any]) -> int | None:
+def _is_tensor_like(value: Any) -> bool:
+    return hasattr(value, "shape") and hasattr(value, "dtype")
+
+
+def _shape(value: Any) -> tuple[int, ...]:
+    return tuple(int(dim) for dim in tuple(value.shape))
+
+
+def _infer_batch_size(tensors: Mapping[str, Any], metadata: Mapping[str, Any]) -> int | None:
     value = metadata.get("batch_size")
     if value is not None:
         return int(value)
     for tensor in tensors.values():
-        if isinstance(tensor, torch.Tensor) and tensor.ndim > 0:
-            return int(tensor.shape[0])
+        shape = _shape(tensor) if _is_tensor_like(tensor) else ()
+        if shape:
+            return shape[0]
     return None
 
 
@@ -91,6 +100,7 @@ def from_torchlens_boundary(boundary: ReplayBoundary | BoundaryPayload) -> Bound
     if isinstance(boundary, BoundaryPayload):
         return boundary
     metadata = dict(getattr(boundary, "metadata", {}) or {})
+    metadata.setdefault("backend", str(getattr(boundary, "backend", "torch")))
     tensors = dict(getattr(boundary, "tensors", {}) or {})
     torchlens_spec = dict(getattr(boundary, "spec", {}) or {})
     labels = [
@@ -106,10 +116,10 @@ def from_torchlens_boundary(boundary: ReplayBoundary | BoundaryPayload) -> Bound
             "tensors": {
                 str(label): {
                     "dtype": str(tensor.dtype),
-                    "shape_without_batch": [int(dim) for dim in tensor.shape[1:]],
+                    "shape_without_batch": list(_shape(tensor)[1:]),
                 }
                 for label, tensor in tensors.items()
-                if isinstance(tensor, torch.Tensor)
+                if _is_tensor_like(tensor)
             },
         },
         passthrough_specs={},

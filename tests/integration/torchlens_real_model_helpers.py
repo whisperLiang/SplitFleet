@@ -123,9 +123,11 @@ def make_runtime(model, trace_inputs, boundary, dynamic_batch=(2, 3)):
     )
 
 
-def run_split_inference_equivalence(model, trace_inputs, runtime_inputs, boundary):
+def run_split_inference_equivalence(
+    model, trace_inputs, runtime_inputs, boundary, *, dynamic_batch=(2, 3),
+):
     model.eval()
-    runtime = make_runtime(model, trace_inputs, boundary)
+    runtime = make_runtime(model, trace_inputs, boundary, dynamic_batch=dynamic_batch)
     with torch.no_grad():
         direct = model(*normalize_inputs(runtime_inputs))
         boundary_payload = runtime.backend.run_prefix(*normalize_inputs(runtime_inputs))
@@ -139,9 +141,12 @@ def run_split_inference_equivalence(model, trace_inputs, runtime_inputs, boundar
     return runtime
 
 
-def run_split_training_smoke(model, trace_inputs, runtime_inputs, targets, loss_fn, boundary="50%"):
+def run_split_training_smoke(
+    model, trace_inputs, runtime_inputs, targets, loss_fn, boundary="50%", *,
+    dynamic_batch=(2, 3),
+):
     model.train()
-    runtime = make_runtime(model, trace_inputs, boundary)
+    runtime = make_runtime(model, trace_inputs, boundary, dynamic_batch=dynamic_batch)
     optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=1e-4)
     before = clone_trainable_state(model)
     boundary = runtime.backend.run_prefix(*normalize_inputs(runtime_inputs), training=True)

@@ -40,6 +40,17 @@ def test_torch_state_manifest_is_value_independent_and_round_trips() -> None:
         assert torch.equal(left, right)
 
 
+def test_torch_ndarray_export_is_an_independent_snapshot() -> None:
+    adapter = TorchBackendAdapter()
+    model = torch.nn.Linear(2, 1)
+    snapshot = adapter.export_ndarrays(model)
+
+    with torch.no_grad():
+        model.weight.add_(1)
+
+    assert not torch.equal(torch.from_numpy(snapshot[0]), model.weight)
+
+
 def test_engine_registry_requires_explicit_unique_names() -> None:
     registry = SplitEngineRegistry()
     marker = object()

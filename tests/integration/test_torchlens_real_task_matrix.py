@@ -205,7 +205,10 @@ def test_real_image_classification_models(request, name, builder, input_shape, b
     runtime_batch = 2 if name == "timm_swin_tiny" else 3
     runtime_inputs = torch.randn(runtime_batch, *input_shape)
     labels = torch.randint(0, num_classes, (runtime_batch,))
-    run_split_inference_equivalence(model, trace_inputs, runtime_inputs, boundary)
+    dynamic_batch = (2, 2) if name == "timm_swin_tiny" else (2, 3)
+    run_split_inference_equivalence(
+        model, trace_inputs, runtime_inputs, boundary, dynamic_batch=dynamic_batch,
+    )
     run_split_training_smoke(
         model,
         trace_inputs,
@@ -213,6 +216,7 @@ def test_real_image_classification_models(request, name, builder, input_shape, b
         labels,
         nn.CrossEntropyLoss(),
         boundary=boundary,
+        dynamic_batch=dynamic_batch,
     )
 
 
