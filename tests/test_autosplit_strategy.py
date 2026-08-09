@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 
+import numpy as np
 import pytest
 import torch
+from flwr.common import Code, FitRes, Status, ndarrays_to_parameters, parameters_to_ndarrays
 from torch import nn
 
 from splitfleet.autosplit import ReplicaScope
@@ -30,6 +32,7 @@ from splitfleet.common.constants import (
 )
 from splitfleet.autosplit.torchlens_contract import runtime_contract_digest
 from splitfleet.server.server_model.server_model import ServerModel
+from splitfleet.server.stage_runtime.manager import StageRuntimeManager
 from splitfleet.server.strategy import AutoSplitStrategy
 
 
@@ -55,6 +58,23 @@ class DummyServerModel(ServerModel):
 
     def configure_evaluate(self, ins):
         self.eval_config = ins
+
+
+class FakeClientProxy:
+    def __init__(self, cid: str) -> None:
+        self.cid = cid
+
+
+class FakeClientManager:
+    def __init__(self, cids: list[str]) -> None:
+        self.clients = [FakeClientProxy(cid) for cid in cids]
+
+    def num_available(self) -> int:
+        return len(self.clients)
+
+    def sample(self, num_clients: int, min_num_clients: int | None = None):
+        assert min_num_clients is None or len(self.clients) >= min_num_clients
+        return self.clients[:num_clients]
 
 
 def test_autosplit_strategy_generates_torchlens_metadata() -> None:
@@ -129,3 +149,103 @@ def test_autosplit_strategy_rejects_non_two_stage_requests() -> None:
             preferred_stage_count=3,
             init_server_model_fn=lambda: DummyServerModel(),
         )
+
+
+def test_per_client_placement_routes_matching_client_and_tail_plans_across_rounds() -> None:
+    model = TinyNet().eval()
+
+    def placement(round_id: int, cid: str, training: bool) -> str:
+        _ = training
+        if (round_id, cid) in {(1, "a"), (2, "b")}:
+            return "after:first"
+        return "50%"
+
+    strategy = AutoSplitStrategy(
+        model=model,
+        sample_inputs=torch.randn(2, 4),
+        worker_specs=[],
+        client_placement_fn=placement,
+        min_fit_clients=2,
+        min_available_clients=2,
+        init_server_model_fn=lambda: DummyServerModel(),
+    )
+    manager = StageRuntimeManager(autosplit_session=strategy.autosplit_session)
+    strategy.bind_stage_runtime_manager(manager)
+    clients = FakeClientManager(["a", "b"])
+    initial = strategy.backend_adapter.export_ndarrays(model)
+    flower_parameters = ndarrays_to_parameters(initial)
+
+    round_one = strategy.configure_fit(1, flower_parameters, clients)
+    client_plans_one = {client.cid: ins.config[AUTOSPLIT_PLAN_ID_CONFIG_KEY] for client, ins in round_one}
+    server_one = strategy.configure_server_fit(1, initial, ["a", "b"])
+    server_plans_one = {ins.sid: ins.config[AUTOSPLIT_PLAN_ID_CONFIG_KEY] for ins in server_one}
+
+    assert strategy.common_server_model is False
+    assert client_plans_one == server_plans_one
+    assert client_plans_one["a"] != client_plans_one["b"]
+    assert all(manager.get_placement_plan(plan_id) is not None for plan_id in client_plans_one.values())
+
+    round_two = strategy.configure_fit(2, flower_parameters, clients)
+    client_plans_two = {client.cid: ins.config[AUTOSPLIT_PLAN_ID_CONFIG_KEY] for client, ins in round_two}
+    assert client_plans_two["a"] == client_plans_one["b"]
+    assert client_plans_two["b"] == client_plans_one["a"]
+
+
+def test_splitfed_reassembles_named_prefix_and_suffix_updates_before_fedavg() -> None:
+    model = TinyNet().eval()
+    strategy = AutoSplitStrategy(
+        model=model,
+        sample_inputs=torch.randn(2, 4),
+        aggregation_policy="splitfed",
+        init_server_model_fn=lambda: DummyServerModel(),
+    )
+    initial = [np.array(value, copy=True) for value in strategy.backend_adapter.export_ndarrays(model)]
+    strategy._round_initial_client_states[1] = [np.array(value, copy=True) for value in initial]
+    strategy._round_initial_server_states[1] = [np.array(value, copy=True) for value in initial]
+
+    client_results = []
+    server_results = []
+    for cid, weight, prefix_delta, suffix_delta in (
+        ("a", 1, 1.0, 2.0),
+        ("b", 3, 3.0, 4.0),
+    ):
+        client_state = [np.array(value, copy=True) for value in initial]
+        server_state = [np.array(value, copy=True) for value in initial]
+        client_state[0] += prefix_delta
+        server_state[-1] += suffix_delta
+        client_results.append(
+            (
+                FakeClientProxy(cid),
+                FitRes(
+                    status=Status(Code.OK, ""),
+                    parameters=ndarrays_to_parameters(client_state),
+                    num_examples=weight,
+                    metrics={},
+                ),
+            )
+        )
+        result = ServerModelFitRes(
+            parameters=server_state,
+            config={"num_examples": weight},
+        )
+        result.sid = cid
+        server_results.append(result)
+
+    client_parameters, _ = strategy.aggregate_fit(1, client_results, [])
+    server_parameters = strategy.aggregate_server_fit(1, server_results)
+    # The client-side model of a per-client round is produced once both halves
+    # have been aggregated; `aggregate_fit` alone cannot publish one.
+    assert client_parameters is None
+    client_parameters, _ = strategy.finalize_round(1, client_parameters, server_parameters)
+    reassembled_client = parameters_to_ndarrays(client_parameters)
+
+    assert all(
+        np.array_equal(client_value, server_value)
+        for client_value, server_value in zip(reassembled_client, server_parameters)
+    )
+    assert np.allclose(reassembled_client[0], initial[0] + 2.5)
+    assert np.allclose(reassembled_client[-1], initial[-1] + 3.5)
+    assert all(
+        np.array_equal(reassembled_client[index], initial[index])
+        for index in range(1, len(initial) - 1)
+    )

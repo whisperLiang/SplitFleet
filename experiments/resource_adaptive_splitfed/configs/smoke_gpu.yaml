@@ -1,0 +1,28 @@
+experiment: smoke_gpu
+dataset: cifar10
+model: resnet18
+normalization: groupnorm
+data_root: data
+download: true
+results_root: results/resource_adaptive_splitfed
+profile_records: results/resource_adaptive_splitfed/smoke_profile_gpu/profiles/profile_records.jsonl
+device: cuda:0
+max_train_samples: 128
+max_test_samples: 64
+num_clients: 2
+client_profiles: {gpu: 2}
+partition: {type: dirichlet, alpha: 0.5}
+client_holdout_fraction: 0.10
+rounds: 1
+local_epochs: 1
+max_batches_per_epoch: 1
+batch_size: 2
+evaluation_batch_size: 32
+server_concurrency: 1
+client_worker_threads: 1
+torch_num_threads: 1
+optimizer: {name: sgd, lr: 0.001, momentum: 0.0}
+scheduler: {min_relative_improvement_to_switch: 0.0, min_rounds_between_switches: 0, max_switches_per_round: null}
+device_profile_controls: {gpu: {}}
+client_network_profiles: {gpu: local}
+network_profiles: {local: {}}

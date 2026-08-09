@@ -37,6 +37,21 @@ class TorchBackendAdapter:
         schema_hash = hashlib.sha256(payload).hexdigest()
         return StateManifest(self.backend_name, entries, schema_hash)
 
+    def tied_state_groups(self, model: torch.nn.Module) -> tuple[tuple[int, ...], ...]:
+        positions: dict[int, list[int]] = {}
+        for index, value in enumerate(model.state_dict(keep_vars=True).values()):
+            # Only trainable tensors are reported: a shared parameter receives a
+            # gradient from whichever stage uses it, which is what makes summing
+            # both stages' updates the right reassembly. A shared buffer carries
+            # statistics instead, so it keeps the strict ownership check.
+            if not isinstance(value, torch.nn.Parameter) or not value.is_floating_point():
+                continue
+            if value.numel() == 0:
+                # Empty tensors can share a null storage pointer without being tied.
+                continue
+            positions.setdefault(int(value.data_ptr()), []).append(index)
+        return tuple(tuple(group) for group in positions.values() if len(group) > 1)
+
     def export_state(self, model: torch.nn.Module) -> ParameterEnvelope:
         manifest = self.state_manifest(model)
         tensors = tuple(encode_tensor(name, value) for name, value in model.state_dict().items())

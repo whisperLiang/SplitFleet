@@ -240,6 +240,14 @@ class Server(FlwrServer):
             self.strategy.aggregate_server_fit(server_round, server_fit_res)
 
         client_parameters_aggregated, metrics_aggregated = aggregated_client_result
+        # Split strategies whose client-side model is only complete once the
+        # suffix results exist assemble it here; the default is a no-op.
+        client_parameters_aggregated, server_parameters_aggregated = \
+            self.strategy.finalize_round(
+                server_round,
+                client_parameters_aggregated,
+                server_parameters_aggregated,
+            )
         return (
             client_parameters_aggregated,
             server_parameters_aggregated,

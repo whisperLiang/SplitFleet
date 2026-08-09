@@ -46,6 +46,12 @@ class ArrayBackendAdapter:
         raw = json.dumps([entry.__dict__ for entry in entries], sort_keys=True).encode()
         return StateManifest(self.backend_name, entries, hashlib.sha256(raw).hexdigest())
 
+    def tied_state_groups(self, model: Any) -> tuple[tuple[int, ...], ...]:
+        positions: dict[int, list[int]] = {}
+        for index, value in enumerate(self._state(model).values()):
+            positions.setdefault(id(value), []).append(index)
+        return tuple(tuple(group) for group in positions.values() if len(group) > 1)
+
     def encode_tensor(self, tensor_id: str, tensor: Any) -> TensorEnvelope:
         value = np.ascontiguousarray(self._to_numpy(tensor))
         requires_grad = bool(

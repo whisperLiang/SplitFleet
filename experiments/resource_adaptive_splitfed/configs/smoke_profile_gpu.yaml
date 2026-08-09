@@ -1,0 +1,19 @@
+experiment: smoke_profile_gpu
+dataset: cifar10
+model: resnet18
+normalization: groupnorm
+data_root: data
+download: true
+results_root: results/resource_adaptive_splitfed
+device: cuda:0
+seed: 1
+max_train_samples: 16
+batch_sizes: [1, 2]
+split_keys: [stem, layer4, full_local]
+local_steps_per_profile: 1
+warmup_steps: 0
+repetitions: 1
+learning_rate: 0.001
+server_concurrency: 1
+device_profiles: {gpu: {}}
+network_profiles: {local: {}}

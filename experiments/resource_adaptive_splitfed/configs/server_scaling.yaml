@@ -1,0 +1,35 @@
+experiment: server_scaling
+dataset: cifar10
+model: resnet18
+normalization: groupnorm
+data_root: data
+download: true
+results_root: results/resource_adaptive_splitfed
+profile_records: results/resource_adaptive_splitfed/profile_resnet18_cifar10/profiles/profile_records.jsonl
+device: cpu
+num_clients: 4
+server_concurrency: 2
+sweep:
+  num_clients: [4, 8, 16, 32, 64]
+  server_concurrency: [2, 4, 8, 16]
+methods: [fixed_early, fixed_middle, static_heterogeneous, edge_local_adaptive, resource_adaptive_splitfed]
+client_profiles: {weak: 2, medium: 1, strong: 1}
+partition: {type: dirichlet, alpha: 0.5}
+client_holdout_fraction: 0.10
+rounds: 20
+local_epochs: 1
+batch_size: 32
+evaluation_batch_size: 256
+client_worker_threads: 16
+torch_num_threads: 1
+seeds: [1, 2, 3, 4, 5]
+optimizer: {name: sgd, lr: 0.01, momentum: 0.0}
+scheduler: {min_relative_improvement_to_switch: 0.10, min_rounds_between_switches: 3, max_switches_per_round: null}
+device_profile_controls:
+  weak: {cpu_background_load: 0.60, cpu_load_workers: 1, memory_limit_mb: 2048}
+  medium: {cpu_background_load: 0.25, cpu_load_workers: 1, memory_limit_mb: 4096}
+  strong: {memory_limit_mb: 8192}
+client_network_profiles: {weak: normal, medium: normal, strong: fast}
+network_profiles:
+  normal: {uplink_mbps: 100, downlink_mbps: 100, rtt_ms: 5}
+  fast: {uplink_mbps: 1000, downlink_mbps: 1000, rtt_ms: 1}

@@ -227,7 +227,7 @@ def test_paddle_lenet_ocr_all_split_nodes_train(request) -> None:
 
 
 def test_tinygrad_fcn_segmentation_all_split_nodes_train(request) -> None:
-    if _isolated(request, env_overrides={"DEVICE": "CPU"}): return
+    if _isolated(request, env_overrides={"DEVICE": "CPU", "DEBUG": "0"}): return
     from tinygrad import Tensor
 
     class FCNSegmenter:

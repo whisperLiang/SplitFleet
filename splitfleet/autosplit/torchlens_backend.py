@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -377,7 +378,16 @@ class TorchLensSplitBackend:
         *,
         loss_fn=None,
         optimizer=None,
+        measurements: dict[str, float] | None = None,
     ):
+        """Run the suffix training step, optionally filling ``measurements``.
+
+        Every backend reports ``server_total_ms``. Backends whose suffix step is
+        executed phase by phase also report ``server_forward_ms`` and
+        ``server_backward_ms``; the others cannot separate the phases and do not
+        report a fabricated split.
+        """
+
         runtime = self._ensure_runtime()
         native = to_torchlens_boundary(boundary)
         device = _runtime_device(runtime)
@@ -385,7 +395,19 @@ class TorchLensSplitBackend:
             native = native.to(device)
             targets = _move_to_device(targets, device)
         if self.framework_backend == "torch":
-            return train_torch_suffix(runtime, native, targets, loss_fn=loss_fn, optimizer=optimizer)
+            return train_torch_suffix(
+                runtime,
+                native,
+                targets,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                measurements=measurements,
+            )
+        if measurements is not None:
+            started = time.perf_counter_ns()
+            result = runtime.train_suffix(native, targets, loss_fn=loss_fn, optimizer=optimizer)
+            measurements["server_total_ms"] = (time.perf_counter_ns() - started) / 1_000_000.0
+            return result
         return runtime.train_suffix(native, targets, loss_fn=loss_fn, optimizer=optimizer)
 
     def backward_prefix(
@@ -571,12 +593,14 @@ def train_suffix(
     *,
     loss_fn=None,
     optimizer=None,
+    measurements: dict[str, float] | None = None,
 ):
     return handle.backend.train_suffix(
         boundary,
         targets,
         loss_fn=loss_fn,
         optimizer=optimizer,
+        measurements=measurements,
     )
 
 

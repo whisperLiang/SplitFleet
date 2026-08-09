@@ -170,7 +170,11 @@ class PlainSlStrategy(Strategy):
             ]
         self._cid_to_sid_mapping = {cid: cid for cid in cids}
         return [
-            ServerModelFitIns(parameters=parameters, config=config, sid=cid)
+            ServerModelFitIns(
+                parameters=parameters,
+                config=copy.deepcopy(config),
+                sid=cid,
+            )
             for cid in cids
         ]
 
@@ -200,9 +204,15 @@ class PlainSlStrategy(Strategy):
         parameters: NDArrays,
         cids: List[str],
     ) -> List[ServerModelEvaluateIns]:
-        # for simplicity assume that the server model is the same for all clients
-        self._cid_to_sid_mapping = {cid: "" for cid in cids}
-        return [ServerModelEvaluateIns(parameters=parameters, config={}, sid="")]
+        _ = server_round
+        if self.common_server_model:
+            self._cid_to_sid_mapping = {cid: "" for cid in cids}
+            return [ServerModelEvaluateIns(parameters=parameters, config={}, sid="")]
+        self._cid_to_sid_mapping = {cid: cid for cid in cids}
+        return [
+            ServerModelEvaluateIns(parameters=parameters, config={}, sid=cid)
+            for cid in cids
+        ]
 
     def aggregate_fit(
         self,

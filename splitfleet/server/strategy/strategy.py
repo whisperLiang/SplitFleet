@@ -114,6 +114,40 @@ class Strategy(FlwrStrategy):
             server-side model parameters are not updated
         """
 
+    def finalize_round(
+        self,
+        server_round: int,
+        client_parameters: Optional[Parameters],
+        server_parameters,
+    ) -> Tuple[Optional[Parameters], Optional[object]]:
+        """Combine the client-side and server-side aggregates of one round.
+
+        A strategy whose client-side global model is only defined once the
+        server-side results exist — a per-client split replica scope, where each
+        client update carries a prefix half and each server result the matching
+        suffix half — returns `None` from `aggregate_fit` and produces the
+        complete model here. The server calls this once per round, after both
+        `aggregate_fit` and `aggregate_server_fit`.
+
+        Parameters
+        ----------
+        server_round : int
+            The current round of split learning
+        client_parameters : Optional[Parameters]
+            Whatever `aggregate_fit` returned for this round
+        server_parameters
+            Whatever `aggregate_server_fit` returned for this round
+
+        Returns
+        -------
+        Tuple[Optional[Parameters], Optional[object]]
+            The parameters the server should adopt. `None` on either side keeps
+            the previous global value for that side.
+        """
+
+        _ = server_round
+        return client_parameters, server_parameters
+
     # pylint: disable=arguments-differ
     def evaluate(
         self,

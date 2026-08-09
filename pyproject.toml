@@ -36,6 +36,13 @@ dev = [
     "grpcio-tools>=1.62.0",
 ]
 
+experiment = [
+    "matplotlib>=3.9.0",
+    "psutil>=6.0.0",
+    "pyyaml>=6.0.0",
+    "torchvision>=0.26.0",
+]
+
 integration = [
     "torchvision>=0.26.0",
     "timm>=1.0.26",
@@ -60,8 +67,11 @@ multibackend = [
 torchlens = { path = "./torchlens-2.31.0-py3-none-any.whl" }
 
 [tool.setuptools.packages.find]
-include = ["splitfleet*"]
+include = ["splitfleet*", "experiments*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "experiments/resource_adaptive_splitfed/tests"]
 addopts = "-q"
+markers = [
+    "integration: real-model or optional-dependency integration checks",
+]

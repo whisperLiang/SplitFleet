@@ -159,6 +159,9 @@ def test_torchlens_split_training_smoke_with_oort_selection() -> None:
         server_result = server_model.get_fit_result()
         client_parameters, _ = strategy.aggregate_fit(server_round, results, [])
         server_parameters = strategy.aggregate_server_fit(server_round, [server_result])
+        client_parameters, server_parameters = strategy.finalize_round(
+            server_round, client_parameters, server_parameters
+        )
 
     assert selected_counts == [2, 2]
     assert all(np.isfinite(loss) and loss >= 0 for loss in observed_losses)

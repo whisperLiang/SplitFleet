@@ -39,6 +39,8 @@ class StageRuntimeManager(ServerModelManager):
         self.worker_registry = worker_registry or GLOBAL_WORKER_REGISTRY
         self._placement_plan: Optional[SplitPlan] = None
         self._runtime_handle: Optional[SplitRuntimeHandle] = None
+        self._placement_plans: dict[str, SplitPlan] = {}
+        self._runtime_handles_by_plan_id: dict[str, SplitRuntimeHandle] = {}
         self._clone_runtime_cache: dict[str, SplitRuntimeHandle] = {}
         self._delegate = (
             GrpcServerModelManager(init_server_model_fn=init_server_model_fn)
@@ -48,16 +50,42 @@ class StageRuntimeManager(ServerModelManager):
 
     def set_placement_plan(self, placement_plan: SplitPlan) -> None:
         self._placement_plan = placement_plan
+        self.register_placement_plan(placement_plan, make_default=True)
+
+    def register_placement_plan(
+        self,
+        placement_plan: SplitPlan,
+        *,
+        make_default: bool = False,
+    ) -> None:
+        """Register a placement without evicting other clients' active ABIs."""
+
+        self._placement_plans[placement_plan.plan_id] = placement_plan
         handle = placement_plan.metadata.get("_runtime_handle")
         if isinstance(handle, SplitRuntimeHandle):
-            self.bind_runtime_handle(handle)
+            self.bind_runtime_handle(
+                handle,
+                plan_id=placement_plan.plan_id,
+                make_default=make_default,
+            )
 
-    def get_placement_plan(self) -> Optional[SplitPlan]:
-        return self._placement_plan
+    def get_placement_plan(self, plan_id: str | None = None) -> Optional[SplitPlan]:
+        if plan_id is None:
+            return self._placement_plan
+        return self._placement_plans.get(str(plan_id))
 
-    def bind_runtime_handle(self, runtime_handle: SplitRuntimeHandle) -> None:
-        self._runtime_handle = runtime_handle
-        self._clone_runtime_cache.clear()
+    def bind_runtime_handle(
+        self,
+        runtime_handle: SplitRuntimeHandle,
+        *,
+        plan_id: str | None = None,
+        make_default: bool = True,
+    ) -> None:
+        registry_key = str(plan_id or runtime_handle.plan.plan_id)
+        self._runtime_handles_by_plan_id[registry_key] = runtime_handle
+        if make_default:
+            self._runtime_handle = runtime_handle
+            self._clone_runtime_cache.clear()
         self.autosplit_session._runtime_handles[runtime_handle.plan.plan_id] = runtime_handle
 
     def register_worker(self, worker_spec: WorkerSpec) -> WorkerSpec:
@@ -66,7 +94,12 @@ class StageRuntimeManager(ServerModelManager):
     def list_workers(self, *, online_only: bool = True) -> list[WorkerSpec]:
         return self.worker_registry.list_workers(online_only=online_only)
 
-    def _require_runtime_handle(self) -> SplitRuntimeHandle:
+    def _require_runtime_handle(self, plan_id: str | None = None) -> SplitRuntimeHandle:
+        if plan_id is not None:
+            handle = self._runtime_handles_by_plan_id.get(str(plan_id))
+            if handle is None:
+                raise RuntimeError(f"No TorchLens runtime handle is registered for plan {plan_id!r}.")
+            return handle
         if self._runtime_handle is None:
             raise RuntimeError("No TorchLens runtime handle is active.")
         return self._runtime_handle
@@ -76,8 +109,9 @@ class StageRuntimeManager(ServerModelManager):
         model,
         *,
         suffix: str = "",
+        plan_id: str | None = None,
     ) -> SplitRuntimeHandle:
-        base = self._require_runtime_handle()
+        base = self._require_runtime_handle(plan_id)
         cache_key = self._clone_runtime_cache_key(base, model=model, suffix=suffix)
         cached = self._clone_runtime_cache.get(cache_key)
         if cached is not None:

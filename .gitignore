@@ -1,5 +1,6 @@
 __pycache__
 data/*
+results/
 dcgm/*
 *.err
 *.out
@@ -25,3 +26,4 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+paper/

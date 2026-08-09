@@ -1,0 +1,36 @@
+experiment: split_resource_profile
+dataset: cifar10
+model: resnet18
+normalization: groupnorm
+data_root: data
+download: true
+results_root: results/resource_adaptive_splitfed
+device: cpu
+seed: 1
+batch_sizes: [1, 2, 4, 8]
+local_steps_per_profile: 20
+warmup_steps: 5
+repetitions: 5
+learning_rate: 0.01
+server_concurrency: 1
+device_profiles:
+  weak:
+    cpu_background_load: 0.70
+    cpu_load_workers: 2
+  medium:
+    cpu_background_load: 0.35
+    cpu_load_workers: 1
+  strong: {}
+network_profiles:
+  poor:
+    uplink_mbps: 10
+    downlink_mbps: 50
+    rtt_ms: 30
+  normal:
+    uplink_mbps: 100
+    downlink_mbps: 100
+    rtt_ms: 5
+  fast:
+    uplink_mbps: 1000
+    downlink_mbps: 1000
+    rtt_ms: 1

@@ -68,6 +68,28 @@ def test_binding_runtime_handle_clears_clone_cache() -> None:
     assert manager._clone_runtime_cache == {}
 
 
+def test_registered_placements_clone_the_requested_client_abi() -> None:
+    manager, model, default = _manager_with_plan()
+    alternate = manager.autosplit_session.plan(
+        model,
+        torch.randn(2, 4),
+        boundary="after:fc1",
+        dynamic_batch=(1, 8),
+    )
+    manager.register_placement_plan(alternate)
+
+    default_clone = manager.clone_runtime_for_model(
+        copy.deepcopy(model), suffix="default-client", plan_id=default.plan_id
+    )
+    alternate_clone = manager.clone_runtime_for_model(
+        copy.deepcopy(model), suffix="alternate-client", plan_id=alternate.plan_id
+    )
+
+    assert default_clone.plan.boundary == default.boundary
+    assert alternate_clone.plan.boundary == alternate.boundary
+    assert default_clone.plan.feature_abi_id != alternate_clone.plan.feature_abi_id
+
+
 def test_clone_runtime_rejects_feature_abi_mismatch(monkeypatch) -> None:
     manager, model, _placement = _manager_with_plan()
     base = manager._require_runtime_handle()

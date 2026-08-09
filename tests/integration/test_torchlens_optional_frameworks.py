@@ -135,7 +135,7 @@ def test_tinygrad_split_training_optional(request) -> None:
         pytest.skip("tinygrad is not installed; TorchLens 2.31 requires tinygrad==0.13.0 on Python >=3.11")
     if installed_version != "0.13.0":
         pytest.skip("TorchLens 2.31 requires tinygrad==0.13.0 (Python >=3.11)")
-    if _run_isolated(request, extra_env={"DEVICE": "CPU"}): return
+    if _run_isolated(request, extra_env={"DEVICE": "CPU", "DEBUG": "0"}): return
     tinygrad = pytest.importorskip("tinygrad")
     from tinygrad import Tensor
     class Model:

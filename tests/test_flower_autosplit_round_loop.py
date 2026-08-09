@@ -7,6 +7,7 @@ from torch import nn
 
 from splitfleet.client.autosplit_split_client import AutoSplitSplitLearningClient
 from splitfleet.common import ServerModelFitIns
+from splitfleet.common.constants import CLIENT_ID_CONFIG_KEY
 from splitfleet.server.server_model.autosplit_tail_server_model import AutoSplitTailServerModel
 from splitfleet.server.server_model.proxy.server_model_proxy import ServerModelProxy
 from splitfleet.server.stage_runtime.manager import StageRuntimeManager
@@ -142,6 +143,61 @@ def test_torchlens_splitfed_keeps_per_client_tail_semantics() -> None:
 
     assert strategy.replica_scope_policy.resolve().value == "per_client"
     assert strategy.common_server_model is False
+
+
+def test_per_client_placements_execute_matching_prefix_and_tail_abis() -> None:
+    torch.manual_seed(31)
+    strategy_model = DeepNet()
+    strategy = AutoSplitStrategy(
+        model=strategy_model,
+        sample_inputs=torch.randn(2, 4),
+        client_placement_fn=lambda _round, cid, _training: (
+            "after:fc1" if cid == "early" else "after:fc2"
+        ),
+        loss_fn=nn.MSELoss(),
+        optimizer_fn=lambda model: torch.optim.SGD(model.parameters(), lr=0.01),
+    )
+    manager = StageRuntimeManager(autosplit_session=strategy.autosplit_session)
+    strategy.bind_stage_runtime_manager(manager)
+    inputs = torch.randn(3, 4)
+    targets = torch.randn(3, 2)
+    observed_boundaries = set()
+
+    for cid in ("early", "late"):
+        placement = strategy._placement_for_client(1, cid, training=True)
+        config = strategy._autosplit_config(1, training=True, placement=placement)
+        config[CLIENT_ID_CONFIG_KEY] = cid
+        server_model = AutoSplitTailServerModel(
+            runtime_manager=manager,
+            model=strategy_model,
+            optimizer_fn=lambda model: torch.optim.SGD(model.parameters(), lr=0.01),
+            loss_fn=nn.MSELoss(),
+        )
+        server_model.configure_fit(
+            ServerModelFitIns(
+                parameters=_model_to_ndarrays(strategy_model),
+                config=config,
+                sid=cid,
+            )
+        )
+        client = AutoSplitSplitLearningClient(
+            model=strategy_model,
+            train_data=[(inputs, targets)],
+            sample_inputs=torch.randn(2, 4),
+            optimizer_fn=lambda model: torch.optim.SGD(model.parameters(), lr=0.01),
+        )
+        client.server_model_proxy = InProcessServerModelProxy(
+            server_model=server_model, cid=cid
+        )
+
+        _, num_examples, metrics = client.fit(
+            _model_to_ndarrays(strategy_model), config
+        )
+        observed_boundaries.add(server_model.runtime_handle.plan.boundary)
+        assert num_examples == 3
+        assert np.isfinite(metrics["loss"])
+
+    assert len(observed_boundaries) == 2
 
 
 def test_autosplit_tail_server_model_prepares_runtime_after_train_mode() -> None:

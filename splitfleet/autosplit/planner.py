@@ -234,6 +234,16 @@ class AutoSplitPlanner:
         )
         if not candidates:
             raise RuntimeError("TorchLens did not enumerate any legal split candidates for this model.")
+        # ``trace`` resolves explicit module names/percentages to a concrete
+        # TorchLens candidate.  Preserve that caller choice when it satisfies
+        # constraints; enumeration order is graph order and must not silently
+        # replace every requested placement with the earliest legal cut.
+        requested = backend.current_candidate
+        if requested is not None:
+            candidates = sorted(
+                candidates,
+                key=lambda item: item.candidate_id != requested.candidate_id,
+            )
 
         checked = 0
         selected: tuple[SplitCandidate, dict[str, Any]] | None = None

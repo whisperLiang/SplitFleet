@@ -1,0 +1,52 @@
+experiment: dynamic_resources
+dataset: cifar10
+model: resnet18
+normalization: groupnorm
+data_root: data
+download: true
+results_root: results/resource_adaptive_splitfed
+profile_records: results/resource_adaptive_splitfed/profile_resnet18_cifar10/profiles/profile_records.jsonl
+device: cpu
+num_clients: 20
+client_profiles: {weak: 8, medium: 6, strong: 6}
+partition: {type: dirichlet, alpha: 0.5}
+client_holdout_fraction: 0.10
+rounds: 100
+local_epochs: 1
+batch_size: 32
+evaluation_batch_size: 256
+server_concurrency: 4
+client_worker_threads: 4
+torch_num_threads: 1
+seeds: [1, 2, 3, 4, 5]
+methods: [fixed_middle, static_heterogeneous, compute_only_adaptive, edge_local_adaptive, resource_adaptive_splitfed, oracle]
+optimizer: {name: sgd, lr: 0.01, momentum: 0.0}
+scheduler:
+  min_relative_improvement_to_switch: 0.10
+  min_rounds_between_switches: 3
+  max_switches_per_round: null
+device_profile_controls:
+  weak: {cpu_background_load: 0.50, cpu_load_workers: 1, memory_limit_mb: 2048}
+  medium: {cpu_background_load: 0.20, cpu_load_workers: 1, memory_limit_mb: 4096}
+  strong: {memory_limit_mb: 8192}
+client_network_profiles: {weak: normal, medium: normal, strong: fast}
+network_profiles:
+  normal: {uplink_mbps: 100, downlink_mbps: 100, rtt_ms: 5}
+  fast: {uplink_mbps: 1000, downlink_mbps: 1000, rtt_ms: 1}
+resource_phases:
+  - rounds: [1, 20]
+    name: normal
+  - rounds: [21, 40]
+    name: client_cpu_contention
+    affected_client_ratio: 0.4
+    cpu_background_load: 0.70
+  - rounds: [41, 60]
+    name: poor_uplink
+    affected_client_ratio: 0.4
+    uplink_mbps: 10
+  - rounds: [61, 80]
+    name: server_contention
+    server_compute_capacity_ratio: 0.50
+    server_concurrency: 2
+  - rounds: [81, 100]
+    name: recovered

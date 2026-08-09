@@ -39,6 +39,7 @@ def _run_isolated(request, backend: str) -> bool:
         env["CUDA_VISIBLE_DEVICES"] = ""
     if backend == "tinygrad":
         env["DEVICE"] = "CPU"
+        env["DEBUG"] = "0"
     result = subprocess.run(
         [sys.executable, "-m", "pytest", request.node.nodeid, "-q", "-s"],
         cwd=str(request.config.rootpath),

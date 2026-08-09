@@ -9,7 +9,11 @@ from threading import RLock
 
 import numpy as np
 
-from splitfleet.autosplit import SplitRuntimeHandle
+from splitfleet.autosplit import (
+    SplitRuntimeHandle,
+    normalize_batch_window,
+    require_batch_in_window,
+)
 from splitfleet.backends.utils import adapter_for
 from splitfleet.split_engine.contracts import GraphContract, ModelVersionContract, validate_contract
 from splitfleet.split_engine import graph_contract_for_runtime_handle
@@ -40,15 +44,11 @@ def _model_to_ndarrays(model: Any, adapter=None) -> list[np.ndarray]:
     return adapter.export_ndarrays(model)
 
 
-def _batch_size_from_boundary(boundary: Any) -> int:
-    batch_size = getattr(boundary, "batch_size", None)
-    if batch_size is not None:
-        return int(batch_size)
-    for tensor in getattr(boundary, "tensors", {}).values():
-        shape = tuple(getattr(tensor, "shape", ()) or ())
-        if shape:
-            return int(shape[0])
-    return 1
+def _request_num_examples(payload: bytes) -> int:
+    """Read the example count the prefix measured for this step."""
+
+    metadata = json.loads(payload.decode("utf-8"))
+    return int(metadata["num_examples"])
 
 
 class AutoSplitTailServerModel(ServerModel):
@@ -73,12 +73,14 @@ class AutoSplitTailServerModel(ServerModel):
         self.device = device
         try:
             sample_inputs = runtime_manager._require_runtime_handle().plan.metadata.get("_example_inputs")
-        except AttributeError:
+        except (AttributeError, RuntimeError):
             sample_inputs = ()
         self.backend_adapter = adapter_for(model, sample_inputs)
         self.model = self.backend_adapter.move_model(self.backend_adapter.clone_model(model), device)
         self.optimizer = None
         self.runtime_handle: SplitRuntimeHandle | None = None
+        self.graph_contract: GraphContract | None = None
+        self.batch_window: tuple[int, int] | None = None
         self.num_examples = 0
         self.loss_total = 0.0
         self.sid = ""
@@ -123,7 +125,7 @@ class AutoSplitTailServerModel(ServerModel):
             step_key = (wire_boundary.round_id, wire_boundary.client_id, wire_boundary.step_id)
             boundary = envelope_to_boundary(wire_boundary, runtime_handle.runtime, self.device)
             targets = decode_bundle_wire(batch.data["targets"], self.device)
-            request_metadata = json.loads(batch.data["metadata"].decode("utf-8"))
+            examples = _request_num_examples(batch.data["metadata"])
             self._begin_step(step_key)
             try:
                 result = self.runtime_manager.run_train_tail_plan(
@@ -137,7 +139,6 @@ class AutoSplitTailServerModel(ServerModel):
                 self._abort_step(step_key)
                 raise
             self._complete_step(step_key)
-            examples = int(request_metadata.get("num_examples") or _batch_size_from_boundary(boundary))
             loss_value = self.backend_adapter.scalar_value(result["loss"])
             self.num_examples += examples
             self.loss_total += loss_value * examples
@@ -167,8 +168,7 @@ class AutoSplitTailServerModel(ServerModel):
             targets = decode_bundle_wire(batch.data["targets"], self.device)
             outputs = self.runtime_manager.run_eval_tail_plan(runtime_handle, boundary)
             loss = self.runtime_manager.autosplit_session.compute_loss(outputs, targets, self.loss_fn)
-            request_metadata = json.loads(batch.data["metadata"].decode("utf-8"))
-            examples = int(request_metadata.get("num_examples") or _batch_size_from_boundary(boundary))
+            examples = _request_num_examples(batch.data["metadata"])
             responses.append(
                 BatchData(
                     data={
@@ -197,38 +197,41 @@ class AutoSplitTailServerModel(ServerModel):
         self.model_version = int(config.get(AUTOSPLIT_MODEL_VERSION_CONFIG_KEY, 0))
         self.plan_id = str(config.get(AUTOSPLIT_PLAN_ID_CONFIG_KEY, ""))
         _load_model_from_ndarrays(self.model, parameters, self.backend_adapter)
+        # Hashing the model state is not free, so the round hashes it once and
+        # both the contract check and the runtime cache key reuse the result.
+        state_schema = self.backend_adapter.state_manifest(self.model).schema_hash
         raw_version_contract = config.get(AUTOSPLIT_MODEL_VERSION_CONTRACT_CONFIG_KEY)
         if raw_version_contract:
             version_contract = ModelVersionContract.from_json(raw_version_contract)
             if version_contract.round_model_version != self.model_version:
                 raise RuntimeError("Round model version contract mismatch")
-            if version_contract.state_schema_hash != self.backend_adapter.state_manifest(self.model).schema_hash:
+            if version_contract.state_schema_hash != state_schema:
                 raise RuntimeError("Suffix model state schema mismatch")
         self.backend_adapter.set_training(self.model, training)
-        runtime_key = (
-            self.plan_id,
-            self.backend_adapter.state_manifest(self.model).schema_hash,
-            bool(training),
-            str(self.device),
-        )
+        runtime_key = (self.plan_id, state_schema, bool(training), str(self.device))
         self.runtime_handle = self._runtime_cache.get(runtime_key)
         if self.runtime_handle is None:
             plan_suffix = f"{sid or 'shared'}_{uuid.uuid4().hex[:8]}"
             self.runtime_handle = self.runtime_manager.clone_runtime_for_model(
                 self.model,
                 suffix=plan_suffix,
+                plan_id=self.plan_id,
             )
             self._runtime_cache[runtime_key] = self.runtime_handle
+        # The contract hashes the whole model state, so it is resolved once per
+        # round here rather than once per uploaded boundary.
+        self.graph_contract = graph_contract_for_runtime_handle(self.runtime_handle)
+        self.batch_window = normalize_batch_window(self.runtime_handle.plan.dynamic_batch)
         raw_contract = config.get(AUTOSPLIT_GRAPH_CONTRACT_CONFIG_KEY)
         if raw_contract:
             expected = GraphContract.from_json(raw_contract)
             if config.get(AUTOSPLIT_GRAPH_CONTRACT_DIGEST_CONFIG_KEY) != expected.digest:
                 raise RuntimeError("Configured graph contract digest is invalid")
-            validate_contract(expected, graph_contract_for_runtime_handle(self.runtime_handle))
+            validate_contract(expected, self.graph_contract)
 
     def _validate_wire_identity(self, boundary) -> None:
         runtime_handle = self._require_runtime_handle()
-        contract = graph_contract_for_runtime_handle(runtime_handle)
+        contract = self.graph_contract
         if boundary.engine != "torchlens" or boundary.backend != self.backend_adapter.backend_name:
             raise ValueError("Unsupported split engine/backend boundary")
         if boundary.plan_id != self.plan_id:
@@ -241,6 +244,14 @@ class AutoSplitTailServerModel(ServerModel):
             raise ValueError("Boundary graph contract mismatch")
         if boundary.boundary_schema_hash != contract.boundary_schema_hash:
             raise ValueError("Boundary ABI mismatch")
+        batch_size = int(boundary.batch_size or 0)
+        if batch_size > 0:
+            require_batch_in_window(
+                batch_size,
+                self.batch_window,
+                stage=f"Split suffix (sid={self.sid or 'shared'})",
+                trace_batch_mode=str(runtime_handle.plan.trace_batch_mode or ""),
+            )
 
     def _begin_step(self, step_key: tuple[int, str, str]) -> None:
         with self._step_lock:

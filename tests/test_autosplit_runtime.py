@@ -112,14 +112,18 @@ def test_client_prepares_mode_specific_torchlens_runtimes() -> None:
         AUTOSPLIT_MODE_CONFIG_KEY: "generated_eager",
     }
 
-    train_handle = client._prepare_round(_model_to_ndarrays(client.model), config, training=True)
+    train_handle = client._prepare_round(
+        _model_to_ndarrays(client.model), config, training=True
+    ).handle
     train_inputs = torch.randn(3, 4)
     expected_train = copy.deepcopy(client.model).train()(train_inputs)
     split_train = train_handle.backend.run_suffix(train_handle.backend.run_prefix(train_inputs))
 
     assert torch.allclose(split_train, expected_train, atol=1e-5, rtol=1e-5)
 
-    eval_handle = client._prepare_round(_model_to_ndarrays(client.model), config, training=False)
+    eval_handle = client._prepare_round(
+        _model_to_ndarrays(client.model), config, training=False
+    ).handle
     eval_inputs = torch.randn(3, 4)
     with torch.no_grad():
         expected_eval = copy.deepcopy(client.model).eval()(eval_inputs)
