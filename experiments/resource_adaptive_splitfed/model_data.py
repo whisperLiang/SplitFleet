@@ -1,4 +1,4 @@
-"""Real CIFAR-10/ResNet-18 construction and deterministic client partitions."""
+"""Real CIFAR-10 model construction and deterministic client partitions."""
 
 from __future__ import annotations
 
@@ -15,25 +15,57 @@ from torchvision import datasets, models, transforms
 from .config_utils import stable_hash
 
 
+CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
+CIFAR10_STD = (0.2023, 0.1994, 0.2010)
+FLOWER_CIFAR10_PIPELINE = "flower-cifar10-v1"
+
+
+def flower_cifar10_transforms() -> tuple[transforms.Compose, transforms.Compose]:
+    """Return separate Flower-style transforms for training and evaluation."""
+
+    train_transform = transforms.Compose(
+        [
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD),
+        ]
+    )
+    evaluation_transform = transforms.Compose(
+        [transforms.ToTensor(), transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD)]
+    )
+    return train_transform, evaluation_transform
+
+
 def build_model(
     name: str,
     *,
     num_classes: int = 10,
     normalization: str = "groupnorm",
 ) -> torch.nn.Module:
-    normalized = name.lower().replace("-", "")
-    if normalized != "resnet18":
-        raise ValueError("The reference RA-SplitFed experiment currently supports resnet18.")
+    normalized = name.lower().replace("-", "").replace("_", "")
+    builders = {
+        "resnet18": models.resnet18,
+        "resnet50": models.resnet50,
+        "resnet101": models.resnet101,
+        "wideresnet502": models.wide_resnet50_2,
+    }
+    if normalized not in builders:
+        raise ValueError(
+            "The RA-SplitFed experiment supports resnet18, resnet50, "
+            "resnet101, and wide_resnet50_2."
+        )
     norm = normalization.lower().replace("_", "")
     if norm == "groupnorm":
-        norm_layer = lambda channels: torch.nn.GroupNorm(min(32, channels), channels)
+        # Match Flower's maintained CIFAR ResNet baseline.
+        norm_layer = lambda channels: torch.nn.GroupNorm(2, channels)
     elif norm == "batchnorm":
         norm_layer = torch.nn.BatchNorm2d
     else:
         raise ValueError("normalization must be 'groupnorm' or 'batchnorm'.")
-    # GroupNorm keeps the actual ResNet-18 graph and trainable normalization,
+    # GroupNorm keeps the actual ResNet graph and trainable normalization,
     # while making a genuine batch-size-one training execution well-defined.
-    return models.resnet18(
+    return builders[normalized](
         weights=None,
         num_classes=num_classes,
         norm_layer=norm_layer,
@@ -47,14 +79,13 @@ def cifar10_datasets(
     max_train_samples: int | None = None,
     max_test_samples: int | None = None,
 ) -> tuple[Dataset, Dataset]:
-    transform = transforms.Compose(
-        [
-            transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
-        ]
+    train_transform, evaluation_transform = flower_cifar10_transforms()
+    train: Dataset = datasets.CIFAR10(
+        root=str(root), train=True, download=download, transform=train_transform
     )
-    train: Dataset = datasets.CIFAR10(root=str(root), train=True, download=download, transform=transform)
-    test: Dataset = datasets.CIFAR10(root=str(root), train=False, download=download, transform=transform)
+    test: Dataset = datasets.CIFAR10(
+        root=str(root), train=False, download=download, transform=evaluation_transform
+    )
     if max_train_samples is not None:
         train = Subset(train, range(min(int(max_train_samples), len(train))))
     if max_test_samples is not None:
@@ -81,80 +112,50 @@ def dirichlet_partition(
     client_profiles: Mapping[str, str] | None = None,
     rare_classes: Sequence[int] = (),
     weak_rare_multiplier: float = 1.0,
+    min_partition_size: int = 10,
+    self_balancing: bool = False,
+    shuffle: bool = True,
 ) -> dict[str, list[int]]:
+    """Partition by label using Flower ``DirichletPartitioner`` semantics."""
+
     if num_clients < 2 or alpha <= 0:
         raise ValueError("Dirichlet partition requires num_clients >= 2 and alpha > 0.")
+    if min_partition_size < 1:
+        raise ValueError("min_partition_size must be positive.")
     rng = np.random.default_rng(seed)
     labels = np.asarray(targets, dtype=np.int64)
-    assignments = {str(index): [] for index in range(num_clients)}
+    if len(labels) < num_clients:
+        raise ValueError("The dataset must contain at least one sample per client.")
+    required_minimum = min(int(min_partition_size), len(labels) // num_clients)
+    average_size = len(labels) / num_clients
     profiles = client_profiles or {}
-    for label in sorted(set(labels.tolist())):
-        indices = np.flatnonzero(labels == label)
-        rng.shuffle(indices)
-        weights = rng.dirichlet(np.full(num_clients, alpha))
-        if label in rare_classes and weak_rare_multiplier != 1.0:
-            for index in range(num_clients):
-                if profiles.get(str(index)) == "weak":
-                    weights[index] *= weak_rare_multiplier
+    assignments: dict[str, list[int]] = {}
+    for _attempt in range(11):
+        assignments = {str(index): [] for index in range(num_clients)}
+        for label in sorted(set(labels.tolist())):
+            label_indices = np.flatnonzero(labels == label)
+            weights = rng.dirichlet(np.full(num_clients, alpha, dtype=float))
+            if label in rare_classes and weak_rare_multiplier != 1.0:
+                for index in range(num_clients):
+                    if profiles.get(str(index)) == "weak":
+                        weights[index] *= weak_rare_multiplier
+            if self_balancing:
+                for index in range(num_clients):
+                    if len(assignments[str(index)]) > average_size:
+                        weights[index] = 0.0
             weights /= weights.sum()
-        counts = rng.multinomial(len(indices), weights)
-        cursor = 0
-        for client_index, count in enumerate(counts):
-            assignments[str(client_index)].extend(indices[cursor : cursor + count].tolist())
-            cursor += count
-    # Empty clients make synchronized comparisons ill-defined. Move one sample
-    # from the largest partition deterministically; this is partition repair,
-    # not a generated observation.
-    for client_id, indices in assignments.items():
-        if indices:
-            continue
-        donor = max(assignments, key=lambda cid: (len(assignments[cid]), cid))
-        if len(assignments[donor]) <= 1:
-            raise RuntimeError("Unable to construct non-empty client partitions.")
-        indices.append(assignments[donor].pop())
-    # Guarantee that no class is exclusive to a single client. This keeps the
-    # fairness experiment robust without creating or duplicating samples.
-    for label in sorted(set(labels.tolist())):
-        holders = [
-            client_id
-            for client_id, indices in assignments.items()
-            if any(labels[index] == label for index in indices)
-        ]
-        if len(holders) >= 2:
-            continue
-        donor = holders[0]
-        sample = next(index for index in assignments[donor] if labels[index] == label)
-        recipient = max(
-            (cid for cid in assignments if cid != donor),
-            key=lambda cid: (len(assignments[cid]), cid),
+            split_points = (np.cumsum(weights) * len(label_indices)).astype(int)[:-1]
+            for client_index, split in enumerate(np.split(label_indices, split_points)):
+                assignments[str(client_index)].extend(split.tolist())
+        if min(len(indices) for indices in assignments.values()) >= required_minimum:
+            break
+    else:
+        raise ValueError(
+            "Unable to satisfy the Flower-style minimum partition size after 11 attempts."
         )
-        assignments[donor].remove(sample)
-        assignments[recipient].append(sample)
-        # Moving a donor's only sample would undo the empty-client repair above,
-        # so trade one of the recipient's samples back instead of emptying it.
-        if not assignments[donor]:
-            recipient_counts = Counter(int(labels[index]) for index in assignments[recipient])
-            # Only trade back a sample the recipient holds more than once, so the
-            # swap cannot make some other class exclusive in its turn.
-            returned = next(
-                (
-                    index
-                    for index in assignments[recipient]
-                    if labels[index] != label and recipient_counts[int(labels[index])] > 1
-                ),
-                None,
-            )
-            if returned is None:
-                raise RuntimeError(
-                    "Unable to keep every client non-empty while removing class exclusivity."
-                )
-            assignments[recipient].remove(returned)
-            assignments[donor].append(returned)
-    empty = sorted(client_id for client_id, indices in assignments.items() if not indices)
-    if empty:
-        raise RuntimeError(f"Partition repair left clients without samples: {empty}.")
-    for indices in assignments.values():
-        indices.sort()
+    if shuffle:
+        for indices in assignments.values():
+            rng.shuffle(indices)
     return assignments
 
 

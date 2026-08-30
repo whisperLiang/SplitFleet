@@ -1,0 +1,89 @@
+schema: splitfleet.physical-system-optimized-protocol.v1
+created_at: "2026-08-12T00:00:00+08:00"
+status: formal_seed1_authorized_after_valid_native_profile
+classification: post_hoc_systems_engineering_experiment
+
+topology:
+  server: {id: fy205, address: 192.168.66.205, role: persistent_suffix_and_aggregation}
+  clients:
+    - {id: win136, address: 192.168.66.136, expected_device: cpu}
+    - {id: orin140, address: 192.168.66.140, expected_device: cuda}
+    - {id: orin118, address: 192.168.66.118, expected_device: cuda}
+    - {id: orin238, address: 192.168.66.238, expected_device: cuda}
+
+workload:
+  model: wide_resnet50_2
+  dataset: cifar10
+  normalization: groupnorm
+  partition: {type: dirichlet, alpha: 0.5}
+  max_train_samples: 8000
+  test_samples: 10000
+  rounds: 100
+  batch_size: 16
+  max_batches_per_round: 4
+  optimizer: {name: sgd, lr: 0.02, momentum: 0.0, weight_decay: 0.0}
+  candidate_cuts: [stem, layer2, layer4]
+
+implementation:
+  split_runtime: native_prefix
+  parameter_sync_mode: prefix_parameters
+  client_suffix_parameter_bytes: 0
+  server_replica_scope: per_client_persistent
+  prefix_executor_primary: persistent_eager
+  prefix_executor_optional: {name: torch_compile, backend: aot_eager, failure_policy: fail_closed}
+  optional_compile_feasibility:
+    status: failed_before_client_connection
+    run_id: pilotA9_torch_compile_prefix_feasibility_seed1_20260812
+    failed_client: orin140
+    reason: pytorch_compile_worker_and_user_triton_incompatible_missing_triton_key
+    fallback_used: false
+  prefix_prewarm: before_client_connection
+  torchlens_in_timed_path: false
+  aggregation: reassemble_per_client_full_state_then_sample_weighted_mean
+
+profile:
+  required_before_formal_runs: true
+  status: valid_and_selection_frozen
+  rounds: 9
+  schedule: [stem, layer2, layer4, stem, layer2, layer4, stem, layer2, layer4]
+  reuse_a8_torchlens_profile: prohibited
+  run_id: profileA9_native_prefix_candidates_seed1_20260812
+  validation_sha256: f08299e77137f8b2e9856cf7669493d774249a18f9366b2281a0208f27d1ae1a
+  failure_records: 0
+  steady_round_mean_sec: {stem: 1.968143811012851, layer2: 5.667616063001333, layer4: 73.37864896352403}
+  frozen_selection:
+    best_global_fixed: stem
+    static_heterogeneous: {win136: stem, orin140: layer2, orin118: stem, orin238: layer2}
+  scheduler_cost_report:
+    path: validation_report_native_cost_v2.json
+    sha256: 94b4e9d25b64beea57448f34207770714a6e061f6d7bd2e05d56e0970fb23232
+    timing_semantics: per_round_totals_plus_observed_flower_coordination_overhead
+
+resource_scenario:
+  phases:
+    - {name: common_warmup, rounds: [1, 3]}
+    - {name: natural_lan, rounds: [4, 25]}
+    - {name: constrained_win136_boundary_link, rounds: [26, 60], uplink_mbps: 10, downlink_mbps: 50}
+    - {name: recovered_natural_lan, rounds: [61, 100]}
+  pacing_scope: split_boundary_messages_only
+
+required_reporting:
+  - round_time
+  - test_accuracy
+  - prefix_parameter_download_bytes
+  - prefix_parameter_upload_bytes
+  - boundary_upload_bytes
+  - boundary_download_bytes
+  - persistent_server_reuse
+  - prefix_executor_prepare_time_outside_round
+  - client_and_server_peak_memory
+  - failures_without_imputation
+
+scheduler_cost_model:
+  native_profile_counters: per_round_not_per_batch
+  prefix_sync_and_aggregation_cost: observed_round_time_minus_slowest_client_fit
+  legacy_torchlens_profile_interpretation: unchanged
+
+claim_boundary: >-
+  This experiment isolates systems implementation overhead. It is not a new
+  preregistered algorithm comparison and does not replace the A8 records.

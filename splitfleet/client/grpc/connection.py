@@ -6,6 +6,7 @@ Performance optimizations:
 """
 
 import sys
+import time
 import uuid
 from queue import Queue
 from pathlib import Path
@@ -13,17 +14,11 @@ from logging import DEBUG
 from contextlib import contextmanager
 from typing import Optional, Callable, Tuple, Union, Type, ContextManager, Iterator, cast
 
+import grpc
 from grpc import RpcError
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from flwr.common.address import parse_address
-from flwr.common.grpc import create_channel
-from flwr.client.grpc_client.connection import on_channel_state_change
-from flwr.common.constant import (
-    TRANSPORT_TYPE_GRPC_BIDI,
-    TRANSPORT_TYPE_GRPC_RERE,
-    TRANSPORT_TYPES,
-)
+from flwr.common.constant import TRANSPORT_TYPE_GRPC_RERE, TRANSPORT_TYPES
 from flwr.common import (
     DEFAULT_TTL,
     GRPC_MAX_MESSAGE_LENGTH,
@@ -33,7 +28,7 @@ from flwr.common import (
     RecordSet,
     serde,
     log,
-    recordset_compat as compat
+    recorddict_compat as compat
 )
 from flwr.common.retry_invoker import RetryInvoker
 from flwr.proto.transport_pb2 import (  # pylint: disable=E0611
@@ -42,9 +37,17 @@ from flwr.proto.transport_pb2 import (  # pylint: disable=E0611
     ServerMessage,
 )
 from flwr.proto.transport_pb2_grpc import FlowerServiceStub  # pylint: disable=E0611
-from flwr.common.constant import MessageType, MessageTypeLegacy
+from flwr.app.message_type import MessageType
+from flwr.common.constant import MessageTypeLegacy
 
 from splitfleet.proto.server_model_pb2_grpc import ServerModelStub
+from splitfleet.common.address import parse_address
+
+
+# Flower 1.29 removed the legacy bidi constant while retaining the server-side
+# bridge.  SplitFleet still uses this transport because the same channel also
+# carries its server-model RPC service.
+TRANSPORT_TYPE_GRPC_BIDI = "grpc-bidi"
 
 
 def init_connection(transport: Optional[str], server_address: str) -> Tuple[
@@ -157,13 +160,27 @@ def grpc_connection(  # pylint: disable=R0913, R0915
     if isinstance(root_certificates, str):
         root_certificates = Path(root_certificates).read_bytes()
 
-    channel = create_channel(
-        server_address=server_address,
-        insecure=insecure,
-        root_certificates=root_certificates,
-        max_message_length=max_message_length,
-    )
-    channel.subscribe(on_channel_state_change)
+    channel_options = [
+        ("grpc.max_send_message_length", max_message_length),
+        ("grpc.max_receive_message_length", max_message_length),
+        ("grpc.keepalive_time_ms", 30_000),
+        ("grpc.keepalive_timeout_ms", 10_000),
+        ("grpc.keepalive_permit_without_calls", 1),
+        ("grpc.http2.max_pings_without_data", 0),
+        ("grpc.enable_retries", 1),
+        ("grpc.initial_reconnect_backoff_ms", 1_000),
+        ("grpc.max_reconnect_backoff_ms", 10_000),
+    ]
+    if insecure:
+        channel = grpc.insecure_channel(server_address, options=channel_options)
+    else:
+        credentials = grpc.ssl_channel_credentials(root_certificates)
+        channel = grpc.secure_channel(
+            server_address,
+            credentials,
+            options=channel_options,
+        )
+    channel.subscribe(lambda state: log(DEBUG, "gRPC channel state: %s", state))
 
     queue: Queue[ClientMessage] = Queue(  # pylint: disable=unsubscriptable-object
         maxsize=1
@@ -181,22 +198,22 @@ def grpc_connection(  # pylint: disable=R0913, R0915
         field = proto.WhichOneof("msg")
         message_type = ""
         if field == "get_properties_ins":
-            recordset = compat.getpropertiesins_to_recordset(
+            recordset = compat.getpropertiesins_to_recorddict(
                 serde.get_properties_ins_from_proto(proto.get_properties_ins)
             )
             message_type = MessageTypeLegacy.GET_PROPERTIES
         elif field == "get_parameters_ins":
-            recordset = compat.getparametersins_to_recordset(
+            recordset = compat.getparametersins_to_recorddict(
                 serde.get_parameters_ins_from_proto(proto.get_parameters_ins)
             )
             message_type = MessageTypeLegacy.GET_PARAMETERS
         elif field == "fit_ins":
-            recordset = compat.fitins_to_recordset(
+            recordset = compat.fitins_to_recorddict(
                 serde.fit_ins_from_proto(proto.fit_ins), False
             )
             message_type = MessageType.TRAIN
         elif field == "evaluate_ins":
-            recordset = compat.evaluateins_to_recordset(
+            recordset = compat.evaluateins_to_recorddict(
                 serde.evaluate_ins_from_proto(proto.evaluate_ins), False
             )
             message_type = MessageType.EVALUATE
@@ -219,8 +236,9 @@ def grpc_connection(  # pylint: disable=R0913, R0915
                 message_id=str(uuid.uuid4()),
                 src_node_id=0,
                 dst_node_id=0,
-                reply_to_message="",
+                reply_to_message_id="",
                 group_id="",
+                created_at=time.time(),
                 ttl=DEFAULT_TTL,
                 message_type=message_type,
             ),
@@ -234,20 +252,20 @@ def grpc_connection(  # pylint: disable=R0913, R0915
 
         # RecordSet --> *Res --> *Res proto -> ClientMessage proto
         if message_type == MessageTypeLegacy.GET_PROPERTIES:
-            getpropres = compat.recordset_to_getpropertiesres(recordset)
+            getpropres = compat.recorddict_to_getpropertiesres(recordset)
             msg_proto = ClientMessage(
                 get_properties_res=serde.get_properties_res_to_proto(getpropres)
             )
         elif message_type == MessageTypeLegacy.GET_PARAMETERS:
-            getparamres = compat.recordset_to_getparametersres(recordset, False)
+            getparamres = compat.recorddict_to_getparametersres(recordset, False)
             msg_proto = ClientMessage(
                 get_parameters_res=serde.get_parameters_res_to_proto(getparamres)
             )
         elif message_type == MessageType.TRAIN:
-            fitres = compat.recordset_to_fitres(recordset, False)
+            fitres = compat.recorddict_to_fitres(recordset, False)
             msg_proto = ClientMessage(fit_res=serde.fit_res_to_proto(fitres))
         elif message_type == MessageType.EVALUATE:
-            evalres = compat.recordset_to_evaluateres(recordset)
+            evalres = compat.recorddict_to_evaluateres(recordset)
             msg_proto = ClientMessage(evaluate_res=serde.evaluate_res_to_proto(evalres))
         elif message_type == "reconnect":
             reason = cast(

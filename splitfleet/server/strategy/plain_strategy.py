@@ -162,8 +162,7 @@ class PlainSlStrategy(Strategy):
         config = {}
         if self.config_server_segnent_fn:
             config = self.config_server_segnent_fn(server_round, cids)
-        num_server_models = 1 if self.common_server_model else len(cids)
-        if num_server_models == 1:
+        if self.common_server_model:
             self._cid_to_sid_mapping = {cid: "" for cid in cids}
             return [
                 ServerModelFitIns(parameters=parameters, config=config, sid="")

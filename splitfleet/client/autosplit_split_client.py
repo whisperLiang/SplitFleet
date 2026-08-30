@@ -168,7 +168,9 @@ class AutoSplitSplitLearningClient(NumPyClient):
 
     def fit(self, parameters, config):
         fit_start = time.perf_counter()
+        prepare_start = time.perf_counter()
         round_runtime = self._prepare_round(parameters, config, training=True)
+        runtime_prepare_sec = time.perf_counter() - prepare_start
         runtime_handle = round_runtime.handle
         contract = round_runtime.contract
         prefix_optimizer = self._build_optimizer()
@@ -253,6 +255,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
         metrics = {
             "loss": average_loss,
             "fit_duration_sec": time.perf_counter() - fit_start,
+            "runtime_prepare_sec": runtime_prepare_sec,
             "num_examples": num_examples,
             "boundary": str(runtime_handle.plan.boundary),
             "plan_id": str(runtime_handle.plan.plan_id),

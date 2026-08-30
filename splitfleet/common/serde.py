@@ -6,6 +6,8 @@ Performance optimizations:
 - Reduced branching in hot paths
 """
 
+from __future__ import annotations
+
 from typing import Dict, List, Union
 
 from splitfleet.proto import server_model_pb2

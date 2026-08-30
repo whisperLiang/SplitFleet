@@ -10,13 +10,12 @@ import grpc
 import grpc.aio
 
 from flwr.common import GRPC_MAX_MESSAGE_LENGTH, EventType, event
-from flwr.common.address import parse_address
 from flwr.common import log
 from flwr.server.history import History
-from flwr.server.app import ServerConfig, run_fl
+from flwr.server import ServerConfig
+from flwr.server.server import run_fl
 from flwr.proto.transport_pb2_grpc import add_FlowerServiceServicer_to_server
 from flwr.server.client_manager import ClientManager, SimpleClientManager
-from flwr.server.superlink.fleet.grpc_bidi.grpc_server import valid_certificates
 
 from splitfleet.server.grpc.flower_servicer import FlowerServiceServicer
 from splitfleet.server.server_model.manager import ServerModelManager, GrpcServerModelManager
@@ -25,6 +24,7 @@ from splitfleet.server.strategy import Strategy
 from splitfleet.server.grpc.servicer import ServerModelServicer
 from splitfleet.server.server import Server
 from splitfleet.common.utils import run_async
+from splitfleet.common.address import parse_address
 from splitfleet.proto import server_model_pb2_grpc
 
 
@@ -64,6 +64,9 @@ def init_defaults(
         else:
             server_model_manager = GrpcServerModelManager(
                 init_server_model_fn=strategy.init_server_model_fn,
+                persistent_models=bool(
+                    getattr(strategy, "persistent_server_models", False)
+                ),
             )
 
         server = Server(
@@ -86,7 +89,7 @@ async def start_grpc_server(  # pylint: disable=too-many-arguments
     server_address: str,
     max_concurrent_workers: int = 1000,
     max_message_length: int = GRPC_MAX_MESSAGE_LENGTH,
-    keepalive_time_ms: int = 210000,
+    keepalive_time_ms: int = 30_000,
     certificates: Optional[Tuple[bytes, bytes, bytes]] = None,
 ) -> grpc.Server:
 
@@ -95,8 +98,10 @@ async def start_grpc_server(  # pylint: disable=too-many-arguments
         ("grpc.max_send_message_length", max_message_length),
         ("grpc.max_receive_message_length", max_message_length),
         ("grpc.keepalive_time_ms", keepalive_time_ms),
+        ("grpc.keepalive_timeout_ms", 10_000),
+        ("grpc.http2.min_ping_interval_without_data_ms", 10_000),
         ("grpc.http2.max_pings_without_data", 0),
-        ("grpc.keepalive_permit_without_calls", 0),
+        ("grpc.keepalive_permit_without_calls", 1),
     ]
 
     server = grpc.aio.server(
@@ -106,7 +111,9 @@ async def start_grpc_server(  # pylint: disable=too-many-arguments
     )
 
     if certificates is not None:
-        if not valid_certificates(certificates):
+        if len(certificates) != 3 or not all(
+            isinstance(value, bytes) and value for value in certificates
+        ):
             sys.exit(1)
 
         root_certificate_b, certificate_b, private_key_b = certificates

@@ -43,7 +43,10 @@ class StageRuntimeManager(ServerModelManager):
         self._runtime_handles_by_plan_id: dict[str, SplitRuntimeHandle] = {}
         self._clone_runtime_cache: dict[str, SplitRuntimeHandle] = {}
         self._delegate = (
-            GrpcServerModelManager(init_server_model_fn=init_server_model_fn)
+            GrpcServerModelManager(
+                init_server_model_fn=init_server_model_fn,
+                persistent_models=True,
+            )
             if init_server_model_fn is not None
             else None
         )
