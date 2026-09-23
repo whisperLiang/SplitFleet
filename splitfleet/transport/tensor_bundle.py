@@ -14,9 +14,7 @@ from splitfleet.transport.envelopes import (
     DEFAULT_LIMITS,
     TensorEnvelope,
     decode_boundary,
-    decode_tensor,
     encode_boundary,
-    encode_tensor,
 )
 
 

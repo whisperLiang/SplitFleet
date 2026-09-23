@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
-from splitfleet.autosplit.types import PlacementPlan, ReplicaScope
+from splitfleet.autosplit.types import SplitPlacementPlan, ReplicaScope
 
 
 @dataclass(frozen=True)
@@ -14,7 +14,7 @@ class PartitionSelectionPolicy:
 
     preferred_stage_count: int | None = None
 
-    def choose(self, placements: Sequence[PlacementPlan]) -> PlacementPlan:
+    def choose(self, placements: Sequence[SplitPlacementPlan]) -> SplitPlacementPlan:
         if not placements:
             raise ValueError("No placement plans were provided.")
         if self.preferred_stage_count is None:

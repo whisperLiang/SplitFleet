@@ -34,6 +34,7 @@ from splitfleet.autosplit.torchlens_contract import runtime_contract_digest, sta
 from splitfleet.split_engine import graph_contract_for_runtime_handle
 from splitfleet.split_engine.contracts import ModelVersionContract
 from splitfleet.backends.utils import adapter_for
+from splitfleet.tasks import ModelInputs, TaskAdapter, TaskBatch
 from splitfleet.common.constants import (
     AUTOSPLIT_BACKEND_CONFIG_KEY,
     AUTOSPLIT_BACKEND_VALUE_TORCHLENS,
@@ -60,7 +61,6 @@ from splitfleet.common.constants import (
     AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY,
 )
 from splitfleet.server.server_model.autosplit_tail_server_model import AutoSplitTailServerModel
-from splitfleet.server.server_model.autosplit_server_model import AutoSplitServerModel
 from splitfleet.server.strategy.plain_strategy import PlainSlStrategy
 
 
@@ -101,6 +101,7 @@ class AutoSplitStrategy(PlainSlStrategy):
         model,
         sample_inputs,
         sample_kwargs: Optional[Dict[str, Any]] = None,
+        batch_axes: Optional[Dict[str, int]] = None,
         worker_specs: Optional[Sequence[WorkerSpec]] = None,
         autosplit_session: Optional[AutoSplitSession] = None,
         planner: Optional[AutoSplitPlanner] = None,
@@ -116,6 +117,7 @@ class AutoSplitStrategy(PlainSlStrategy):
         dynamic_batch: tuple[int, int] | list[int] | None = None,
         trace_batch_mode: Optional[str] = None,
         mode: str = "generated_eager",
+        task: TaskAdapter | None = None,
         loss_fn=None,
         optimizer_fn=None,
         runtime_device: str = "cpu",
@@ -126,16 +128,20 @@ class AutoSplitStrategy(PlainSlStrategy):
         oort_config: Optional[OortSelectorConfig] = None,
         **kwargs,
     ) -> None:
-        if sample_kwargs:
-            raise ValueError("TorchLens autosplit backend accepts positional model inputs only.")
         validate_stage_counts(
             preferred_stage_count=preferred_stage_count,
             client_stage_count=client_stage_count,
         )
         self.model = model
-        self.sample_inputs = sample_inputs
-        self.backend_adapter = adapter_for(model, sample_inputs)
-        self.sample_kwargs = {}
+        sample_call = ModelInputs.from_value(sample_inputs.inputs if isinstance(sample_inputs, TaskBatch) else sample_inputs)
+        if sample_kwargs is not None:
+            if sample_call.kwargs:
+                raise ValueError("Provide keyword samples in ModelInputs or sample_kwargs, not both.")
+            sample_call = ModelInputs(sample_call.args, sample_kwargs)
+        self.sample_inputs = sample_call.args
+        self.sample_kwargs = dict(sample_call.kwargs)
+        self.backend_adapter = adapter_for(model, sample_call.args if sample_call.args else sample_call.kwargs)
+        self.batch_axes = batch_axes
         self.worker_specs = list(worker_specs or [WorkerSpec(worker_id="coordinator", device="cpu")])
         self.autosplit_session = autosplit_session or AutoSplitSession(
             planner=planner or AutoSplitPlanner()
@@ -178,7 +184,8 @@ class AutoSplitStrategy(PlainSlStrategy):
         self.dynamic_batch = normalize_batch_window(dynamic_batch)
         self.trace_batch_mode = str(trace_batch_mode) if trace_batch_mode else None
         self.mode = mode
-        self.loss_fn = loss_fn
+        self.task = task
+        self.loss_fn = loss_fn if loss_fn is not None else (task.loss if task is not None else None)
         self.optimizer_fn = optimizer_fn
         self.runtime_device = runtime_device
         self.client_placement_fn = client_placement_fn
@@ -191,6 +198,7 @@ class AutoSplitStrategy(PlainSlStrategy):
         self.tied_weight_update_mode = normalized_tied_mode
         self._placement_plan = None
         self._placement_plans: dict[str, Any] = {}
+        self._evaluation_placement_plans: dict[str, Any] = {}
         self._client_placement_cache: dict[tuple[int, str, bool], Any] = {}
         self._autosplit_config_cache: dict[tuple[str, bool], Dict[str, Any]] = {}
         self._round_initial_client_states: dict[int, list[np.ndarray]] = {}
@@ -242,7 +250,7 @@ class AutoSplitStrategy(PlainSlStrategy):
         self._runtime_manager = runtime_manager
         if self._placement_plan is not None:
             runtime_manager.set_placement_plan(self._placement_plan)
-        for placement in self._placement_plans.values():
+        for placement in (*self._placement_plans.values(), *self._evaluation_placement_plans.values()):
             if placement is not self._placement_plan:
                 runtime_manager.register_placement_plan(placement)
 
@@ -255,13 +263,18 @@ class AutoSplitStrategy(PlainSlStrategy):
     def initialize_server_parameters(self):
         return self.backend_adapter.export_ndarrays(self.model)
 
-    def get_or_create_placement_plan(self, boundary: str | None = None):
+    def get_or_create_placement_plan(self, boundary: str | None = None, *, training: bool = True):
         requested_boundary = str(boundary or self.boundary)
-        placement = self._placement_plans.get(requested_boundary)
+        placements = self._placement_plans if training else self._evaluation_placement_plans
+        placement = placements.get(requested_boundary)
         if placement is None:
+            reference_model = self.backend_adapter.clone_model(self.model)
+            self.backend_adapter.set_training(reference_model, training)
             placement = self.autosplit_session.plan(
-                self.model,
+                reference_model,
                 self.sample_inputs,
+                sample_kwargs=self.sample_kwargs,
+                batch_axes=self.batch_axes,
                 worker_specs=self.worker_specs,
                 constraints=self.constraints,
                 objective=self.objective,
@@ -274,10 +287,11 @@ class AutoSplitStrategy(PlainSlStrategy):
                 dynamic_batch=self.dynamic_batch,
                 trace_batch_mode=self.trace_batch_mode,
             )
-            self._placement_plans[requested_boundary] = placement
+            placement.metadata["_training"] = bool(training)
+            placements[requested_boundary] = placement
             if self._runtime_manager is not None:
                 self._runtime_manager.register_placement_plan(placement)
-        if boundary is None and self._placement_plan is None:
+        if training and boundary is None and self._placement_plan is None:
             self._placement_plan = placement
             if self._runtime_manager is not None:
                 self._runtime_manager.set_placement_plan(self._placement_plan)
@@ -285,7 +299,7 @@ class AutoSplitStrategy(PlainSlStrategy):
 
     def _placement_for_client(self, server_round: int, cid: str, *, training: bool):
         if self.client_placement_fn is None:
-            return self.get_or_create_placement_plan()
+            return self.get_or_create_placement_plan(training=training)
         cache_key = (int(server_round), str(cid), bool(training))
         cached = self._client_placement_cache.get(cache_key)
         if cached is not None:
@@ -293,14 +307,15 @@ class AutoSplitStrategy(PlainSlStrategy):
         self._prune_placement_cache(int(server_round))
         selected = self.client_placement_fn(int(server_round), str(cid), bool(training))
         if selected is None:
-            placement = self.get_or_create_placement_plan()
+            placement = self.get_or_create_placement_plan(training=training)
         elif hasattr(selected, "plan_id") and hasattr(selected, "boundary"):
             placement = selected
-            self._placement_plans.setdefault(str(placement.boundary), placement)
+            placements = self._placement_plans if training else self._evaluation_placement_plans
+            placements.setdefault(str(placement.boundary), placement)
             if self._runtime_manager is not None:
                 self._runtime_manager.register_placement_plan(placement)
         else:
-            placement = self.get_or_create_placement_plan(str(selected))
+            placement = self.get_or_create_placement_plan(str(selected), training=training)
         self._client_placement_cache[cache_key] = placement
         return placement
 
@@ -334,21 +349,15 @@ class AutoSplitStrategy(PlainSlStrategy):
             raise RuntimeError(
                 "AutoSplitStrategy has not been bound to a StageRuntimeManager yet."
             )
-        if self.client_stage_count == 1:
-            return AutoSplitTailServerModel(
-                runtime_manager=self._runtime_manager,
-                model=self.model,
-                optimizer_fn=self.optimizer_fn,
-                loss_fn=self.loss_fn,
-                boundary=self.boundary,
-                mode=self.mode,
-                device=self.runtime_device,
-            )
-        return AutoSplitServerModel(
+        return AutoSplitTailServerModel(
             runtime_manager=self._runtime_manager,
             model=self.model,
+            sample_inputs=self.sample_inputs if self.sample_inputs else self.sample_kwargs,
             optimizer_fn=self.optimizer_fn,
             loss_fn=self.loss_fn,
+            task=self.task,
+            boundary=self.boundary,
+            mode=self.mode,
             device=self.runtime_device,
         )
 
@@ -359,7 +368,9 @@ class AutoSplitStrategy(PlainSlStrategy):
         training: bool = True,
         placement=None,
     ) -> Dict[str, Any]:
-        placement = placement or self.get_or_create_placement_plan()
+        placement = placement or self.get_or_create_placement_plan(training=training)
+        if placement.metadata.get("_training", training) != training:
+            placement = self.get_or_create_placement_plan(placement.boundary, training=training)
         cache_key = (placement.plan_id, bool(training))
         base_config = self._autosplit_config_cache.get(cache_key)
         if base_config is None:
@@ -368,6 +379,8 @@ class AutoSplitStrategy(PlainSlStrategy):
             reference_handle = self.autosplit_session.prepare_runtime(
                 reference_model,
                 self.sample_inputs,
+                sample_kwargs=self.sample_kwargs,
+                batch_axes=self.batch_axes,
                 boundary=placement.boundary,
                 mode=placement.mode,
                 trainable=True,

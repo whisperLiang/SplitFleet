@@ -1,4 +1,4 @@
-"""TorchLens 2.31 adapter using public APIs only."""
+"""TorchLens 2.34.1 adapter using public APIs only."""
 
 from __future__ import annotations
 
@@ -8,10 +8,10 @@ from dataclasses import fields, is_dataclass
 from enum import Enum
 from typing import Any
 
-import torch
-from torchlens.split import ReplayBoundary, prepare
+from torchlens.split import ReplayBoundary
 
 from splitfleet.backends import BACKEND_ADAPTERS
+from splitfleet.tasks import ModelInputs
 from splitfleet.runtime import PrefixContextStore
 from splitfleet.runtime.torch_suffix_training import train_torch_suffix
 from splitfleet.split_engine.base import PrefixContextToken, SplitRuntimeHandle, SuffixResult
@@ -21,6 +21,7 @@ from splitfleet.transport import (
     GradientEnvelope,
     encode_bundle,
 )
+from splitfleet.transport.split_wire import replay_metadata
 
 
 def _value(value: Any) -> Any:
@@ -49,16 +50,6 @@ def _value(value: Any) -> Any:
     return str(value)
 
 
-def _attr(runtime: Any, *names: str, default: Any = "") -> Any:
-    for owner in (runtime, getattr(runtime, "plan", None), getattr(runtime, "graph", None), getattr(runtime, "split_graph", None)):
-        if owner is None:
-            continue
-        for name in names:
-            value = getattr(owner, name, None)
-            if value not in (None, ""):
-                return value
-    return default
-
 
 class TorchLensSplitEngine:
     engine_name = "torchlens"
@@ -67,67 +58,52 @@ class TorchLensSplitEngine:
         self.context_store = context_store or PrefixContextStore()
 
     def prepare(self, model: Any, sample_inputs: Any, request: Any, *, sample_kwargs: dict[str, Any] | None = None) -> SplitRuntimeHandle:
-        runtime = prepare(model, sample_inputs, request, input_kwargs=sample_kwargs)
-        backend = str(getattr(request, "backend", None) or _attr(runtime, "backend", "backend_name"))
+        from splitfleet.autosplit.torchlens_runtime import prepare_split_runtime, normalize_model_call
+
+        call = ModelInputs.from_value(sample_inputs)
+        kwargs = dict(call.kwargs) if sample_kwargs is None else sample_kwargs
+        runtime = prepare_split_runtime(model, call.args, request, input_kwargs=kwargs)
+        args, kwargs, _ = normalize_model_call(model, call.args, kwargs)
+        backend = runtime.adapter.name
+        adapter = BACKEND_ADAPTERS.create(backend)
+        if backend == "jax" and not hasattr(model, "params"):
+            if not args:
+                raise ValueError("Functional JAX models require parameters as the first argument.")
+            adapter.bind_external_params(args[0])
         return SplitRuntimeHandle(
             runtime=runtime,
             backend=backend,
             engine=self.engine_name,
-            metadata={"model": model, "sample_inputs": sample_inputs, "request": request},
+            metadata={"model": model, "sample_inputs": args, "sample_kwargs": kwargs, "request": runtime.request},
         )
 
     def export_contract(self, handle: SplitRuntimeHandle) -> GraphContract:
         runtime = handle.runtime
-        exported = getattr(runtime, "export_contract", None)
-        if callable(exported):
-            raw = _value(exported())
-            if isinstance(raw, dict):
-                known = {name: raw[name] for name in GraphContract.__dataclass_fields__ if name in raw}
-                known.setdefault("backend", handle.backend)
-                return GraphContract(**known)
-        boundary = _value(_attr(runtime, "boundary_schema", default={}))
-        request = _value(_attr(runtime, "request", "split_request", default={}))
-        capabilities = _value(_attr(runtime, "capabilities", "capability_report", default={}))
-        try:
-            version = importlib.metadata.version("torchlens")
-        except importlib.metadata.PackageNotFoundError:
-            version = "unknown"
-        model = handle.metadata.get("model")
-        try:
-            state_schema_hash = BACKEND_ADAPTERS.create(handle.backend).state_manifest(model).schema_hash
-        except (KeyError, TypeError, AttributeError):
-            state_schema_hash = ""
-        input_schema = _tensor_schema(handle.metadata.get("sample_inputs"))
-        graph_hash = str(
-            _attr(runtime, "canonical_graph_hash", default="")
-            or getattr(getattr(runtime, "graph_ir", None), "graph_hash", "")
-            or ""
+        if runtime.graph_ir is None:
+            raise RuntimeError("TorchLens runtime has no captured graph IR.")
+        model = handle.metadata["model"]
+        state_adapter = BACKEND_ADAPTERS.create(handle.backend)
+        if handle.backend == "jax" and not hasattr(model, "params"):
+            state_adapter.bind_external_params(handle.metadata["sample_inputs"][0])
+        state_schema_hash = state_adapter.state_manifest(model).schema_hash
+        input_schema = _tensor_schema(
+            {"args": handle.metadata["sample_inputs"], "kwargs": handle.metadata["sample_kwargs"]},
+            batch_axes=runtime.batch_spec.axes,
         )
-        if not graph_hash:
-            graph = _value(
-                _attr(runtime, "graph_ir", "split_graph", "graph", "ir", default={})
-            )
-            graph_hash = contract_hash(graph)
-        profile = getattr(runtime, "model_profile", None)
-        model_profile_id = str(getattr(profile, "id", "") or "")
-        model_revision = str(
-            handle.metadata.get("model_revision")
-            or getattr(model, "model_revision", "")
-            or (f"{model.__class__.__module__}.{model.__class__.__qualname__}" if model is not None else "")
-        )
+        profile = runtime.model_profile
         return GraphContract(
-            torchlens_version=version,
+            torchlens_version=importlib.metadata.version("torchlens"),
             backend=handle.backend,
-            model_profile_id=model_profile_id or str(_attr(runtime, "model_profile_id", "profile_id")),
-            model_revision=model_revision,
+            model_profile_id=profile.id if profile is not None else "",
+            model_revision=handle.metadata.get("model_revision", f"{model.__class__.__module__}.{model.__class__.__qualname__}"),
             model_state_schema_hash=state_schema_hash,
             input_schema_hash=contract_hash(input_schema),
-            canonical_graph_hash=graph_hash,
-            split_id=str(_attr(runtime, "split_id")),
-            boundary_schema_hash=str(_attr(runtime, "boundary_schema_hash", default="")) or contract_hash(boundary),
-            split_request_hash=contract_hash(request),
-            capability_hash=contract_hash(capabilities),
-            metadata={"source": "derived"},
+            canonical_graph_hash=runtime.graph_ir.graph_hash,
+            split_id=runtime.split_id,
+            boundary_schema_hash=contract_hash(_value(runtime.boundary_schema)),
+            split_request_hash=contract_hash(_value(runtime.request)),
+            capability_hash=contract_hash(_value(runtime.capability_report)),
+            metadata={"source": "torchlens_2.34.1"},
         )
 
     def run_prefix(
@@ -136,10 +112,18 @@ class TorchLensSplitEngine:
         inputs: Any,
         *,
         training: bool,
+        input_kwargs: dict[str, Any] | None = None,
     ) -> tuple[BoundaryEnvelope, PrefixContextToken | None]:
+        from splitfleet.autosplit.torchlens_runtime import normalize_model_call
+
         runtime = handle.runtime
-        args = inputs if isinstance(inputs, tuple) else (inputs,)
-        native = runtime.run_training_prefix(*args) if training else runtime.run_prefix(*args)
+        call = ModelInputs.from_value(inputs)
+        kwargs = (
+            dict(call.kwargs) if isinstance(inputs, ModelInputs)
+            else dict(handle.metadata.get("sample_kwargs", {}))
+        ) if input_kwargs is None else input_kwargs
+        args, kwargs, _ = normalize_model_call(handle.metadata.get("model"), call.args, kwargs)
+        native = runtime.run_training_prefix(*args, input_kwargs=kwargs) if training else runtime.run_prefix(*args, input_kwargs=kwargs)
         contract = self.export_contract(handle)
         round_id = int(handle.metadata.get("round_id", 0))
         client_id = str(handle.metadata.get("client_id", ""))
@@ -152,14 +136,7 @@ class TorchLensSplitEngine:
         tensors = tuple(
             adapter.encode_tensor(name, tensor) for name, tensor in native.tensors.items()
         )
-        batch_size = next(
-            (
-                int(tensor.shape[0])
-                for tensor in native.tensors.values()
-                if tuple(getattr(tensor, "shape", ()) or ())
-            ),
-            0,
-        )
+        batch_size = int(native.metadata["runtime_batch_size"])
         envelope = BoundaryEnvelope(
             tensors=tensors,
             engine=self.engine_name,
@@ -173,7 +150,7 @@ class TorchLensSplitEngine:
             boundary_schema_hash=contract.boundary_schema_hash,
             model_version=int(handle.metadata.get("model_version", 0)),
             batch_size=batch_size,
-            metadata={"contract_digest": contract.digest},
+            metadata={**replay_metadata(native.metadata), "contract_digest": contract.digest},
         )
         return envelope, token
 
@@ -199,6 +176,7 @@ class TorchLensSplitEngine:
             tensors=tensors,
             spec=runtime.boundary_spec,
             metadata={
+                **replay_metadata(boundary.metadata),
                 "split_id": runtime.split_id,
                 "graph_shape_hash": contract.canonical_graph_hash,
                 "batch_size": boundary.batch_size,
@@ -211,6 +189,8 @@ class TorchLensSplitEngine:
         boundary: BoundaryEnvelope,
         targets: Any = None,
         optimizer: Any = None,
+        *,
+        loss_fn: Any = None,
     ) -> SuffixResult:
         native = self._native_boundary(handle, boundary)
         if targets is None:
@@ -219,13 +199,15 @@ class TorchLensSplitEngine:
                 outputs=encode_bundle(outputs, backend=handle.backend),
                 num_examples=boundary.batch_size,
             )
+        if loss_fn is None:
+            raise ValueError("Split training requires an explicit loss_fn.")
         if handle.backend == "torch":
             loss, gradients = train_torch_suffix(
-                handle.runtime, native, targets, optimizer=optimizer
+                handle.runtime, native, targets, loss_fn=loss_fn, optimizer=optimizer
             )
         else:
             loss, gradients = handle.runtime.train_suffix(
-                native, targets, optimizer=optimizer
+                native, targets, loss_fn=loss_fn, optimizer=optimizer
             )
         adapter = BACKEND_ADAPTERS.create(handle.backend)
         gradient_envelope = GradientEnvelope(
@@ -258,6 +240,13 @@ class TorchLensSplitEngine:
             context_token.round_id, context_token.client_id, context_token.step_id
         ):
             raise ValueError("Gradient context identity mismatch")
+        if gradients.backend != handle.backend:
+            raise ValueError("Gradient backend mismatch")
+        if gradients.split_id != handle.runtime.split_id:
+            raise ValueError("Gradient split id mismatch")
+        for field_name in ("plan_id", "model_version"):
+            if field_name in handle.metadata and getattr(gradients, field_name) != handle.metadata[field_name]:
+                raise ValueError(f"Gradient {field_name} mismatch")
         native = self.context_store.pop(
             context_token.round_id, context_token.client_id, context_token.step_id
         )
@@ -284,7 +273,10 @@ def _iter_tensor_values(value: Any):
 def _runtime_device(handle: SplitRuntimeHandle) -> Any:
     """Infer the native device used to reconstruct wire tensors."""
     if handle.backend == "torch":
-        return next(iter(handle.runtime.model.parameters()), torch.empty(0)).device
+        model = handle.runtime.model
+        for tensor in (*model.parameters(), *model.buffers()):
+            return tensor.device
+        return None
     for tensor in _iter_tensor_values(handle.metadata.get("sample_inputs")):
         device = getattr(tensor, "device", None)
         if callable(device):
@@ -297,14 +289,20 @@ def _runtime_device(handle: SplitRuntimeHandle) -> Any:
     return None
 
 
-def _tensor_schema(value: Any) -> Any:
-    if isinstance(value, torch.Tensor):
-        shape = ["B", *[int(dim) for dim in value.shape[1:]]] if value.ndim else []
+def _tensor_schema(value: Any, *, batch_axes=None, path: str = "") -> Any:
+    if hasattr(value, "shape") and hasattr(value, "dtype"):
+        shape = [int(dim) for dim in value.shape]
+        axis = (batch_axes or {}).get(path)
+        if axis is not None:
+            shape[axis] = "B"
         return {"shape": shape, "dtype": str(value.dtype).removeprefix("torch.")}
     if isinstance(value, dict):
-        return {str(key): _tensor_schema(item) for key, item in value.items()}
+        return {str(key): _tensor_schema(item, batch_axes=batch_axes,
+                    path=path + "/" + str(key).replace("~", "~0").replace("/", "~1"))
+                for key, item in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_tensor_schema(item) for item in value]
+        return [_tensor_schema(item, batch_axes=batch_axes, path=f"{path}/{index}")
+                for index, item in enumerate(value)]
     return type(value).__name__
 
 
@@ -312,13 +310,12 @@ def graph_contract_for_runtime_handle(handle: Any) -> GraphContract:
     """Export a contract from SplitFleet's prepared TorchLens runtime handle."""
     engine_handle = SplitRuntimeHandle(
         runtime=handle.runtime,
-        backend=str(getattr(getattr(handle.runtime, "adapter", None), "name", "")),
+        backend=handle.runtime.adapter.name,
         metadata={
             "model": handle.model,
             "sample_inputs": handle.plan.metadata.get("_example_inputs"),
-            "request": getattr(handle.runtime, "request", None),
+            "sample_kwargs": handle.plan.metadata.get("_example_kwargs", {}),
+            "request": handle.runtime.request,
         },
     )
-    if not engine_handle.backend:
-        raise RuntimeError("TorchLens runtime handle does not declare a backend")
     return TorchLensSplitEngine().export_contract(engine_handle)

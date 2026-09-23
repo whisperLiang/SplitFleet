@@ -101,12 +101,10 @@ def inference_context(backend: str):
 def zero_grad(model: Any, optimizer: Any = None) -> None:
     method = getattr(model, "zero_grad", None)
     if callable(method):
-        try: method(set_to_none=True)
-        except TypeError: method()
+        method()
     method = getattr(optimizer, "zero_grad", None)
     if callable(method):
-        try: method(set_to_none=True)
-        except TypeError: method()
+        method()
 
 
 def model_training(model: Any) -> bool:

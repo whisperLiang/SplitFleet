@@ -1,11 +1,5 @@
-"""Optimized gRPC connection handling.
+"""Flower bidi transport and server-model RPCs sharing one gRPC channel."""
 
-Performance optimizations:
-- gRPC compression for reduced bandwidth
-- Connection options for better throughput
-"""
-
-import sys
 import time
 import uuid
 from queue import Queue
@@ -16,9 +10,6 @@ from typing import Optional, Callable, Tuple, Union, Type, ContextManager, Itera
 
 import grpc
 from grpc import RpcError
-from cryptography.hazmat.primitives.asymmetric import ec
-
-from flwr.common.constant import TRANSPORT_TYPE_GRPC_RERE, TRANSPORT_TYPES
 from flwr.common import (
     DEFAULT_TTL,
     GRPC_MAX_MESSAGE_LENGTH,
@@ -30,7 +21,6 @@ from flwr.common import (
     log,
     recorddict_compat as compat
 )
-from flwr.common.retry_invoker import RetryInvoker
 from flwr.proto.transport_pb2 import (  # pylint: disable=E0611
     ClientMessage,
     Reason,
@@ -50,68 +40,34 @@ from splitfleet.common.address import parse_address
 TRANSPORT_TYPE_GRPC_BIDI = "grpc-bidi"
 
 
-def init_connection(transport: Optional[str], server_address: str) -> Tuple[
-    Callable[
-        [
-            str,
-            bool,
-            RetryInvoker,
-            int,
-            Union[bytes, str, None],
-            Optional[Tuple[ec.EllipticCurvePrivateKey, ec.EllipticCurvePublicKey]],
-        ],
-        ContextManager[
-            Tuple[
-                Callable[[], Optional[Message]],
-                Callable[[Message], None],
-                Optional[Callable[[], None]],
-                Optional[Callable[[], None]],
-                Optional[Callable[[int], Tuple[str, str]]],
-            ]
-        ],
-    ],
-    str,
-    Type[Exception],
+Connection = Tuple[Callable[[], Message], Callable[[Message], None], ServerModelStub]
+
+
+def init_connection(transport: str, server_address: str) -> Tuple[
+    Callable[..., ContextManager[Connection]], str, Type[Exception]
 ]:
     # Parse IP address
     parsed_address = parse_address(server_address)
     if not parsed_address:
-        sys.exit(f"Server address ({server_address}) cannot be parsed.")
+        raise ValueError(f"Server address ({server_address}) cannot be parsed.")
     host, port, is_v6 = parsed_address
     address = f"[{host}]:{port}" if is_v6 else f"{host}:{port}"
 
-    if transport == TRANSPORT_TYPE_GRPC_RERE:
-        raise NotImplementedError("ReRe transport is not yet implemented")
-        # connection, error_type = grpc_request_response, RpcError
-    elif transport == TRANSPORT_TYPE_GRPC_BIDI:
-        connection, error_type = grpc_connection, RpcError
-    else:
+    if transport != TRANSPORT_TYPE_GRPC_BIDI:
         raise ValueError(
-            f"Unknown transport type: {transport} (possible: {TRANSPORT_TYPES})"
+            f"Unsupported transport {transport!r}; use {TRANSPORT_TYPE_GRPC_BIDI!r}."
         )
 
-    return connection, address, error_type
+    return grpc_connection, address, RpcError
 
 
 @contextmanager
 def grpc_connection(  # pylint: disable=R0913, R0915
     server_address: str,
     insecure: bool,
-    retry_invoker: RetryInvoker,  # pylint: disable=unused-argument
     max_message_length: int = GRPC_MAX_MESSAGE_LENGTH,
     root_certificates: Optional[Union[bytes, str]] = None,
-    authentication_keys: Optional[  # pylint: disable=unused-argument
-        Tuple[ec.EllipticCurvePrivateKey, ec.EllipticCurvePublicKey]
-    ] = None,
-) -> Iterator[
-    Tuple[
-        Callable[[], Optional[Message]],
-        Callable[[Message], None],
-        Optional[Callable[[], None]],
-        Optional[Callable[[], None]],
-        Optional[Callable[[int], Tuple[str, str]]],
-    ]
-]:
+) -> Iterator[Connection]:
     """Establish a gRPC connection to a gRPC server.
 
     Parameters
@@ -123,8 +79,6 @@ def grpc_connection(  # pylint: disable=R0913, R0915
     insecure : bool
         Starts an insecure gRPC connection when True. Enables HTTPS connection
         when False, using system certificates if `root_certificates` is None.
-    retry_invoker: RetryInvoker
-        Unused argument present for compatibilty.
     max_message_length : int
         The maximum length of gRPC messages that can be exchanged with the Flower
         server. The default should be sufficient for most models. Users who train
@@ -140,22 +94,8 @@ def grpc_connection(  # pylint: disable=R0913, R0915
 
     Returns
     -------
-    receive, send : Callable, Callable
-
-    Examples
-    --------
-    Establishing a SSL-enabled connection to the server:
-
-    >>> from pathlib import Path
-    >>> with grpc_connection(
-    >>>     server_address,
-    >>>     max_message_length=max_message_length,
-    >>>     root_certificates=Path("/crts/root.pem").read_bytes(),
-    >>> ) as conn:
-    >>>     receive, send = conn
-    >>>     server_message = receive()
-    >>>     # do something here
-    >>>     send(client_message)
+    receive, send, server_model_stub
+        Flower instruction receiver, response sender, and server-model RPC stub.
     """
     if isinstance(root_certificates, str):
         root_certificates = Path(root_certificates).read_bytes()
@@ -281,8 +221,7 @@ def grpc_connection(  # pylint: disable=R0913, R0915
         return queue.put(msg_proto, block=False)
 
     try:
-        # Yield methods
-        yield (receive, send, server_model_servicer_stub, None, None, None)
+        yield receive, send, server_model_servicer_stub
     finally:
         # Make sure to have a final
         channel.close()

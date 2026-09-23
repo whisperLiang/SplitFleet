@@ -150,7 +150,7 @@ def test_blacklist_rounds_apply_without_blacklisting_all_clients() -> None:
     assert len(selector.blacklist) < len(selector.clients)
 
 
-def test_blacklist_relaxes_when_needed_to_satisfy_requested_count() -> None:
+def test_blacklist_is_never_relaxed_to_fill_requested_count() -> None:
     selector = OortSelector(
         OortSelectorConfig(
             blacklist_rounds=0,
@@ -173,8 +173,8 @@ def test_blacklist_relaxes_when_needed_to_satisfy_requested_count() -> None:
     result = selector.select(round_id=2, candidate_cids=cids, num_clients=4)
 
     assert len(selector.blacklist) == 2
-    assert len(result.selected_cids) == 4
-    assert set(result.metadata["relaxed_blacklist"]) == selector.blacklist
+    assert len(result.selected_cids) == 2
+    assert not set(result.selected_cids) & selector.blacklist
 
 
 def test_update_after_fit_refreshes_client_statistics() -> None:

@@ -3,24 +3,33 @@
 The complete RA-SplitFed experiment package is documented in
 [`experiments/resource_adaptive_splitfed/README.md`](experiments/resource_adaptive_splitfed/README.md).
 
-SplitFleet is a TorchLens-backed split learning framework built on top of [Flower](https://flower.ai/).
-The autosplit runtime is backed by the repository-local `torchlens-2.31.0-py3-none-any.whl` via `uv.sources`, so SplitFleet focuses on Flower strategy integration, client/server transport, server-tail replicas, and aggregation policy.
+SplitFleet is a unified split federated learning framework built on top of [Flower](https://flower.ai/) and TorchLens. It separates framework backends, operation-level model partitioning, task adapters, boundary transport, and federated aggregation.
+
+The unified task interface covers image classification, text classification, object detection, semantic segmentation, and instance segmentation. See the [Chinese architecture and validation guide](docs/unified_framework.md) for the execution contract and reproducible checks.
+The autosplit runtime is backed by the repository-local `torchlens-2.34.1-1-py3-none-any.whl` via `uv.sources`, so SplitFleet focuses on Flower strategy integration, client/server transport, server-tail replicas, and aggregation policy. This local build fixes tinygrad's repeated traversal of shared graphs, fixed-shape replay, and container parameter binding; the unchanged upstream wheel, source patches, and [rebuild instructions](patches/torchlens/README.md) are retained for verification.
 
 TorchLens-backed split replay and training can also be enabled for TensorFlow, JAX,
 Paddle, and tinygrad through the corresponding optional dependency groups
-(`tensorflow`, `jax`, `paddle`, `tinygrad`, or `multibackend`). MLX and ONNX are
-not registered because TorchLens 2.31 does not provide training-capable split
-adapters for them. JAX callers provide `functional_update_fn` on the split client
+(`tensorflow`, `jax`, `paddle`, `tinygrad`, or `multibackend`). This project registers these five training backends; MLX and ONNX are
+not exposed as SplitFleet training backends. JAX callers provide `functional_update_fn` on the split client
 when model parameters require an external functional update.
 The TorchLens tinygrad adapter is pinned to tinygrad 0.13 and SplitFleet uses
 Python 3.11 so the adapter can be exercised alongside the other backends.
 
 ## What This Project Does
 
-Given a PyTorch model and example positional inputs, SplitFleet prepares a TorchLens split runtime, runs a client-local prefix, sends a typed `BoundaryPayload` to the server suffix, and completes split inference or split training inside the Flower round loop.
+Given a model in a registered backend and example positional/keyword inputs, SplitFleet prepares a TorchLens split runtime, runs a client-local prefix, sends a typed `BoundaryPayload` to the server suffix, and completes split inference or split training inside the Flower round loop.
+
+Split points may be selected before/after captured operations or by percentage.
+Support is determined for each captured graph, backend, input schema, and training
+mode; an untraceable model or unsupported operation is reported explicitly.
+This is not a promise that every possible model or Python execution path can be split.
 
 Currently supported:
 
+- positional and keyword model inputs, including text input mappings
+- task-aware batches and losses, including list-of-images detection batches
+- inspectable backend availability through `BACKEND_ADAPTERS.availability()`
 - client prefix and coordinator/server suffix
 - split inference
 - split training with suffix gradients returned to the prefix
@@ -30,18 +39,16 @@ Currently supported:
   `AutoSplitStrategy.client_placement_fn`
 - capability-aware per-client placement through
   [`CapabilityAwarePlacementPolicy`](splitfleet/server/placement/capability_placement.py)
-- a fleet-wide dynamic batch window negotiated by the strategy, so devices can
-  train heterogeneous batch sizes against the same suffix runtime
+- a fleet-wide dynamic batch window negotiated by the strategy, permitting
+  heterogeneous batch sizes when native TorchLens batch validation succeeds
 - SplitFed-style client and server aggregation
 - name-manifest reassembly of per-client prefix/suffix updates before FedAvg
-- `BoundaryPayload` serialization through SplitFleet torch serde helpers
+- `BoundaryPayload` serialization through SplitFleet's typed wire envelopes
 
 Currently not supported:
 
 - arbitrary multi-stage worker placement
-- old node-by-node remote stage execution
 - non-contiguous client/server stage ownership
-- keyword-input tracing in the SplitFleet adapter
 
 ## Installation
 
@@ -55,7 +62,7 @@ When the repository-local TorchLens wheel or lockfile changes, force uv to forge
 
 ```bash
 uv lock
-uv cache clean
+uv cache clean torchlens
 uv sync --extra dev --reinstall-package torchlens
 ```
 
@@ -73,16 +80,28 @@ uv sync --extra dev --extra integration --extra multibackend --reinstall-package
 
 ## Quick Start
 
+Run the download-free task correctness matrix (image/text classification, detection,
+semantic and instance segmentation; PyTorch and JAX):
+
+```bash
+uv run --no-sync python -m splitfleet.validation --backends torch jax --all-nodes \
+  --output results/unified_task_validation.json
+```
+
+The JSON compares outputs, task losses, all parameter gradients and one SGD step
+at every enumerated before/after boundary, including activation and gradient wire
+round trips. Unsupported and failed cases have separate outcomes and nonzero exit
+codes. These synthetic checks do not measure dataset accuracy or convergence.
+Install the JAX extra with `uv sync --extra dev --extra jax` before this command,
+or use `--backends torch` with the base installation. The full task equivalence
+matrix currently covers PyTorch and JAX. TensorFlow, Paddle and tinygrad have
+separate native replay/training, task-loss and split-node checks; those checks
+do not establish a complete five-backend by five-task equivalence matrix.
+
 Run the TorchLens split training demo:
 
 ```bash
 uv run --no-sync python examples/torchlens_split_training_demo.py
-```
-
-Run the coordinator-local suffix demo:
-
-```bash
-uv run --no-sync python examples/autosplit_remote_worker_demo.py
 ```
 
 Run the default test suite:
@@ -97,8 +116,10 @@ Run the real-model task matrix:
 uv run --no-sync pytest tests/integration/test_torchlens_real_task_matrix.py -q
 ```
 
-The matrix actively validates timm Swin, Hugging Face BERT/DistilBERT/RoBERTa,
-CNN classifiers, torchvision detection heads, and semantic-segmentation models.
+The matrix validates Hugging Face BERT/DistilBERT/RoBERTa, CNN classifiers,
+torchvision detection heads, and semantic-segmentation models. Swin training
+and DeepLab training use explicit fixed-shape captures where TorchLens refuses
+dynamic batch replay; the tests preserve those refusals as part of the contract.
 
 Run exhaustive split-node training on the cross-backend task models (YOLO-style
 detection, FCN segmentation, RetinaNet-style detection, OCR, and foreground-mask
@@ -107,6 +128,11 @@ segmentation):
 ```bash
 uv run --no-sync pytest tests/integration/test_all_split_nodes_training.py -q
 ```
+
+This check accounts for terminal and non-differentiable nodes separately. When a
+backend exposes no differentiable single-node boundary, it also tests the
+multi-tensor frontier chosen by TorchLens; a replay-only node is not reported as
+a successful training boundary.
 
 The gated ResNet-18 exhaustive check limits native numerical libraries to one
 CPU thread per backend subprocess by default. Increase the limit explicitly only
@@ -169,19 +195,35 @@ client = AutoSplitSplitLearningClient(
 
 `dynamic_batch=(min, max)` is planned once by the strategy, travels in the round
 config, and is what every device prepares its prefix runtime with. Devices
-therefore keep their own local batch sizes — including a short trailing batch —
-without each one re-deriving a window from its own sample inputs. The window is
+can keep local batch sizes, including a short trailing batch, when both the
+negotiated window and native TorchLens batch validation allow them. The window is
 part of the feature ABI, so a device that disagrees is rejected at round setup
 instead of at the first boundary upload.
 
-When `dynamic_batch` is omitted, the window defaults to `(2, 64)` for a sample
-batch greater than one and `(1, 64)` otherwise.
+For a runtime with inferred or declared batch axes, omitting `dynamic_batch`
+defaults the window to `(2, 64)` for a sample batch greater than one and `(1, 64)`
+otherwise. Fixed-shape captures do not infer a dynamic window.
+
+The window is an admission constraint, not proof of shape generalization.
+`batch_axes` declares the model-call inputs and dimensions that carry the batch;
+for example, `{"/args/0": 1}` for a `[T, B, C]` input. A missing or failed native
+batch probe still rejects changed batches even when they are inside the window.
+
+Pass `batch_axes={}` to capture the exact example shape without dynamic batch
+axes. Set it on both `AutoSplitStrategy` and `AutoSplitSplitLearningClient`, with
+matching sample shapes, and keep the data-loader batch shape fixed. This is the
+explicit training path used by the BatchNorm1d, DeepLab and Swin configurations
+whose native dynamic batch probes cannot validate replay. See the
+[fixed-shape example and native limitations](docs/unified_framework.md#细粒度分割).
+Changing a fixed input shape requires a separate capture; widening
+`dynamic_batch` does not make that shape dynamic.
 
 A batch outside the window is refused by the prefix before it is uploaded and by
 the suffix before it is executed, naming the observed batch and the window. Set
 `partial_batch_policy="skip"` on the split client to drop such batches instead;
 the dropped batch and example counts are reported in the round metrics rather
-than silently absorbed.
+than silently absorbed. This skip policy does not handle fixed-shape mismatches
+or native batch-probe failures inside the admitted window.
 
 ### Capability-aware placement across heterogeneous devices
 
@@ -242,35 +284,39 @@ mode are the two deltas summed. Shared buffers are not treated as tied.
 
 ## Runtime Invariants
 
-- Runtime validation must prove `torchlens.__version__ == "2.31.0"` from the installed package, not only from wheel metadata.
-- Final runtimes are prepared through TorchLens `prepare_split` or `prepare_split_replay`; low-level TorchLens graph APIs are reserved for read-only candidate probing.
-- `BoundaryPayload` serialization is self-contained: tensors plus a stable `BoundarySpec` must be enough to recover after cross-process transport, and the optional native TorchLens object is not required after serde.
+- Runtime validation must prove `torchlens.__version__ == "2.34.1"` from the installed package and require the repository's patched build 1. Runtime contracts identify this adapter build so earlier contracts must be regenerated.
+- Runtimes use TorchLens `prepare`; split-point discovery and repartition use the public `split_points` and `at` methods. Unsupported points remain visible in candidate diagnostics.
+- `BoundaryPayload` serialization is self-contained: tensors, a stable `BoundarySpec`, and portable replay metadata survive cross-process transport. The optional native TorchLens object and local autograd state are not required on the receiving side.
 - Feature ABI identifiers are schema-only. They include labels, dtype, symbolic shape, layout, passthrough/preprocessing schema, trace mode, dynamic batch, model/runtime identifiers, and TorchLens version, but exclude sample tensor values, concrete sample batch values, target values, device, temporary runtime ids, and validation inputs.
 - Flower autosplit config is JSON-stable. Strategy, client, and server code exchange deterministic runtime contract JSON, contract digests, feature ABI ids, boundary labels, trace batch mode, dynamic batch, backend, and TorchLens version.
 - Boundary uploads are rejected before suffix execution when runtime backend, TorchLens version, feature ABI id, runtime contract digest, boundary label order, batch size, trace batch mode, or dynamic batch do not match the prepared server runtime.
 - The dynamic batch window is negotiated once per placement by the strategy. Clients adopt the broadcast window instead of inferring one, and a client whose prepared prefix does not reproduce the announced feature ABI id fails the round before uploading a boundary.
-- `backward_prefix` delegates to TorchLens split training support. If neither the prepared runtime nor TorchLens exposes a real implementation, SplitFleet raises a clear `RuntimeError` instead of fabricating gradients.
+- `backward_prefix` calls the pinned TorchLens runtime's training API directly.
+- Runtime preparation, optimizer construction and semantic split lookup failures propagate to the caller. Training does not continue with an unprepared runtime, missing optimizer implementation or guessed semantic boundary.
 - Under `ReplicaScope.PER_CLIENT`, the prefix and suffix halves of a round are aggregated by two different calls, so `aggregate_fit` returns `None` for the client-side model and `Strategy.finalize_round` returns the reassembled logical model. No call path can publish a model whose suffix half is a round stale: a caller that skips `finalize_round` keeps the previous global parameters.
 - Suffix timing measurements always contain `server_total_ms`. `server_forward_ms` and `server_backward_ms` are reported only by backends that execute the suffix phase by phase; no backend fabricates a phase split.
 - Per-round aggregation state is dropped when the next round is configured, so a round that never reaches `aggregate_server_fit` cannot retain a copy of the client and server models.
 
 ## Validation
 
-TorchLens 2.31 wheel and API checks:
+See the [validation record](docs/validation_results.md) for the tested environment,
+reproduction commands, task matrix, and explicitly skipped checks.
+
+TorchLens 2.34.1 wheel and API checks:
 
 ```bash
 uv lock
-uv cache clean
+uv cache clean torchlens
 uv sync --extra dev --reinstall-package torchlens
-uv run python -c "import torchlens as tl; print(tl.__file__); print(tl.__version__); assert tl.__version__ == '2.31.0'"
-uv run python -c "from torchlens.split import ReplayBoundary, prepare; print('torchlens 2.31 split api ok')"
+uv run python -c "import torchlens as tl; print(tl.__file__); print(tl.__version__); assert tl.__version__ == '2.34.1'"
+uv run python -c "from torchlens.split import ReplayBoundary, prepare; print('torchlens 2.34.1 split api ok')"
 ```
 
 Default checks:
 
 ```bash
 uv run --no-sync pytest -q
-uv run --no-sync pytest tests/unit/test_torchlens_218_api.py -q
+uv run --no-sync pytest tests/unit/test_torchlens_split_engine.py -q
 uv run --no-sync pytest tests/unit/test_torchlens_boundary_serde.py -q
 uv run --no-sync pytest tests/unit/test_torchlens_candidate_contract.py -q
 uv run --no-sync pytest tests/unit/test_stage_runtime_contract.py -q
@@ -307,7 +353,7 @@ The ResNet18 check verifies that a split training step matches the full-model st
 Cleanup checks:
 
 ```bash
-rg "torchlens-2\.1[7]\.0|2\.1[7]\.0" splitfleet tests examples README.md pyproject.toml uv.lock
+rg 'torchlens-2\.31\.0|torchlens==2\.31\.0' splitfleet tests examples README.md pyproject.toml uv.lock
 rg -i "[a]riadne" splitfleet tests examples README.md pyproject.toml uv.lock
 ```
 

@@ -4,119 +4,24 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-import torch
-
 from splitfleet.autosplit.cache import PlanCacheStore
 from splitfleet.autosplit.planner import AutoSplitPlanner
 from splitfleet.autosplit.torchlens_backend import (
-    SplitRuntimeHandle,
     TorchLensRuntimeHandle,
     backward_prefix,
     prepare_torchlens_runtime,
 )
-from splitfleet.autosplit.torchlens_runtime import normalize_example_inputs, require_torchlens_231
-from splitfleet.autosplit.types import SplitPlan
-
-
-def normalize_inputs(inputs: Any) -> tuple[Any, ...]:
-    return normalize_example_inputs(inputs)
-
-
-def _tensor_backend(value: Any) -> str | None:
-    module = type(value).__module__.lower()
-    if isinstance(value, torch.Tensor):
-        return "torch"
-    if hasattr(value, "shape") and hasattr(value, "dtype"):
-        if module.startswith(("tensorflow", "keras")):
-            return "tf"
-        if module.startswith(("jax", "jaxlib")):
-            return "jax"
-        if module.startswith("paddle"):
-            return "paddle"
-        if module.startswith("tinygrad"):
-            return "tinygrad"
-    return None
-
-
-def _mean_square(value: Any) -> Any:
-    backend = _tensor_backend(value)
-    if backend == "torch":
-        return value.float().square().mean()
-    if backend == "tf":
-        import tensorflow as tf
-
-        value = tf.cast(value, tf.float32)
-        return tf.reduce_mean(tf.square(value))
-    if backend == "jax":
-        import jax.numpy as jnp
-
-        value = jnp.asarray(value, dtype=jnp.float32)
-        return jnp.mean(jnp.square(value))
-    if backend == "paddle":
-        import paddle
-
-        value = paddle.cast(value, "float32")
-        return paddle.mean(paddle.square(value))
-    if backend == "tinygrad":
-        return (value * value).mean()
-    raise TypeError(f"Unsupported tensor type {type(value).__name__}")
-
-
-def _mse_loss(outputs: Any, targets: Any) -> Any:
-    backend = _tensor_backend(outputs)
-    if backend is None or _tensor_backend(targets) != backend:
-        raise TypeError("Default MSE requires output and target tensors from the same backend.")
-    if backend == "torch":
-        return torch.nn.functional.mse_loss(outputs, targets)
-    if backend == "tf":
-        import tensorflow as tf
-
-        return tf.reduce_mean(tf.math.squared_difference(outputs, targets))
-    if backend == "jax":
-        import jax.numpy as jnp
-
-        return jnp.mean(jnp.square(outputs - targets))
-    if backend == "paddle":
-        import paddle.nn.functional as functional
-
-        return functional.mse_loss(outputs, targets)
-    if backend == "tinygrad":
-        return ((outputs - targets) ** 2).mean()
-    raise TypeError(f"Unsupported tensor backend {backend!r}")
-
-
-def _nested_tensor_loss(value: Any) -> Any:
-    losses: list[Any] = []
-
-    def visit(item: Any) -> None:
-        if _tensor_backend(item) is not None:
-            losses.append(_mean_square(item))
-            return
-        if isinstance(item, dict):
-            for child in item.values():
-                visit(child)
-            return
-        if isinstance(item, (list, tuple)):
-            for child in item:
-                visit(child)
-
-    visit(value)
-    if not losses:
-        raise ValueError("Cannot compute a default loss for outputs without tensors.")
-    total = losses[0]
-    for loss in losses[1:]:
-        total = total + loss
-    return total
+from splitfleet.autosplit.torchlens_runtime import require_torchlens_version
+from splitfleet.autosplit.types import SplitPlacementPlan
+from splitfleet.tasks import ModelInputs
+from splitfleet.backends.utils import inference_context
 
 
 def compute_loss(outputs: Any, targets: Any = None, loss_fn=None) -> Any:
-    if loss_fn is not None:
-        if targets is None:
-            return loss_fn(outputs)
-        return loss_fn(outputs, targets)
-    if targets is not None and _tensor_backend(outputs) is not None:
-        return _mse_loss(outputs, targets)
-    return _nested_tensor_loss(outputs)
+    """Evaluate the caller-provided task objective."""
+    if loss_fn is None:
+        raise ValueError("An explicit loss_fn is required for task evaluation and training.")
+    return loss_fn(outputs) if targets is None else loss_fn(outputs, targets)
 
 
 class AutoSplitSession:
@@ -132,12 +37,12 @@ class AutoSplitSession:
     ) -> None:
         if backend != "torchlens":
             raise ValueError(f"Only the TorchLens autosplit backend is supported, got {backend!r}.")
-        require_torchlens_231()
+        require_torchlens_version()
         self.planner = planner or AutoSplitPlanner()
         self.cache_store = cache_store
         self.device = device
         self.backend = backend
-        self._runtime_handles: dict[str, SplitRuntimeHandle] = {}
+        self._runtime_handles: dict[str, TorchLensRuntimeHandle] = {}
 
     def plan(
         self,
@@ -145,6 +50,7 @@ class AutoSplitSession:
         sample_inputs: Any,
         *,
         sample_kwargs: Optional[dict[str, Any]] = None,
+        batch_axes: dict[str, int] | None = None,
         worker_specs=None,
         constraints=None,
         objective=None,
@@ -156,12 +62,12 @@ class AutoSplitSession:
         trainable: bool = True,
         dynamic_batch: tuple[int, int] | None = None,
         trace_batch_mode: str | None = None,
-        compile_options: Any = None,
-    ) -> SplitPlan:
+    ) -> SplitPlacementPlan:
         placement = self.planner.plan(
             model,
             sample_inputs,
             sample_kwargs=sample_kwargs,
+            batch_axes=batch_axes,
             worker_specs=worker_specs,
             constraints=constraints,
             objective=objective,
@@ -174,7 +80,6 @@ class AutoSplitSession:
             trainable=trainable,
             dynamic_batch=dynamic_batch,
             trace_batch_mode=trace_batch_mode,
-            compile_options=compile_options,
         )
         handle = placement.metadata.get("_runtime_handle")
         if isinstance(handle, TorchLensRuntimeHandle):
@@ -186,18 +91,20 @@ class AutoSplitSession:
         model,
         sample_inputs: Any,
         *,
+        sample_kwargs: dict[str, Any] | None = None,
+        batch_axes: dict[str, int] | None = None,
         boundary: str = "50%",
         mode: str = "generated_eager",
         trainable: bool = True,
         dynamic_batch: tuple[int, int] | None = None,
         trace_batch_mode: str | None = None,
-        objective: Any = None,
-        compile_options: Any = None,
-    ) -> SplitRuntimeHandle:
-        del objective, compile_options
+    ) -> TorchLensRuntimeHandle:
+        call = ModelInputs.from_value(sample_inputs)
         handle = prepare_torchlens_runtime(
             model,
-            sample_inputs,
+            call.args,
+            sample_kwargs=dict(call.kwargs) if sample_kwargs is None else sample_kwargs,
+            batch_axes=batch_axes,
             boundary=boundary,
             mode=mode,
             trainable=trainable,
@@ -208,10 +115,10 @@ class AutoSplitSession:
         self._runtime_handles[handle.plan.plan_id] = handle
         return handle
 
-    def get_runtime_handle(self, value: SplitRuntimeHandle | SplitPlan | str) -> SplitRuntimeHandle:
+    def get_runtime_handle(self, value: TorchLensRuntimeHandle | SplitPlacementPlan | str) -> TorchLensRuntimeHandle:
         if isinstance(value, TorchLensRuntimeHandle):
             return value
-        if isinstance(value, SplitPlan):
+        if isinstance(value, SplitPlacementPlan):
             handle = value.metadata.get("_runtime_handle")
             if isinstance(handle, TorchLensRuntimeHandle):
                 return handle
@@ -222,30 +129,31 @@ class AutoSplitSession:
             raise RuntimeError(f"No TorchLens runtime handle is registered for plan {value!r}.") from exc
 
     @staticmethod
-    def _runtime_context(handle: SplitRuntimeHandle) -> str:
-        plan = getattr(handle, "plan", None)
+    def _runtime_context(handle: TorchLensRuntimeHandle) -> str:
+        plan = handle.plan
         return (
-            f"torchlens_version={getattr(handle, 'torchlens_version', getattr(plan, 'torchlens_version', ''))!r}, "
-            f"boundary={getattr(plan, 'boundary', '')!r}, "
-            f"candidate_id={getattr(plan, 'candidate_id', '')!r}, "
-            f"feature_abi_id={getattr(handle, 'feature_abi_id', getattr(plan, 'feature_abi_id', ''))!r}"
+            f"torchlens_version={plan.torchlens_version!r}, "
+            f"boundary={plan.boundary!r}, "
+            f"candidate_id={plan.candidate_id!r}, "
+            f"feature_abi_id={plan.feature_abi_id!r}"
         )
 
-    def compute_loss(self, outputs: Any, targets: Any = None, loss_fn=None) -> torch.Tensor:
+    def compute_loss(self, outputs: Any, targets: Any = None, loss_fn=None) -> Any:
         return compute_loss(outputs, targets, loss_fn)
 
-    def run_eval(self, runtime_handle: SplitRuntimeHandle | SplitPlan, inputs: Any) -> Any:
+    def run_eval(self, runtime_handle: TorchLensRuntimeHandle | SplitPlacementPlan, inputs: Any) -> Any:
         handle = self.get_runtime_handle(runtime_handle)
-        with torch.no_grad():
+        call = ModelInputs.from_value(inputs)
+        with inference_context(handle.backend.framework_backend):
             try:
-                boundary = handle.backend.run_prefix(*normalize_inputs(inputs))
+                boundary = handle.backend.run_prefix(*call.args, input_kwargs=dict(call.kwargs))
                 return handle.backend.run_suffix(boundary)
             except Exception as exc:
                 raise RuntimeError(f"TorchLens split eval failed ({self._runtime_context(handle)}).") from exc
 
     def run_train(
         self,
-        runtime_handle: SplitRuntimeHandle | SplitPlan,
+        runtime_handle: TorchLensRuntimeHandle | SplitPlacementPlan,
         inputs: Any,
         targets: Any,
         *,
@@ -254,8 +162,11 @@ class AutoSplitSession:
         suffix_optimizer=None,
     ) -> dict[str, Any]:
         handle = self.get_runtime_handle(runtime_handle)
+        if loss_fn is None:
+            raise ValueError("Split training requires an explicit loss_fn.")
+        call = ModelInputs.from_value(inputs)
         try:
-            boundary = handle.backend.run_prefix(*normalize_inputs(inputs), training=True)
+            boundary = handle.backend.run_prefix(*call.args, training=True, input_kwargs=dict(call.kwargs))
             loss, boundary_grads = handle.backend.train_suffix(
                 boundary,
                 targets,
@@ -280,7 +191,7 @@ class AutoSplitSession:
 
     def run_suffix_eval(
         self,
-        runtime_handle: SplitRuntimeHandle | SplitPlan,
+        runtime_handle: TorchLensRuntimeHandle | SplitPlacementPlan,
         boundary,
     ) -> Any:
         handle = self.get_runtime_handle(runtime_handle)
@@ -288,7 +199,7 @@ class AutoSplitSession:
 
     def run_suffix_train(
         self,
-        runtime_handle: SplitRuntimeHandle | SplitPlan,
+        runtime_handle: TorchLensRuntimeHandle | SplitPlacementPlan,
         boundary,
         targets: Any,
         *,
@@ -296,6 +207,8 @@ class AutoSplitSession:
         optimizer=None,
     ) -> dict[str, Any]:
         handle = self.get_runtime_handle(runtime_handle)
+        if loss_fn is None:
+            raise ValueError("Split training requires an explicit loss_fn.")
         loss, boundary_grads = handle.backend.train_suffix(
             boundary,
             targets,

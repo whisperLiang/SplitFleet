@@ -17,13 +17,6 @@ from splitfleet.proto import server_model_pb2_grpc
 from splitfleet.proto import server_model_pb2
 
 
-class ClientException(Exception):
-    """Exception indicating that the client invoked a method it should not have. For instance,
-    server model configuration should be taken care of by the server, and any attempt
-    at doing so by the client will result in an exception. The client may only use this proxy
-    for computing predictions and for requesting gradient updates."""
-
-
 class FutureResponse:
     def __init__(self, response_future):
         self.response_future = response_future
@@ -136,7 +129,7 @@ class GrpcServerModelProxy(ServerModelProxy):
             metadata=batch_data.metadata,
         )
         self.request_queue.put(ins)
-        def get_future_fuction():
+        def get_future_response():
             res = next(self.response_stream)
             batch_data = BatchData(
                 data=from_grpc_format(res.data),
@@ -145,8 +138,7 @@ class GrpcServerModelProxy(ServerModelProxy):
             )
             return self._parse_response_args(batch_data)
 
-        future_response = FutureResponse(get_future_fuction)
-        return future_response
+        return FutureResponse(get_future_response)
 
     def close_stream(self):
         if self.request_queue is None:
@@ -156,7 +148,3 @@ class GrpcServerModelProxy(ServerModelProxy):
         ))
         res = next(self.response_stream)
         assert control_code_from_proto(res.control_code) == ControlCode.STREAM_CLOSED_OK
-
-
-    def get_pending_batches_count(self) -> int:
-        raise Exception("TODO")

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import pytest
 import torch
 from torch import nn
 
 from splitfleet.autosplit.torchlens_backend import TorchLensSplitBackend
+from splitfleet.autosplit.planner import AutoSplitPlanner
+from splitfleet.autosplit.types import PlacementConstraint
+from splitfleet.tasks import ModelInputs
 from splitfleet.autosplit.torchlens_contract import (
     build_feature_abi_spec,
     build_runtime_contract,
@@ -95,6 +99,78 @@ def test_torchlens_trace_preserves_user_tl_prefixed_attributes() -> None:
     assert model.tl_user_marker == "keep-me"
 
 
+class FlattenBatchNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.first = nn.Linear(4, 8)
+        self.last = nn.Linear(8, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.last(self.first(x).reshape(-1, 8))
+
+
+@pytest.mark.parametrize("batch_axes", [None, {}])
+def test_reshape_payload_matches_captured_boundary_and_enforces_limit(batch_axes) -> None:
+    model = FlattenBatchNet().eval()
+    inputs = torch.randn(2, 10, 4)
+    boundary = "after:reshape_1_2:1"
+    placement = AutoSplitPlanner().plan(
+        model, inputs, boundary=boundary, batch_axes=batch_axes, dynamic_batch=(1, 8),
+    )
+    handle = placement.metadata["_runtime_handle"]
+    capture_batch = handle.runtime.traced_batch_size
+    payload = handle.backend.run_prefix(inputs[:capture_batch])
+    actual_bytes = sum(tensor.numel() * tensor.element_size() for tensor in payload.tensors.values())
+
+    assert placement.payload_bytes == actual_bytes == capture_batch * 10 * 8 * 4
+    assert placement.candidate_descriptor["descriptor"]["payload_batch_size"] == capture_batch
+    assert all(
+        candidate.boundary != boundary
+        for candidate in handle.backend.enumerate_candidates(max_payload_bytes=64)
+    )
+    with pytest.raises(RuntimeError, match="max_payload_bytes"):
+        AutoSplitPlanner().plan(
+            model, inputs, boundary=boundary, batch_axes=batch_axes,
+            constraints=PlacementConstraint(max_payload_bytes=64),
+        )
+
+
+class ResidualKeywordNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.first = nn.Linear(4, 4)
+        self.last = nn.Linear(4, 2)
+
+    def forward(self, x: torch.Tensor, *, scale: torch.Tensor) -> torch.Tensor:
+        return self.last((self.first(x).relu() + x) * scale)
+
+
+@pytest.mark.parametrize("boundary", ["before:linear_1_1:1", "after:add_1_3:1"])
+def test_planner_preserves_explicit_multitensor_cut_or_rejects_it(boundary: str) -> None:
+    model = ResidualKeywordNet().eval()
+    inputs = ModelInputs((torch.randn(2, 4),), {"scale": torch.randn(2, 1)})
+    placement = AutoSplitPlanner().plan(model, inputs, boundary=boundary)
+
+    assert placement.boundary == boundary
+    # Before first: x and scale. After the residual add: its result and scale.
+    assert len(placement.boundary_tensor_labels) == 2
+    handle = placement.metadata["_runtime_handle"]
+    kind, node_id = boundary.split(":", 1)
+    assert handle.runtime.plan.target_node_id == node_id
+    assert (node_id in handle.runtime.plan.prefix_node_ids) == (kind == "after")
+    assert (node_id in handle.runtime.plan.suffix_node_ids) == (kind == "before")
+    payload = handle.backend.run_prefix(*inputs.args, input_kwargs=dict(inputs.kwargs))
+    torch.testing.assert_close(
+        handle.backend.run_suffix(payload), model(*inputs.args, **inputs.kwargs),
+    )
+
+    with pytest.raises(RuntimeError, match="max_frontier_size"):
+        AutoSplitPlanner().plan(
+            model, inputs, boundary=boundary,
+            constraints=PlacementConstraint(max_frontier_size=1),
+        )
+
+
 def test_feature_abi_is_batch_symbolic_and_runtime_identity_tolerant() -> None:
     schema_b1 = {
         "x": {
@@ -113,7 +189,7 @@ def test_feature_abi_is_batch_symbolic_and_runtime_identity_tolerant() -> None:
     layout = {"x": {"dtype": "torch.float32", "shape_without_batch": [8], "rank": 2}}
     cuda_layout = {"x": {"dtype": "torch.float32", "shape_without_batch": [8], "rank": 2, "device": "cuda:0"}}
     spec_b1 = build_feature_abi_spec(
-        torchlens_version="2.31.0",
+        torchlens_version="2.34.1",
         model_family="toy",
         model_name="ToyNet",
         canonical_split_key="after:x",
@@ -126,7 +202,7 @@ def test_feature_abi_is_batch_symbolic_and_runtime_identity_tolerant() -> None:
         dynamic_batch=(1, 8),
     )
     spec_b2 = build_feature_abi_spec(
-        torchlens_version="2.31.0",
+        torchlens_version="2.34.1",
         model_family="toy",
         model_name="ToyNet",
         canonical_split_key="after:x",
@@ -167,8 +243,8 @@ def test_feature_abi_is_batch_symbolic_and_runtime_identity_tolerant() -> None:
         boundary_tensor_labels=["x"],
         boundary_schema=schema_b1,
         feature_layout=layout,
-        torchlens_version="2.31.0",
-        runtime_version="2.31.0",
+        torchlens_version="2.34.1",
+        runtime_version="2.34.1",
         trace_batch_size=1,
     )
     cloud_contract = build_runtime_contract(
@@ -179,14 +255,14 @@ def test_feature_abi_is_batch_symbolic_and_runtime_identity_tolerant() -> None:
         boundary_tensor_labels=["x"],
         boundary_schema=schema_b2,
         feature_layout=cuda_layout,
-        torchlens_version="2.31.0",
-        runtime_version="2.31.0",
+        torchlens_version="2.34.1",
+        runtime_version="2.34.1",
         trace_batch_size=2,
     )
     compatibility = classify_contract_compatibility(edge_contract, cloud_contract)
     assert compatibility["compatible"] is True
     assert compatibility["reason"] == "runtime_identity_changed_but_feature_abi_compatible"
-    assert edge_contract["torchlens_version"] == "2.31.0"
+    assert edge_contract["torchlens_version"] == "2.34.1"
 
 
 def test_feature_abi_rejects_label_order_dtype_and_shape_changes() -> None:
@@ -234,3 +310,24 @@ def test_feature_abi_rejects_label_order_dtype_and_shape_changes() -> None:
     assert feature_abi_id(base) != feature_abi_id(reordered)
     assert feature_abi_id(base) != feature_abi_id(dtype_changed)
     assert feature_abi_id(base) != feature_abi_id(shape_changed)
+
+
+@pytest.mark.parametrize(
+    "legacy_contract",
+    [
+        {"feature_layout_id": "matching-legacy-layout"},
+        {"feature_abi_spec": {"boundary_tensor_labels": ["x"]}},
+        {"feature_abi_spec": {}},
+    ],
+)
+def test_contract_requires_explicit_feature_abi_id(legacy_contract) -> None:
+    compatibility = classify_contract_compatibility(legacy_contract, legacy_contract)
+
+    assert compatibility["compatible"] is False
+    assert compatibility["reason"] == "feature_abi_id"
+
+
+@pytest.mark.parametrize("payload", ["invalid-json", "[]", "null"])
+def test_malformed_contract_is_rejected(payload: str) -> None:
+    with pytest.raises(ValueError):
+        classify_contract_compatibility(payload, {"feature_abi_id": "abi"})

@@ -71,3 +71,28 @@ def test_candidate_discovery_names_the_required_cut_count() -> None:
 
     with pytest.raises(RuntimeError, match="distinct cuts are required"):
         discover_split_candidates(model, torch.zeros(2, 4))
+
+
+def test_candidate_discovery_rejects_graph_without_semantic_module_paths() -> None:
+    model = nn.Sequential(
+        nn.Linear(4, 8),
+        nn.ReLU(),
+        nn.Linear(8, 8),
+        nn.ReLU(),
+        nn.Linear(8, 8),
+        nn.ReLU(),
+        nn.Linear(8, 8),
+        nn.ReLU(),
+        nn.Linear(8, 8),
+        nn.ReLU(),
+        nn.Linear(8, 2),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        discover_split_candidates(model, torch.zeros(2, 4))
+
+    message = str(exc_info.value)
+    assert "semantic split 'stem'" in message
+    assert "available module paths" in message
+    assert "'0'" in message
+    assert "'5'" in message

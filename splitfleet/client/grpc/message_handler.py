@@ -4,8 +4,9 @@ from flwr.client.client import (
     maybe_call_get_parameters,
     maybe_call_get_properties,
 )
-from flwr.client.typing import ClientFn
-from flwr.common import Context, Message
+from typing import Callable
+
+from flwr.common import Message
 from flwr.app.message_type import MessageType
 from flwr.common.constant import MessageTypeLegacy
 from flwr.common.recorddict_compat import (
@@ -20,14 +21,15 @@ from flwr.common.recorddict_compat import (
 )
 
 from splitfleet.common.constants import CLIENT_ID_CONFIG_KEY
+from splitfleet.client.client import Client
 from splitfleet.proto.server_model_pb2_grpc import ServerModelStub
 from splitfleet.server.server_model.proxy.grpc_server_model_proxy import GrpcServerModelProxy
 
 
-def handle_legacy_message_from_msgtype(
-    client_fn: ClientFn, message: Message, context: Context, server_model_stub: ServerModelStub
+def handle_message(
+    client_fn: Callable[[str], Client], message: Message, server_model_stub: ServerModelStub
 ) -> Message:
-    """Handle legacy message in the inner most mod."""
+    """Dispatch a Flower instruction with its companion server-model proxy."""
     cid = str(message.metadata.src_node_id)
     assert len(message.content.configs_records) == 1
     config_record = next(iter(message.content.configs_records.values()))
@@ -42,9 +44,6 @@ def handle_legacy_message_from_msgtype(
     client.set_server_model_proxy(
         server_model_proxy
     )
-    if hasattr(client, "set_context"):
-        client.set_context(context)
-
     message_type = message.metadata.message_type
 
     # Handle GetPropertiesIns

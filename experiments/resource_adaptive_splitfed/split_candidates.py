@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Sequence
 
 import torch
 
@@ -98,32 +98,28 @@ def discover_split_candidates(
         "layer3": matching(("layer3",)),
         "layer4": matching(("layer4",)),
     }
-    quantiles = {"stem": 0.05, "maxpool": 0.12, "layer1": 0.25, "layer2": 0.45, "layer3": 0.65, "layer4": 0.88}
-    selected: dict[str, tuple[Any, str]] = {}
+    selected: dict[str, Any] = {}
     used: set[str] = set()
     for key in SEMANTIC_SPLIT_ORDER[:-1]:
         matches = [candidate for candidate in semantic_matches[key] if candidate.boundary not in used]
-        if matches:
-            chosen, source = max(matches, key=lambda candidate: int(candidate.node_index or 0)), "module_path"
-        else:
-            target = round(quantiles[key] * (len(raw) - 1))
-            ordered = sorted(raw, key=lambda candidate: abs(raw.index(candidate) - target))
-            chosen = next(
-                (candidate for candidate in ordered if candidate.boundary not in used), None
+        if not matches:
+            available_paths = sorted({
+                str(getattr(node, "module_path", "") or "")
+                for node in graph.nodes
+                if getattr(node, "module_path", "")
+            })
+            raise RuntimeError(
+                f"TorchLens did not expose a unique trainable boundary for semantic split {key!r}; "
+                f"available module paths: {available_paths!r}."
             )
-            if chosen is None:
-                raise RuntimeError(
-                    f"No unused trainable split candidate remains for {key!r}; "
-                    f"{len(raw)} candidates were exposed and {len(used)} are already assigned."
-                )
-            source = "graph_quantile_fallback"
-        selected[key] = (chosen, source)
+        chosen = max(matches, key=lambda candidate: int(candidate.node_index or 0))
+        selected[key] = chosen
         used.add(chosen.boundary)
 
     all_parameters = [name for name, _ in model.named_parameters()]
     descriptors: list[ExperimentSplitCandidate] = []
     for key in SEMANTIC_SPLIT_ORDER[:-1]:
-        candidate, mapping_source = selected[key]
+        candidate = selected[key]
         handle = backend.repartition(candidate.boundary)
         node = handle.runtime.trace_graph.nodes[int(candidate.node_index)]
         prefix_names = _parameter_names_for_node_ids(
@@ -148,7 +144,7 @@ def discover_split_candidates(
                 client_parameter_names=prefix_names,
                 server_parameter_names=[name for name in all_parameters if name not in prefix_names],
                 graph_signature=candidate.graph_signature,
-                mapping_source=mapping_source,
+                mapping_source="module_path",
             )
         )
     descriptors.append(

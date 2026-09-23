@@ -134,8 +134,11 @@ def decode_tensor(envelope: TensorEnvelope, device: str | torch.device = "cpu") 
         raise ValueError(
             f"Tensor payload length mismatch: expected {expected}, got {len(envelope.payload)}"
         )
-    raw = torch.frombuffer(bytearray(envelope.payload), dtype=torch.uint8)
-    value = raw.view(dtype).reshape(envelope.shape).clone().to(device)
+    if expected == 0:
+        value = torch.empty(envelope.shape, dtype=dtype, device=device)
+    else:
+        raw = torch.frombuffer(bytearray(envelope.payload), dtype=torch.uint8)
+        value = raw.view(dtype).reshape(envelope.shape).clone().to(device)
     if envelope.requires_grad and (value.is_floating_point() or value.is_complex()):
         value.requires_grad_(True)
     return value

@@ -33,6 +33,8 @@ def run_real_model_test_isolated(request) -> bool:
     )
     if result.returncode != 0:
         pytest.fail(f"isolated real-model test failed:\n{result.stdout}", pytrace=False)
+    if " skipped" in result.stdout:
+        pytest.skip(result.stdout.strip().splitlines()[-1])
     return True
 
 
@@ -113,21 +115,25 @@ def nested_tensor_loss(output) -> torch.Tensor:
     return total
 
 
-def make_runtime(model, trace_inputs, boundary, dynamic_batch=(2, 3)):
+def make_runtime(model, trace_inputs, boundary, dynamic_batch=(2, 3), *, batch_axes=None):
     return prepare_torchlens_runtime(
         model,
         trace_inputs,
         boundary=boundary,
         trainable=True,
         dynamic_batch=dynamic_batch,
+        batch_axes=batch_axes,
     )
 
 
 def run_split_inference_equivalence(
     model, trace_inputs, runtime_inputs, boundary, *, dynamic_batch=(2, 3),
+    batch_axes=None,
 ):
     model.eval()
-    runtime = make_runtime(model, trace_inputs, boundary, dynamic_batch=dynamic_batch)
+    runtime = make_runtime(
+        model, trace_inputs, boundary, dynamic_batch=dynamic_batch, batch_axes=batch_axes,
+    )
     with torch.no_grad():
         direct = model(*normalize_inputs(runtime_inputs))
         boundary_payload = runtime.backend.run_prefix(*normalize_inputs(runtime_inputs))
@@ -143,10 +149,10 @@ def run_split_inference_equivalence(
 
 def run_split_training_smoke(
     model, trace_inputs, runtime_inputs, targets, loss_fn, boundary="50%", *,
-    dynamic_batch=(2, 3),
+    dynamic_batch=(2, 3), batch_axes=None,
 ):
     model.train()
-    runtime = make_runtime(model, trace_inputs, boundary, dynamic_batch=dynamic_batch)
+    runtime = make_runtime(model, trace_inputs, boundary, dynamic_batch=dynamic_batch, batch_axes=batch_axes)
     optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=1e-4)
     before = clone_trainable_state(model)
     boundary = runtime.backend.run_prefix(*normalize_inputs(runtime_inputs), training=True)
@@ -184,7 +190,6 @@ def run_boundary_serde_roundtrip(runtime, boundary):
     output1 = runtime.backend.run_suffix(boundary)
     output2 = runtime.backend.run_suffix(restored)
     assert restored.tensors
-    assert hasattr(restored, "passthrough_inputs")
     assert_nested_shape_equal(output1, output2)
     assert_nested_close(output1, output2)
     return restored

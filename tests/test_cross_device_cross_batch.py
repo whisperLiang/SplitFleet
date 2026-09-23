@@ -58,9 +58,6 @@ class InProcessServerModelProxy(ServerModelProxy):
     def close_stream(self):
         return None
 
-    def get_pending_batches_count(self) -> int:
-        return 0
-
 
 def _ndarrays(model: nn.Module) -> list[np.ndarray]:
     return [tensor.detach().cpu().numpy() for tensor in model.state_dict().values()]

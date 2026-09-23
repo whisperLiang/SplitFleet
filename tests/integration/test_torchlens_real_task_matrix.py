@@ -200,8 +200,8 @@ def test_real_image_classification_models(request, name, builder, input_shape, b
     torch.manual_seed(100)
     model, num_classes = builder()
     trace_inputs = torch.randn(2, *input_shape)
-    # TorchLens 2.31 cannot yet replay Swin window reshapes across a changed
-    # concrete batch; other models in this matrix cover dynamic batch.
+    # Swin is checked at the captured batch size in this matrix; the other
+    # architectures additionally exercise a changed runtime batch size.
     runtime_batch = 2 if name == "timm_swin_tiny" else 3
     runtime_inputs = torch.randn(runtime_batch, *input_shape)
     labels = torch.randint(0, num_classes, (runtime_batch,))
@@ -209,6 +209,15 @@ def test_real_image_classification_models(request, name, builder, input_shape, b
     run_split_inference_equivalence(
         model, trace_inputs, runtime_inputs, boundary, dynamic_batch=dynamic_batch,
     )
+    if name == "timm_swin_tiny":
+        # The native B=1 -> B=2 training probe fails numerically in 2.34.1.
+        # Preserve that refusal, then explicitly capture the requested shape.
+        from torchlens.split.errors import SplitBoundaryError
+        model.train()
+        dynamic = prepare_torchlens_runtime(model, trace_inputs, boundary=boundary, dynamic_batch=dynamic_batch)
+        with pytest.raises(SplitBoundaryError, match="batch.*probe"):
+            dynamic.backend.run_prefix(runtime_inputs, training=True)
+        del dynamic
     run_split_training_smoke(
         model,
         trace_inputs,
@@ -217,6 +226,7 @@ def test_real_image_classification_models(request, name, builder, input_shape, b
         nn.CrossEntropyLoss(),
         boundary=boundary,
         dynamic_batch=dynamic_batch,
+        batch_axes={} if name == "timm_swin_tiny" else None,
     )
 
 
@@ -321,13 +331,23 @@ def test_real_segmentation_models(request, name, builder, input_shape, boundary)
     runtime = run_split_inference_equivalence(model, trace_inputs, runtime_inputs, boundary)
     split_output = runtime.backend.run_suffix(runtime.backend.run_prefix(runtime_inputs))
     assert split_output.shape[:2] == (3, num_classes)
+    if name == "deeplabv3_resnet50":
+        # Its pooled BatchNorm cannot train at canonical B=1. Native probing
+        # B=2 has no independent probe and must refuse extrapolation to B=3.
+        from torchlens.split.errors import SplitBoundaryError
+        model.train()
+        dynamic = prepare_torchlens_runtime(model, trace_inputs, boundary=boundary)
+        with pytest.raises(SplitBoundaryError, match="batch.*probe"):
+            dynamic.backend.run_prefix(runtime_inputs, training=True)
+        del dynamic
     run_split_training_smoke(
         model,
-        trace_inputs,
+        runtime_inputs if name == "deeplabv3_resnet50" else trace_inputs,
         runtime_inputs,
         mask,
         nn.CrossEntropyLoss(),
         boundary=boundary,
+        batch_axes={} if name == "deeplabv3_resnet50" else None,
     )
 
 

@@ -28,12 +28,7 @@ from splitfleet.common.address import parse_address
 from splitfleet.proto import server_model_pb2_grpc
 
 
-ADDRESS_DRIVER_API = "0.0.0.0:9091"
-ADDRESS_FLEET_API_GRPC_RERE = "0.0.0.0:9092"
 ADDRESS_FLEET_API_GRPC_BIDI = "[::]:8080"  # IPv6 to keep start_server compatible
-ADDRESS_FLEET_API_REST = "0.0.0.0:9093"
-
-DATABASE = ":flwr-in-memory-state:"
 
 
 def init_defaults(
@@ -55,8 +50,6 @@ def init_defaults(
             )
             if hasattr(strategy, "bind_stage_runtime_manager"):
                 strategy.bind_stage_runtime_manager(server_model_manager)
-            for worker_spec in getattr(strategy, "worker_specs", []):
-                server_model_manager.register_worker(worker_spec)
             if hasattr(strategy, "get_or_create_placement_plan"):
                 server_model_manager.set_placement_plan(
                     strategy.get_or_create_placement_plan()

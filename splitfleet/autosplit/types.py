@@ -6,8 +6,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Optional
 
-from splitfleet.autosplit.boundary import BoundaryPayload
-
 
 class ReplicaScope(str, Enum):
     """Supported state-sharing semantics for server-side suffix replicas."""
@@ -35,7 +33,7 @@ class PlacementConstraint:
     """Hard constraints applied before scoring prefix/suffix placements."""
 
     max_stages: int = 2
-    max_frontier_size: int = 1
+    max_frontier_size: int | None = None
     max_candidates: int = 32
     max_payload_bytes: int = 32 * 1024 * 1024
     max_stage_memory_bytes: Optional[int] = None
@@ -81,7 +79,6 @@ class SplitRuntimePlan:
     model_name: str = ""
     model_family: str = ""
     canonical_split_key: str = ""
-    feature_layout_id: str = ""
     feature_abi_id: str = ""
     runtime_contract: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -120,17 +117,12 @@ class SplitPlacementPlan:
     dynamic_batch: tuple[int, int] | None = None
     trace_batch_size: int | None = None
     canonical_split_key: str = ""
-    feature_layout_id: str = ""
     feature_abi_id: str = ""
     runtime_contract: dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
     worker_specs: Dict[str, WorkerSpec] = field(default_factory=dict)
     objective: PlacementObjective = field(default_factory=PlacementObjective)
     constraints: PlacementConstraint = field(default_factory=PlacementConstraint)
-
-    @property
-    def split_config_id(self) -> str:
-        return self.plan_id
 
     @property
     def stage_count(self) -> int:
@@ -142,8 +134,3 @@ class SplitPlacementPlan:
             "prefix": self.prefix_worker_id,
             "suffix": self.suffix_worker_id,
         }
-
-
-# Deprecated aliases retained while callers migrate to the control-plane name.
-SplitPlan = SplitPlacementPlan
-PlacementPlan = SplitPlacementPlan

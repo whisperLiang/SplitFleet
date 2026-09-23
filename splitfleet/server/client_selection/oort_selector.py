@@ -50,7 +50,6 @@ class OortSelector(ClientSelector):
         self.exploit_clients: list[str] = []
         self.explore_clients: list[str] = []
         self.blacklist: set[str] = set()
-        self._relaxed_blacklist: list[str] = []
         self._rng = random.Random(self.config.seed)
         self._last_selection_round: int | None = None
         self._last_recorded_selection_round: int | None = None
@@ -98,12 +97,6 @@ class OortSelector(ClientSelector):
             if self.clients[cid].available
         ]
         eligible = [cid for cid in available if cid not in self.blacklist]
-        relaxed_blacklist = self._relax_blacklist_if_needed(
-            eligible=eligible,
-            available=available,
-            num_clients=num_clients,
-        )
-        self._relaxed_blacklist = relaxed_blacklist
         if len(eligible) <= num_clients:
             self._update_pacer(round_id)
             self._update_round_prefer_duration()
@@ -414,32 +407,12 @@ class OortSelector(ClientSelector):
         overused.sort(key=lambda state: (-state.selected_count, state.cid))
         self.blacklist = {state.cid for state in overused[:max_blacklist]}
 
-    def _relax_blacklist_if_needed(
-        self,
-        *,
-        eligible: list[str],
-        available: Sequence[str],
-        num_clients: int,
-    ) -> list[str]:
-        if len(eligible) >= num_clients:
-            return []
-        fallback = [
-            cid
-            for cid in available
-            if cid in self.blacklist and cid not in eligible
-        ]
-        needed = min(num_clients - len(eligible), len(fallback))
-        relaxed = fallback[:needed]
-        eligible.extend(relaxed)
-        return relaxed
-
     def _metadata(self) -> dict[str, Any]:
         return {
             "exploration": self.exploration,
             "round_threshold": self.round_threshold,
             "round_prefer_duration": self.round_prefer_duration,
             "blacklist": sorted(self.blacklist),
-            "relaxed_blacklist": list(self._relaxed_blacklist),
         }
 
     @staticmethod

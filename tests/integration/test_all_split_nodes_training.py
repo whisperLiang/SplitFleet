@@ -14,6 +14,9 @@ def _isolated(request, *, env_overrides=None) -> bool:
     if os.environ.get("SPLITFLEET_ALL_NODES_CHILD") == "1":
         return False
     env = os.environ.copy()
+    for variable in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                     "TF_NUM_INTRAOP_THREADS", "TF_NUM_INTEROP_THREADS"):
+        env[variable] = "1"
     env["SPLITFLEET_ALL_NODES_CHILD"] = "1"
     env.update(env_overrides or {})
     result = subprocess.run(
@@ -104,51 +107,17 @@ def _all_nodes(model, inputs, targets, loss_fn, backend_name: str) -> None:
         trained.append(candidate.boundary)
 
     assert len(trained) + len(non_differentiable) + len(replay_only) == len(candidates)
-    frontier_trained = 0
-    if not trained:
-        # Some native IRs (currently tinygrad UOps) expose only constant/shape
-        # nodes as single-node boundaries. Exercise the differentiable frontier
-        # selected by TorchLens as well, while still accounting for every node
-        # above rather than silently dropping non-differentiable candidates.
-        runtime = prepare_torchlens_runtime(
-            model, inputs, boundary="50%", trainable=True,
-            dynamic_batch=dynamic_batch,
-        )
-        boundary = runtime.backend.run_prefix(*args, training=True)
-        before_state = adapter.export_ndarrays(model)
-        optimizer = None
-        if backend_name != "jax":
-            optimizer = adapter.build_optimizer(model, {"name": "sgd", "lr": 1e-4})
-            if backend_name == "tf" and hasattr(optimizer, "build"):
-                optimizer.build(model.trainable_variables)
-        loss, gradients = runtime.backend.train_suffix(
-            boundary, targets, loss_fn=loss_fn, optimizer=optimizer,
-        )
-        assert np.isfinite(adapter.scalar_value(loss))
-        assert gradients, f"{backend_name} has no differentiable split-training frontier"
-        prefix_result = runtime.backend.backward_prefix(
-            boundary, gradients, optimizer=optimizer,
-        )
-        if backend_name == "jax":
-            import jax
-
-            adapter.bind_external_params(
-                jax.tree_util.tree_map(
-                    lambda parameter, grad: parameter - 1e-4 * grad,
-                    adapter.external_params,
-                    prefix_result["inputs"][0],
-                )
-            )
-        after_state = adapter.export_ndarrays(model)
-        assert any(
-            not np.array_equal(before, after)
-            for before, after in zip(before_state, after_state, strict=True)
-        ), f"{backend_name} frontier updated no model parameter"
-        frontier_trained = 1
+    if backend_name == "tinygrad":
+        # Every nonterminal cut in this pointwise float model carries a
+        # differentiable frontier. A lazy decoded NPY COPY used to silently
+        # turn all 24 cuts into apparent non-differentiable successes.
+        assert len(trained) == 24
+        assert not non_differentiable
+    assert trained, f"{backend_name} has no trainable enumerated split boundary"
     print(
         f"ALL_SPLIT_NODES backend={backend_name} total={len(candidates)} "
         f"trained={len(trained)} non_differentiable={len(non_differentiable)} "
-        f"terminal={len(replay_only)} frontier_trained={frontier_trained}"
+        f"terminal={len(replay_only)}"
     )
 
 
@@ -227,7 +196,7 @@ def test_paddle_lenet_ocr_all_split_nodes_train(request) -> None:
 
 
 def test_tinygrad_fcn_segmentation_all_split_nodes_train(request) -> None:
-    if _isolated(request, env_overrides={"DEVICE": "CPU", "DEBUG": "0"}): return
+    if _isolated(request, env_overrides={"DEV": "CPU", "DEBUG": "0"}): return
     from tinygrad import Tensor
 
     class FCNSegmenter:
@@ -244,7 +213,8 @@ def test_tinygrad_fcn_segmentation_all_split_nodes_train(request) -> None:
             return (images * self.scale + self.bias).relu().sigmoid()
 
     loss_fn = lambda output, target: ((output - target) ** 2).mean()
-    inputs = Tensor.randn(2, 1, 8, 8).realize()
+    # Exercise both sides of ReLU with reproducible nonzero parameter gradients.
+    inputs = Tensor(np.linspace(-1.0, 1.0, 128, dtype=np.float32).reshape(2, 1, 8, 8)).realize()
     inputs.requires_grad = True
-    targets = Tensor.randn(2, 1, 8, 8).realize()
+    targets = Tensor(np.zeros((2, 1, 8, 8), dtype=np.float32)).realize()
     _all_nodes(FCNSegmenter(), inputs, targets, loss_fn, "tinygrad")

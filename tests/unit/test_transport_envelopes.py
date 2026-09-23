@@ -53,7 +53,8 @@ def test_gradient_envelope_detects_corruption() -> None:
 
 @pytest.mark.parametrize(
     "source",
-    [torch.tensor(7, dtype=torch.int64), torch.tensor(1.25, dtype=torch.float32)],
+    [torch.tensor(7, dtype=torch.int64), torch.tensor(1.25, dtype=torch.float32),
+     torch.empty((0, 4)), torch.empty((0,), dtype=torch.int64)],
 )
 def test_scalar_tensor_envelope_round_trip(source: torch.Tensor) -> None:
     restored = decode_tensor(encode_tensor("scalar", source))

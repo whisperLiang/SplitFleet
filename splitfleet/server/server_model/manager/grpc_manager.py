@@ -16,7 +16,6 @@ class GrpcServerModelManager(ServerModelManager):
         super().__init__()
         self.init_server_model_fn = lambda: init_server_model_fn().to_server_model()
         self.persistent_models = bool(persistent_models)
-        self.client_locks = {}
         self.spanned_server_models = {}
         self.active_server_model_ids = []
 

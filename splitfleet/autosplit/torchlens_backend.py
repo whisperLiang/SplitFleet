@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
 import torch
 import numpy as np
-from torchlens.split import after
-
 from splitfleet.autosplit.boundary import (
     BoundaryPayload,
     from_torchlens_boundary,
@@ -24,12 +22,13 @@ from splitfleet.autosplit.torchlens_candidate import (
 from splitfleet.autosplit.torchlens_contract import build_runtime_contract
 from splitfleet.autosplit.torchlens_runtime import (
     TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION,
-    first_tensor_batch_size,
-    infer_trace_batch_mode,
     make_split_spec,
+    _point,
     normalize_example_inputs,
+    normalize_model_call,
     prepare_split_runtime,
     repartition_split_runtime,
+    runtime_input_batch_size,
     torchlens_runtime_version,
     trace_signature,
 )
@@ -55,9 +54,6 @@ class TorchLensRuntimeHandle:
         self.plan.feature_abi_id = value
 
 
-SplitRuntimeHandle = TorchLensRuntimeHandle
-
-
 def _make_plan_id(graph_signature: str, split_id: str, boundary: str, mode: str) -> str:
     digest = hashlib.sha1(
         "|".join([graph_signature, split_id, boundary, mode]).encode("utf-8")
@@ -65,21 +61,8 @@ def _make_plan_id(graph_signature: str, split_id: str, boundary: str, mode: str)
     return f"torchlens_{digest[:12]}"
 
 
-def _iter_tensors(value: Any):
-    if hasattr(value, "shape") and hasattr(value, "dtype"):
-        yield value
-        return
-    if isinstance(value, Mapping):
-        for item in value.values():
-            yield from _iter_tensors(item)
-        return
-    if isinstance(value, (list, tuple)):
-        for item in value:
-            yield from _iter_tensors(item)
-
-
 def _runtime_device(runtime: Any) -> torch.device | None:
-    model = getattr(runtime, "model", None)
+    model = runtime.model
     if isinstance(model, torch.nn.Module):
         for tensor in model.parameters():
             return tensor.device
@@ -100,32 +83,6 @@ def _move_to_device(value: Any, device: torch.device | str | None) -> Any:
     if isinstance(value, tuple):
         return tuple(_move_to_device(item, device) for item in value)
     return value
-
-
-def _boundary_batch_matches(payload: BoundaryPayload, batch_size: int) -> bool:
-    for tensor in payload.tensors.values():
-        shape = tuple(getattr(tensor, "shape", ()) or ())
-        if shape and int(shape[0]) == batch_size:
-            return True
-    return False
-
-
-def _normalise_boundary_batch_metadata(
-    payload: BoundaryPayload,
-    inputs: tuple[Any, ...],
-) -> BoundaryPayload:
-    batch_size = first_tensor_batch_size(inputs)
-    if batch_size is None or not _boundary_batch_matches(payload, batch_size):
-        return payload
-    metadata = dict(payload.metadata)
-    metadata["batch_size"] = int(batch_size)
-    payload.metadata = metadata
-    payload.batch_size = int(batch_size)
-    return payload
-
-
-def _flatten_tensors(value: Any) -> list[torch.Tensor]:
-    return list(_iter_tensors(value))
 
 
 def _compare_outputs(expected: Any, actual: Any, backend: str = "torch") -> tuple[bool, float, float]:
@@ -191,10 +148,13 @@ class TorchLensSplitBackend:
         self.current_candidate: SplitCandidate | None = None
         self.candidates: list[SplitCandidate] = []
         self.trace_sample_input: Any = None
+        self.trace_sample_kwargs: dict[str, Any] = {}
+        self.dynamic_batch: tuple[int, int] | None = None
+        self.trace_batch_mode = "batch_gt1"
+        self.candidate_report: dict[str, Any] | None = None
         self.model_name = model_name
         self.model_family = model_family
         self.trace_batch_size: int | None = None
-        self.validation: dict[str, Any] | None = None
         self.framework_backend = "torch"
 
     def trace(
@@ -203,6 +163,8 @@ class TorchLensSplitBackend:
         sample_inputs: Any,
         *,
         split_spec: Any = None,
+        sample_kwargs: dict[str, Any] | None = None,
+        batch_axes: dict[str, int] | None = None,
         boundary: str = "50%",
         mode: str = "generated_eager",
         trainable: bool = True,
@@ -210,39 +172,50 @@ class TorchLensSplitBackend:
         trace_batch_mode: str | None = None,
         model_name: str | None = None,
         model_family: str | None = None,
-        **_: Any,
     ) -> "TorchLensSplitBackend":
+        if mode != "generated_eager":
+            raise ValueError(f"Unsupported split execution mode {mode!r}; use 'generated_eager'.")
         self.model = model
         self.model_name = model_name or self.model_name or model.__class__.__name__
         self.model_family = model_family or self.model_family or self.model_name
         self.trace_sample_input = normalize_example_inputs(sample_inputs)
+        self.trace_sample_kwargs = dict(sample_kwargs or {})
+        self.trace_sample_input, self.trace_sample_kwargs, batch_axes = normalize_model_call(
+            model, self.trace_sample_input, self.trace_sample_kwargs, batch_axes,
+        )
         from splitfleet.backends.utils import detect_torchlens_backend
-        self.framework_backend = detect_torchlens_backend(model, self.trace_sample_input)
-        self.trace_batch_size = first_tensor_batch_size(self.trace_sample_input)
-        resolved_trace_batch_mode = trace_batch_mode or infer_trace_batch_mode(self.trace_sample_input)
-        if dynamic_batch is None:
-            dynamic_batch = (2, 64) if resolved_trace_batch_mode == "batch_gt1" else (1, 64)
+        complete_inputs = (self.trace_sample_input, self.trace_sample_kwargs)
+        self.framework_backend = detect_torchlens_backend(model, complete_inputs)
+        if dynamic_batch is not None:
+            if len(dynamic_batch) != 2 or not 1 <= dynamic_batch[0] <= dynamic_batch[1]:
+                raise ValueError("dynamic_batch must be a positive inclusive (minimum, maximum) range")
         probe_boundary = "50%" if str(boundary) == "auto" else str(boundary)
         self.split_spec = split_spec or make_split_spec(
             probe_boundary,
-            dynamic_batch=dynamic_batch,
             trainable=trainable,
-            trace_batch_mode=resolved_trace_batch_mode,
-            mode=mode,
             backend=self.framework_backend,
+            batch_axes=batch_axes,
         )
         self.runtime = prepare_split_runtime(
             model,
             self.trace_sample_input,
             self.split_spec,
-            mode=mode,
+            input_kwargs=self.trace_sample_kwargs,
         )
+        self.trace_batch_size = self.runtime.batch_spec.user_batch_size
+        self.trace_batch_mode = trace_batch_mode or (
+            "batch_gt1" if (self.trace_batch_size or 1) > 1 else "batch_1"
+        )
+        self.dynamic_batch = dynamic_batch
+        if self.dynamic_batch is None and self.runtime.batch_spec.axes:
+            self.dynamic_batch = (2, 64) if self.trace_batch_mode == "batch_gt1" else (1, 64)
         self.current_candidate = candidate_from_plan(
             self.runtime,
             self.split_spec,
             self.runtime.plan,
             graph_signature=trace_signature(self.runtime),
         )
+        self.current_candidate = self._with_batch_contract(self.current_candidate)
         self.candidates = [self.current_candidate]
         return self
 
@@ -256,112 +229,91 @@ class TorchLensSplitBackend:
             raise RuntimeError("TorchLens split backend has no model.")
         return self.model
 
+    def _with_batch_contract(self, candidate: SplitCandidate) -> SplitCandidate:
+        return replace(candidate, dynamic_batch=self.dynamic_batch, trace_batch_mode=self.trace_batch_mode)
+
+    def split_points(self, *, diagnose: bool = True):
+        """Report every before/after compute boundary, including refusal reasons."""
+        report = self._ensure_runtime().split_points(diagnose=diagnose)
+        self.candidate_report = report.as_dict()
+        return report
+
     def enumerate_candidates(
         self,
         *,
         max_boundary_count: int | None = None,
         max_payload_bytes: int | None = None,
         max_candidates: int | None = None,
+        kinds: tuple[str, ...] = ("after",),
     ) -> list[SplitCandidate]:
+        if not kinds or any(kind not in ("before", "after") for kind in kinds):
+            raise ValueError("Candidate kinds must contain 'before' and/or 'after'.")
         runtime = self._ensure_runtime()
-        graph = getattr(runtime, "trace_graph", None)
-        if graph is None:
-            raise RuntimeError("TorchLens runtime does not expose trace_graph.")
+        report = self.split_points()
+        indexes = {node.canonical_id: index for index, node in enumerate(runtime.trace_graph.nodes)}
         candidates: list[SplitCandidate] = []
-        for node_index, node in enumerate(graph.nodes):
-            label = str(getattr(node, "label", "") or "")
-            if (
-                not label
-                or bool(getattr(node, "is_input", False))
-                or bool(getattr(node, "is_output", False))
-            ):
+        for site in report.supported:
+            if site.kind not in kinds:
                 continue
-            try:
-                spec = make_split_spec(
-                    after(label), dynamic_batch=self.split_spec.dynamic_batch,
-                    trainable=self.split_spec.trainable,
-                    backend=self.framework_backend,
-                )
-                candidate_runtime = repartition_split_runtime(runtime, spec)
-            except Exception:
-                continue
-            candidate = candidate_from_plan(
-                candidate_runtime,
-                spec,
-                candidate_runtime.plan,
-                node_index=node_index,
-                graph_signature=trace_signature(runtime),
-            )
+            candidate_runtime = runtime.at(site.point)
+            candidate = self._with_batch_contract(candidate_from_plan(
+                candidate_runtime, candidate_runtime.request, candidate_runtime.plan,
+                node_index=indexes[site.node_id],
+                graph_signature=trace_signature(candidate_runtime),
+            ))
+            candidate.descriptor["capabilities"] = site.as_dict()
             if max_boundary_count is not None and candidate.boundary_count > int(max_boundary_count):
                 continue
             if max_payload_bytes is not None and candidate.estimated_payload_bytes > int(max_payload_bytes):
                 continue
             candidates.append(candidate)
-        candidates.sort(
-            key=lambda item: (
-                int(item.estimated_payload_bytes),
-                int(item.boundary_count),
-                int(item.node_index if item.node_index is not None else 10**9),
-                item.candidate_id,
-            )
-        )
+        candidates.sort(key=lambda item: (
+            int(item.estimated_payload_bytes), int(item.boundary_count),
+            int(item.node_index if item.node_index is not None else 10**9), item.candidate_id,
+        ))
         if max_candidates is not None:
-            candidates = candidates[: max(0, int(max_candidates))]
+            candidates = candidates[:max(0, int(max_candidates))]
         self.candidates = candidates
         return candidates
 
     def repartition(self, boundary: str) -> TorchLensRuntimeHandle:
-        """Select another boundary while reusing the existing model capture."""
+        """Select another boundary while reusing capture and native batch semantics."""
         runtime = self._ensure_runtime()
-        if self.split_spec is None:
-            raise RuntimeError("TorchLens split backend has not been traced.")
-        spec = make_split_spec(
-            boundary,
-            dynamic_batch=self.split_spec.dynamic_batch,
-            trainable=self.split_spec.trainable,
-            backend=self.framework_backend,
-        )
+        spec = replace(runtime.request, point=_point(boundary))
         self.runtime = repartition_split_runtime(runtime, spec)
-        self.split_spec = spec
-        self.current_candidate = candidate_from_plan(
-            self.runtime,
-            spec,
-            self.runtime.plan,
+        self.split_spec = self.runtime.request
+        self.current_candidate = self._with_batch_contract(candidate_from_plan(
+            self.runtime, self.split_spec, self.runtime.plan,
             graph_signature=trace_signature(self.runtime),
-        )
+        ))
         return self.make_handle()
 
     def split(self, candidate: SplitCandidate | None = None) -> SplitCandidate:
         chosen = candidate or self.current_candidate
         if chosen is None:
             raise RuntimeError("No TorchLens split candidate is selected.")
-        model = self._ensure_model()
-        if self.trace_sample_input is None or self.split_spec is None:
-            raise RuntimeError("TorchLens split backend has not been traced.")
-        self.split_spec = make_split_spec(
-            chosen.boundary, dynamic_batch=self.split_spec.dynamic_batch,
-            trainable=self.split_spec.trainable,
-            backend=self.framework_backend,
-        )
-        self.runtime = prepare_split_runtime(model, self.trace_sample_input, self.split_spec)
-        self.current_candidate = candidate_from_plan(
-            self.runtime,
-            self.split_spec,
-            self.runtime.plan,
-            node_index=chosen.node_index,
-            graph_signature=trace_signature(self.runtime),
-        )
+        self.repartition(chosen.boundary)
+        self.current_candidate = replace(self.current_candidate, node_index=chosen.node_index, layer_index=chosen.layer_index)
         return self.current_candidate
 
-    def run_prefix(self, *inputs: Any, training: bool = False) -> BoundaryPayload:
+    def run_prefix(
+        self, *inputs: Any, training: bool = False,
+        input_kwargs: dict[str, Any] | None = None,
+    ) -> BoundaryPayload:
         runtime = self._ensure_runtime()
         args = normalize_example_inputs(inputs)
+        kwargs = self.trace_sample_kwargs if input_kwargs is None else input_kwargs
+        args, kwargs, _ = normalize_model_call(self._ensure_model(), args, kwargs)
+        batch_size = runtime_input_batch_size(runtime, args, kwargs)
+        if self.dynamic_batch is not None and batch_size is not None:
+            low, high = self.dynamic_batch
+            if not low <= batch_size <= high:
+                raise ValueError(f"Input batch size {batch_size} is outside configured dynamic_batch={self.dynamic_batch}.")
         raw = (
-            runtime.run_training_prefix(*args)
-            if training and hasattr(runtime, "run_training_prefix")
-            else runtime.run_prefix(*args)
+            runtime.run_training_prefix(*args, input_kwargs=kwargs)
+            if training else runtime.run_prefix(*args, input_kwargs=kwargs)
         )
-        return _normalise_boundary_batch_metadata(from_torchlens_boundary(raw), args)
+        return from_torchlens_boundary(raw)
 
     def run_suffix(self, boundary: BoundaryPayload) -> Any:
         runtime = self._ensure_runtime()
@@ -388,6 +340,8 @@ class TorchLensSplitBackend:
         report a fabricated split.
         """
 
+        if loss_fn is None:
+            raise ValueError("Split training requires an explicit loss_fn.")
         runtime = self._ensure_runtime()
         native = to_torchlens_boundary(boundary)
         device = _runtime_device(runtime)
@@ -418,15 +372,12 @@ class TorchLensSplitBackend:
         optimizer=None,
     ) -> Any:
         runtime = self._ensure_runtime()
-        backward = getattr(runtime, "backward_prefix", None)
-        if not callable(backward):
-            raise RuntimeError("TorchLens SplitRuntime does not support backward_prefix.")
         native = to_torchlens_boundary(boundary)
         device = _runtime_device(runtime)
         if device is not None:
             native = native.to(device)
             boundary_grads = _move_to_device(boundary_grads, device)
-        return backward(native, boundary_grads=boundary_grads, optimizer=optimizer)
+        return runtime.backward_prefix(native, boundary_grads=boundary_grads, optimizer=optimizer)
 
     def validate_candidate(self, candidate: SplitCandidate | None = None) -> dict[str, Any]:
         chosen = candidate or self.current_candidate
@@ -455,9 +406,9 @@ class TorchLensSplitBackend:
         inputs = normalize_example_inputs(self.trace_sample_input)
         try:
             with inference_context(self.framework_backend):
-                boundary = self.run_prefix(*inputs)
+                boundary = self.run_prefix(*inputs, input_kwargs=self.trace_sample_kwargs)
                 replay_output = self.run_suffix(boundary)
-                expected_output = model(*inputs)
+                expected_output = model(*inputs, **self.trace_sample_kwargs)
             success, max_abs, max_rel = _compare_outputs(expected_output, replay_output, self.framework_backend)
         except Exception as exc:
             return {
@@ -482,8 +433,8 @@ class TorchLensSplitBackend:
         candidate = self.current_candidate
         if candidate is None:
             raise RuntimeError("No TorchLens split candidate is selected.")
-        plan = getattr(runtime, "plan", None)
-        split_spec = getattr(runtime, "request", self.split_spec)
+        plan = runtime.plan
+        split_spec = runtime.request
         boundary_schema = dict(candidate.descriptor.get("boundary_schema") or {})
         feature_layout = dict(candidate.descriptor.get("feature_layout") or {})
         contract = build_runtime_contract(
@@ -496,8 +447,8 @@ class TorchLensSplitBackend:
             runtime_backend="torchlens_native",
             adapter_version=TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION,
             runtime_version=torchlens_runtime_version(),
-            trace_batch_mode=str(getattr(split_spec, "trace_batch_mode", "")),
-            dynamic_batch=getattr(split_spec, "dynamic_batch", None),
+            trace_batch_mode=self.trace_batch_mode,
+            dynamic_batch=self.dynamic_batch,
             trace_batch_size=self.trace_batch_size,
         )
         actual_split_id = str(candidate.boundary)
@@ -506,34 +457,35 @@ class TorchLensSplitBackend:
                 trace_signature(runtime),
                 actual_split_id,
                 candidate.boundary,
-                str(getattr(split_spec, "mode", "generated_eager")),
+                "generated_eager",
             ),
             split_id=actual_split_id,
             graph_signature=trace_signature(runtime),
             boundary=candidate.boundary,
             mode="generated_eager",
-            trainable=bool(getattr(split_spec, "trainable", True)),
-            dynamic_batch=getattr(split_spec, "dynamic_batch", None),
-            trace_batch_mode=str(getattr(split_spec, "trace_batch_mode", "batch_gt1")),
+            trainable=split_spec.features.training,
+            dynamic_batch=self.dynamic_batch,
+            trace_batch_mode=self.trace_batch_mode,
             trace_batch_size=self.trace_batch_size,
             boundary_bytes=int(candidate.estimated_payload_bytes),
-            prefix_node_count=len(getattr(plan, "prefix_node_ids", ()) or ()),
-            suffix_node_count=len(getattr(plan, "suffix_node_ids", ()) or ()),
+            prefix_node_count=len(plan.prefix_node_ids),
+            suffix_node_count=len(plan.suffix_node_ids),
             trainable_suffix=bool(candidate.is_trainable_tail),
             candidate_id=candidate.candidate_id,
             split_label=candidate.split_label,
             boundary_tensor_labels=list(candidate.boundary_tensor_labels),
             torchlens_version=torchlens_runtime_version(),
-            feature_layout_id=str(contract.get("feature_layout_id", "")),
             feature_abi_id=str(contract.get("feature_abi_id", "")),
             runtime_contract=contract,
             metadata={
                 "boundary_nodes": tuple(candidate.boundary_tensor_labels),
-                "requested_boundary": getattr(split_spec, "boundary", candidate.boundary),
+                "requested_boundary": split_spec.boundary,
                 "candidate_descriptor": build_candidate_descriptor(candidate),
-                "feature_layout_id": contract.get("feature_layout_id", ""),
                 "feature_abi_id": contract.get("feature_abi_id", ""),
                 "_example_inputs": self.trace_sample_input,
+                "_example_kwargs": self.trace_sample_kwargs,
+                "batch_validation": runtime.batch_validation,
+                "candidate_report": self.candidate_report,
             },
         )
         return TorchLensRuntimeHandle(
@@ -556,11 +508,15 @@ def prepare_torchlens_runtime(
     model_name: str | None = None,
     model_family: str | None = None,
     candidate: SplitCandidate | None = None,
+    sample_kwargs: dict[str, Any] | None = None,
+    batch_axes: dict[str, int] | None = None,
 ) -> TorchLensRuntimeHandle:
     backend = TorchLensSplitBackend(model_name=model_name, model_family=model_family)
     backend.trace(
         model,
         sample_inputs,
+        sample_kwargs=sample_kwargs,
+        batch_axes=batch_axes,
         boundary=boundary,
         mode=mode,
         trainable=trainable,
@@ -574,12 +530,12 @@ def prepare_torchlens_runtime(
     return backend.make_handle()
 
 
-def run_prefix(handle: TorchLensRuntimeHandle, *inputs: Any) -> BoundaryPayload:
-    return handle.backend.run_prefix(*inputs)
+def run_prefix(handle: TorchLensRuntimeHandle, *inputs: Any, input_kwargs=None) -> BoundaryPayload:
+    return handle.backend.run_prefix(*inputs, input_kwargs=input_kwargs)
 
 
-def run_training_prefix(handle: TorchLensRuntimeHandle, *inputs: Any) -> BoundaryPayload:
-    return handle.backend.run_prefix(*inputs, training=True)
+def run_training_prefix(handle: TorchLensRuntimeHandle, *inputs: Any, input_kwargs=None) -> BoundaryPayload:
+    return handle.backend.run_prefix(*inputs, training=True, input_kwargs=input_kwargs)
 
 
 def run_suffix(handle: TorchLensRuntimeHandle, boundary: BoundaryPayload) -> Any:
@@ -619,7 +575,6 @@ def backward_prefix(
 
 
 __all__ = [
-    "SplitRuntimeHandle",
     "TorchLensRuntimeHandle",
     "TorchLensSplitBackend",
     "backward_prefix",

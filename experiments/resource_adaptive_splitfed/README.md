@@ -34,7 +34,7 @@ missing series and never inserts zeroes or interpolated observations.
 The experiment builds on SplitFleet's current production architecture rather
 than replacing it:
 
-- `splitfleet.autosplit` prepares TorchLens 2.31 native two-stage runtimes and
+- `splitfleet.autosplit` prepares TorchLens 2.34.1 native two-stage runtimes and
   enforces graph, feature-ABI, dynamic-batch, and boundary contracts;
 - `BoundaryPayload` is converted to SplitFleet's versioned, pickle-free wire
   envelope, encoded to bytes, decoded for the suffix, and paired with a
@@ -65,11 +65,10 @@ to stable keys in this order:
 stem, maxpool, layer1, layer2, layer3, layer4, full_local
 ```
 
-If those module paths do not exist, graph-order quantiles provide an explicit
-`graph_quantile_fallback` mapping. Every key except `full_local` consumes one
-distinct boundary, so a graph exposing fewer than six trainable cuts is
-rejected up front with the required count rather than failing part-way through
-the fallback mapping. The saved descriptor contains the TorchLens
+Each semantic key must resolve to a distinct module-path boundary. Every key
+except `full_local` consumes one distinct boundary, so a graph exposing fewer
+than six trainable cuts or missing one of the named paths is rejected before
+the experiment starts. The saved descriptor contains the TorchLens
 node ID and label, module path, boundary schema, feature layout, graph
 signature, measured-at-trace payload size, and client/server parameter-name
 ownership. `full_local` has no boundary and follows ordinary FedAvg local
@@ -296,7 +295,7 @@ Install the optional TensorFlow/JAX/Paddle/tinygrad validation matrix with:
 uv sync --extra dev --extra experiment --extra multibackend
 ```
 
-Python 3.11, Torch 2.11, TorchLens 2.31, torchvision, PyYAML, psutil, and
+Python 3.11, Torch 2.11, TorchLens 2.34.1, torchvision, PyYAML, psutil, and
 matplotlib are locked by `uv.lock`.
 
 ## Run

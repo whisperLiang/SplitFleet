@@ -1,11 +1,8 @@
-from typing import Dict, Union, List, Optional
+from typing import Optional
 from abc import ABC, abstractmethod
 
 import numpy as np
-try:
-    import torch
-except ImportError:
-    torch = None
+import torch
 
 from splitfleet.common import (
     ControlCode,
@@ -18,7 +15,6 @@ from splitfleet.common.parameter import (
     bytes_to_ndarray_dict
 )
 
-NumpyBatchData = Dict[str, Union[np.ndarray, List[np.ndarray]]]
 FORBIDDEN_SERVER_MODEL_METHODS = {
     "get_parameters",
     "configure_fit",
@@ -30,7 +26,7 @@ FORBIDDEN_SERVER_MODEL_METHODS = {
 class ServerModelProxy(ABC):
 
     def __init__(self, cid: str):
-        """Initialize a server model proxt
+        """Initialize a server model proxy.
 
         Parameters
         ----------
@@ -38,7 +34,6 @@ class ServerModelProxy(ABC):
             ID of the client associated with the given proxy
         """
         self.cid = cid
-        self.device = None
         self._request_argument_format: RequestArgumentFormat = RequestArgumentFormat.RAW
 
     def numpy(self) -> None:
@@ -49,7 +44,6 @@ class ServerModelProxy(ABC):
     def torch(self) -> None:
         """Informs the server model proxy that the client will be sending pytorch tensors
         """
-        assert torch is not None, "Pytorch is not installed"
         self._request_argument_format = RequestArgumentFormat.TORCH
 
     @abstractmethod
@@ -57,7 +51,8 @@ class ServerModelProxy(ABC):
         self,
         method: str,
         batch_data: BatchData,
-        _timeout_: Optional[float]
+        _timeout_: Optional[float],
+        _streams_: bool,
     ) -> BatchData:
         """Issue a blocking request to the server model. The client will wait until receiving a
         response
@@ -85,7 +80,13 @@ class ServerModelProxy(ABC):
         """
 
     @abstractmethod
-    def _streaming_request(self, method: str, batch_data: BatchData) -> None:
+    def _streaming_request(
+        self,
+        method: str,
+        batch_data: BatchData,
+        _timeout_: Optional[float],
+        _streams_: bool,
+    ) -> None:
         """Issue a non blocking request to the server model. The client will immediately continue
 
         Parameters
@@ -101,24 +102,14 @@ class ServerModelProxy(ABC):
         self,
         method: str,
         batch_data: BatchData,
-        _timeout_: Optional[float]
+        _timeout_: Optional[float],
+        _streams_: bool,
     ):
-        pass
+        """Issue a request and return a future for its response."""
 
     @abstractmethod
     def close_stream(self):
         """Wait until the server finishes processing the data the client sent to it
-        """
-
-    @abstractmethod
-    def get_pending_batches_count(self) -> int:
-        """Returns the number of batches that are unprocessed (i.e., how much is the client ahead
-        of the server). This may be a if using the streaming functionality
-
-        Returns
-        -------
-        int
-            number of pending batches
         """
 
     def _parse_request_args(self, *args, **kwargs):
@@ -180,7 +171,7 @@ class ServerModelProxy(ABC):
         def _request(
             *args,
             _type_: RequestType = RequestType.BLOCKING,
-            _timeout_: bool = None,
+            _timeout_: Optional[float] = None,
             _streams_: bool = True,
             **kwargs
         ) -> Optional[BatchData]:
@@ -213,6 +204,6 @@ class ServerModelProxy(ABC):
                 )
                 return future
             else:
-                raise Exception("Unkown request type")
+                raise ValueError(f"Unknown request type: {_type_!r}")
 
         return _request

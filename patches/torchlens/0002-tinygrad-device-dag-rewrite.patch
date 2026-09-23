@@ -1,0 +1,67 @@
+--- a/torchlens/split/adapters/tinygrad.py
++++ b/torchlens/split/adapters/tinygrad.py
+@@ -1,4 +1,5 @@
+ """tinygrad UOp split replay adapter."""
++# Modified by SplitFleet: bounded DAG traversal and fixed-shape replay for local build 1.
+ 
+ from __future__ import annotations
+ 
+@@ -80,22 +80,46 @@
+ 
+ 
+ def _rewrite_tinygrad_uop_device(uop: Any, target_device: str | None) -> Any:
+-    """Rewrite captured tinygrad DEVICE leaves to the requested replay device."""
++    """Rewrite DEVICE leaves once per reachable UOp, preserving DAG sharing.
++
++    The memo is local to this call: replay graphs and their buffers are never
++    retained, and subsequent replays observe the current source graph. An
++    explicit postorder stack handles deep graphs without Python recursion.
++    """
+ 
+     if target_device is None or not hasattr(uop, "replace"):
+         return uop
+     ops = _tinygrad_ops()
+-    if getattr(uop, "op", None) is ops.DEVICE:
+-        if getattr(uop, "arg", None) == target_device:
+-            return uop
+-        return uop.replace(arg=target_device)
+-    src = tuple(getattr(uop, "src", ()) or ())
+-    if not src:
+-        return uop
+-    rewritten_src = tuple(_rewrite_tinygrad_uop_device(item, target_device) for item in src)
+-    if rewritten_src == src:
+-        return uop
+-    return uop.replace(src=rewritten_src)
++    rewritten: dict[int, Any] = {}
++    stack = [(uop, False)]
++    while stack:
++        node, expanded = stack.pop()
++        node_id = id(node)
++        if node_id in rewritten:
++            continue
++        if not hasattr(node, "replace"):
++            rewritten[node_id] = node
++            continue
++        if getattr(node, "op", None) is ops.DEVICE:
++            rewritten[node_id] = (
++                node if getattr(node, "arg", None) == target_device
++                else node.replace(arg=target_device)
++            )
++            continue
++        sources = tuple(getattr(node, "src", ()) or ())
++        if not sources:
++            rewritten[node_id] = node
++            continue
++        if not expanded:
++            stack.append((node, True))
++            stack.extend((source, False) for source in reversed(sources))
++            continue
++        rewritten_sources = tuple(rewritten[id(source)] for source in sources)
++        rewritten[node_id] = (
++            node if rewritten_sources == sources
++            else node.replace(src=rewritten_sources)
++        )
++    return rewritten[id(uop)]
+ 
+ 
+ def _tinygrad_shape_tuple(uop: Any) -> tuple[int, ...] | None:

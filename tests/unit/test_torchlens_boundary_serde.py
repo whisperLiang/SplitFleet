@@ -54,9 +54,12 @@ def test_torchlens_boundary_payload_round_trips_without_pickle() -> None:
     assert isinstance(restored, BoundaryPayload)
     assert restored.tensors
     assert restored.batch_size == 3
+    assert restored.metadata["runtime_batch_size"] == 3
+    assert restored.metadata["shape_program_hash"] == boundary.metadata["shape_program_hash"]
+    assert "state_fingerprint" not in envelope.metadata
+    assert "prefix_boundary_tensors" not in envelope.metadata
     assert restored.spec is not None
     assert restored.spec.boundary_tensor_labels
-    assert restored.passthrough_inputs == ()
     for label, tensor in boundary.tensors.items():
         assert label in restored.tensors
         assert tuple(restored.tensors[label].shape) == tuple(tensor.shape)

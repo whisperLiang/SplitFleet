@@ -1,21 +1,14 @@
-"""Legacy gRPC-bidi client runner used by SplitFleet's dual RPC service.
-
-Flower 1.29 removed its public legacy ``start_client`` helper, but SplitFleet
-still needs the bidirectional Flower stream and its companion server-model
-stub on the same channel.  This module keeps that small compatibility loop
-local instead of importing Flower internals which no longer exist.
-"""
+"""Run Flower instructions and server-model RPCs over one bidi connection."""
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass
 from logging import INFO, WARN
-from typing import Callable, Optional, Tuple, Union
+from typing import Callable, Optional, Union
 
-from cryptography.hazmat.primitives.asymmetric import ec
 from flwr.client.message_handler.message_handler import handle_control_message
-from flwr.common import Context, EventType, GRPC_MAX_MESSAGE_LENGTH, RecordSet, event
+from flwr.common import EventType, GRPC_MAX_MESSAGE_LENGTH, event
 from flwr.common.logger import log
 
 from splitfleet.client.client import Client
@@ -23,7 +16,7 @@ from splitfleet.client.grpc.connection import (
     TRANSPORT_TYPE_GRPC_BIDI,
     init_connection,
 )
-from splitfleet.client.grpc.message_handler import handle_legacy_message_from_msgtype
+from splitfleet.client.grpc.message_handler import handle_message
 
 
 ClientFn = Callable[[str], Client]
@@ -56,14 +49,11 @@ def start_client(
     grpc_max_message_length: int = GRPC_MAX_MESSAGE_LENGTH,
     root_certificates: Optional[Union[bytes, str]] = None,
     insecure: Optional[bool] = None,
-    transport: Optional[str] = TRANSPORT_TYPE_GRPC_BIDI,
-    authentication_keys: Optional[
-        Tuple[ec.EllipticCurvePrivateKey, ec.EllipticCurvePublicKey]
-    ] = None,
+    transport: str = TRANSPORT_TYPE_GRPC_BIDI,
     max_retries: Optional[int] = None,
     max_wait_time: Optional[float] = None,
 ) -> None:
-    """Connect one SplitFleet client and process legacy Flower instructions."""
+    """Connect one SplitFleet client and process Flower bidi instructions."""
 
     if (client is None) == (client_fn is None):
         raise ValueError("Provide exactly one of `client` or `client_fn`.")
@@ -85,18 +75,13 @@ def start_client(
             with connection(
                 address,
                 insecure,
-                None,
                 grpc_max_message_length,
                 root_certificates,
-                authentication_keys,
             ) as conn:
-                receive, send, server_model_stub, _create_node, _delete_node, _ = conn
-                contexts: dict[int, Context] = {}
+                receive, send, server_model_stub = conn
                 while True:
                     message = receive()
                     reconnect_window.record_success()
-                    if message is None:
-                        continue
                     log(
                         INFO,
                         "Received: %s message %s",
@@ -107,38 +92,14 @@ def start_client(
                     if control_reply is not None:
                         send(control_reply)
                         break
-                    context = contexts.setdefault(
-                        int(message.metadata.run_id),
-                        Context(
-                            run_id=int(message.metadata.run_id),
-                            node_id=0,
-                            node_config={},
-                            state=RecordSet(),
-                            run_config={},
-                        ),
-                    )
-                    reply = handle_legacy_message_from_msgtype(
+                    reply = handle_message(
                         client_fn=client_fn,
                         message=message,
-                        context=context,
                         server_model_stub=server_model_stub,
                     )
                     send(reply)
                     log(INFO, "Sent reply")
-        except StopIteration as exc:
-            attempts, elapsed = reconnect_window.record_failure()
-            retry_limit_hit = max_retries is not None and attempts >= max_retries
-            time_limit_hit = max_wait_time is not None and elapsed >= max_wait_time
-            if retry_limit_hit or time_limit_hit:
-                raise RuntimeError(
-                    f"Stream from {server_address} ended unexpectedly after "
-                    f"{attempts} consecutive recovery failures"
-                ) from exc
-            delay = min(2.0 ** min(attempts - 1, 4), 10.0)
-            log(WARN, "Stream ended; reconnecting in %.1f seconds", delay)
-            time.sleep(delay)
-            continue
-        except connection_error_type as exc:
+        except (StopIteration, connection_error_type) as exc:
             attempts, elapsed = reconnect_window.record_failure()
             retry_limit_hit = max_retries is not None and attempts >= max_retries
             time_limit_hit = max_wait_time is not None and elapsed >= max_wait_time

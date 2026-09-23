@@ -50,7 +50,7 @@ def test_clone_runtime_preserves_feature_abi_and_cache_key() -> None:
     assert key["feature_abi_id"] == placement.feature_abi_id
     assert key["boundary"] == placement.boundary
     assert key["graph_signature"] == placement.graph_signature
-    assert key["torchlens_version"] == "2.31.0"
+    assert key["torchlens_version"] == "2.34.1"
     assert key["runtime_backend"] == "torchlens_native"
     assert key["trace_batch_mode"] == placement.trace_batch_mode
     assert key["dynamic_batch"] == list(placement.dynamic_batch)
@@ -104,3 +104,16 @@ def test_clone_runtime_rejects_feature_abi_mismatch(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="feature ABI is incompatible"):
         manager.clone_runtime_for_model(copy.deepcopy(model), suffix="bad")
+
+
+@pytest.mark.parametrize("method,args", [
+    ("get_server_model", ("client",)),
+    ("initialize_server_models", ([],)),
+    ("collect_server_fit_results", ()),
+    ("get_server_model_ids", ()),
+    ("end_round", ()),
+])
+def test_server_lifecycle_requires_a_model_factory(method, args) -> None:
+    manager = StageRuntimeManager()
+    with pytest.raises(RuntimeError, match="init_server_model_fn"):
+        getattr(manager, method)(*args)

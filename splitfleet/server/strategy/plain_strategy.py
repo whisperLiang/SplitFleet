@@ -49,7 +49,7 @@ class PlainSlStrategy(Strategy):
         process_clients_as_batch: bool = False,
     ) -> None:
         super().__init__()
-        self.init_server_model_fn = init_server_model_fn
+        self._server_model_factory = init_server_model_fn
         self.fraction_fit = fraction_fit
         self.fraction_evaluate = fraction_evaluate
         self.config_server_segnent_fn = config_server_segnent_fn
@@ -66,7 +66,7 @@ class PlainSlStrategy(Strategy):
         self.requests_state: Dict[Tuple[str, str], Dict[str, ClientRequestGroup]] = {}
 
     def init_server_model_fn(self) -> ServerModel:
-        return self.init_server_model_fn().to_server_model()
+        return self._server_model_factory()
 
     def evaluate(
         self,

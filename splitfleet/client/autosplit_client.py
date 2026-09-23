@@ -5,38 +5,11 @@ from __future__ import annotations
 from typing import Any, Callable, Iterable, Optional
 
 import numpy as np
-import torch
 
 from splitfleet.client.numpy_client import NumPyClient
+from splitfleet.tasks import TaskAdapter, prepare_task_batch
+from splitfleet.tasks.transport import encode_task_batch
 
-
-def _to_numpy(value: Any) -> Any:
-    if isinstance(value, np.ndarray):
-        return value
-    if isinstance(value, torch.Tensor):
-        return value.detach().cpu().numpy()
-    if isinstance(value, dict):
-        return {key: _to_numpy(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_to_numpy(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_to_numpy(item) for item in value)
-    return value
-
-
-def _batch_size(value: Any) -> int:
-    if isinstance(value, np.ndarray):
-        return int(value.shape[0]) if value.ndim > 0 else 1
-    if isinstance(value, torch.Tensor):
-        return int(value.shape[0]) if value.ndim > 0 else 1
-    if isinstance(value, dict):
-        for item in value.values():
-            size = _batch_size(item)
-            if size > 0:
-                return size
-    if isinstance(value, (list, tuple)) and value:
-        return _batch_size(value[0])
-    return 1
 
 
 class AutoSplitNumPyClient(NumPyClient):
@@ -48,10 +21,14 @@ class AutoSplitNumPyClient(NumPyClient):
         train_data: Iterable[Any],
         evaluate_data: Optional[Iterable[Any]] = None,
         batch_adapter: Optional[Callable[[Any], tuple[Any, Any]]] = None,
+        task: TaskAdapter | None = None,
+        backend: str = "torch",
     ) -> None:
         self.train_data = train_data
         self.evaluate_data = evaluate_data if evaluate_data is not None else train_data
-        self.batch_adapter = batch_adapter or self._default_batch_adapter
+        self.batch_adapter = batch_adapter
+        self.task = task
+        self.backend = backend
 
     def get_parameters(self, config):
         _ = config
@@ -64,13 +41,11 @@ class AutoSplitNumPyClient(NumPyClient):
         num_examples = 0
         weighted_loss = 0.0
         for batch in self.train_data:
-            inputs, targets = self.batch_adapter(batch)
-            response = proxy.train_batch(
-                inputs=_to_numpy(inputs),
-                targets=_to_numpy(targets),
-                _streams_=False,
+            task_batch = prepare_task_batch(batch, task=self.task, batch_adapter=self.batch_adapter, training=True)
+            response = proxy.train_task_batch(
+                payload=encode_task_batch(task_batch, backend=self.backend), _streams_=False,
             )
-            batch_examples = _batch_size(inputs)
+            batch_examples = task_batch.num_examples
             batch_loss = float(np.asarray(response["loss"]).reshape(-1)[0])
             num_examples += batch_examples
             weighted_loss += batch_loss * batch_examples
@@ -86,13 +61,11 @@ class AutoSplitNumPyClient(NumPyClient):
         num_examples = 0
         weighted_loss = 0.0
         for batch in self.evaluate_data:
-            inputs, targets = self.batch_adapter(batch)
-            response = proxy.evaluate_batch(
-                inputs=_to_numpy(inputs),
-                targets=_to_numpy(targets),
-                _streams_=False,
+            task_batch = prepare_task_batch(batch, task=self.task, batch_adapter=self.batch_adapter, training=False)
+            response = proxy.evaluate_task_batch(
+                payload=encode_task_batch(task_batch, backend=self.backend), _streams_=False,
             )
-            batch_examples = _batch_size(inputs)
+            batch_examples = task_batch.num_examples
             batch_loss = float(np.asarray(response["loss"]).reshape(-1)[0])
             num_examples += batch_examples
             weighted_loss += batch_loss * batch_examples
@@ -104,12 +77,3 @@ class AutoSplitNumPyClient(NumPyClient):
         if proxy is None:
             raise RuntimeError("AutoSplitNumPyClient requires a server_model_proxy.")
         return proxy
-
-    @staticmethod
-    def _default_batch_adapter(batch: Any) -> tuple[Any, Any]:
-        if isinstance(batch, (list, tuple)) and len(batch) == 2:
-            return batch[0], batch[1]
-        raise ValueError(
-            "Expected each batch to be a `(inputs, targets)` pair. "
-            "Provide `batch_adapter` to customize parsing."
-        )

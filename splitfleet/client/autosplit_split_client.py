@@ -8,17 +8,13 @@ import uuid
 from dataclasses import asdict, dataclass
 from typing import Any, Callable, Iterable, Optional
 
-import numpy as np
-
 from splitfleet.autosplit import (
     AutoSplitSession,
-    SplitRuntimeHandle,
+    TorchLensRuntimeHandle,
     batch_window_contains,
     classify_contract_compatibility,
     describe_batch_window,
-    first_tensor_batch_size,
     normalize_batch_window,
-    normalize_inputs,
     require_batch_in_window,
 )
 from splitfleet.backends.utils import (
@@ -30,9 +26,10 @@ from splitfleet.backends.utils import (
     zero_grad,
 )
 from splitfleet.runtime import PrefixContextStore
+from splitfleet.tasks import ModelInputs, TaskAdapter, TaskBatch, prepare_task_batch
 from splitfleet.split_engine.contracts import GraphContract, ModelVersionContract, validate_contract
 from splitfleet.split_engine import graph_contract_for_runtime_handle
-from splitfleet.autosplit.torchlens_runtime import torchlens_runtime_version
+from splitfleet.autosplit.torchlens_runtime import runtime_input_batch_size, torchlens_runtime_version
 from splitfleet.transport import decode_gradients, encode_boundary, encode_bundle_wire
 from splitfleet.transport.split_wire import boundary_to_envelope, envelope_to_gradients
 from splitfleet.client.numpy_client import NumPyClient
@@ -58,24 +55,6 @@ from splitfleet.common.constants import (
 from splitfleet.common.constants import CLIENT_ID_CONFIG_KEY
 
 
-def _model_to_ndarrays(model: Any, adapter=None) -> list[np.ndarray]:
-    adapter = adapter or adapter_for(model, ())
-    return adapter.export_ndarrays(model)
-
-
-def _load_model_from_ndarrays(model: Any, ndarrays: list[np.ndarray], adapter=None) -> None:
-    (adapter or adapter_for(model, ())).load_ndarrays(model, ndarrays)
-
-
-def _batch_size(value: Any) -> int:
-    size = first_tensor_batch_size(value)
-    if size is None:
-        raise ValueError(
-            "Split training needs a batched tensor in the model inputs to size a step."
-        )
-    return int(size)
-
-
 PARTIAL_BATCH_POLICIES = ("error", "skip")
 
 
@@ -87,7 +66,7 @@ class _RoundRuntime:
     resolved once per round instead of once per batch.
     """
 
-    handle: SplitRuntimeHandle
+    handle: TorchLensRuntimeHandle
     contract: GraphContract
     batch_window: tuple[int, int] | None
     trace_batch_mode: str
@@ -133,26 +112,35 @@ class AutoSplitSplitLearningClient(NumPyClient):
         sample_inputs: Any,
         evaluate_data: Optional[Iterable[Any]] = None,
         sample_kwargs: Optional[dict] = None,
+        batch_axes: Optional[dict[str, int]] = None,
         batch_adapter: Optional[Callable[[Any], tuple[Any, Any]]] = None,
+        task: TaskAdapter | None = None,
         optimizer_fn=None,
         functional_update_fn: Optional[Callable[[Any, Any], Any]] = None,
         autosplit_session: Optional[AutoSplitSession] = None,
         device: str = "cpu",
         partial_batch_policy: str = "error",
     ) -> None:
-        if sample_kwargs:
-            raise ValueError("TorchLens autosplit backend accepts positional model inputs only.")
         if partial_batch_policy not in PARTIAL_BATCH_POLICIES:
             raise ValueError(
                 f"Unsupported partial_batch_policy {partial_batch_policy!r}; "
                 f"expected one of {PARTIAL_BATCH_POLICIES}."
             )
-        self.backend_adapter = adapter_for(model, sample_inputs)
+        sample_call = ModelInputs.from_value(sample_inputs.inputs if isinstance(sample_inputs, TaskBatch) else sample_inputs)
+        if sample_kwargs is not None:
+            if sample_call.kwargs:
+                raise ValueError("Provide keyword samples in ModelInputs or sample_kwargs, not both.")
+            sample_call = ModelInputs(sample_call.args, sample_kwargs)
+        self.backend_adapter = adapter_for(model, sample_call.args if sample_call.args else sample_call.kwargs)
         self.model = self.backend_adapter.move_model(self.backend_adapter.clone_model(model), device)
         self.train_data = train_data
         self.evaluate_data = evaluate_data if evaluate_data is not None else train_data
-        self.sample_inputs = bind_model_inputs(sample_inputs, self.backend_adapter)
-        self.batch_adapter = batch_adapter or self._default_batch_adapter
+        sample_call = sample_call.map_values(lambda value: move_value(value, self.backend_adapter, device))
+        self.sample_inputs = bind_model_inputs(sample_call.args, self.backend_adapter)
+        self.sample_kwargs = dict(sample_call.kwargs)
+        self.batch_axes = batch_axes
+        self.task = task
+        self.batch_adapter = batch_adapter
         self.optimizer_fn = optimizer_fn
         self.functional_update_fn = functional_update_fn
         self.autosplit_session = autosplit_session or AutoSplitSession(device=device)
@@ -164,7 +152,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
 
     def get_parameters(self, config):
         _ = config
-        return _model_to_ndarrays(self.model, self.backend_adapter)
+        return self.backend_adapter.export_ndarrays(self.model)
 
     def fit(self, parameters, config):
         fit_start = time.perf_counter()
@@ -182,20 +170,22 @@ class AutoSplitSplitLearningClient(NumPyClient):
         num_examples = 0
         weighted_loss = 0.0
         for batch in self.train_data:
-            inputs, targets = self.batch_adapter(batch)
-            torch_inputs = move_value(inputs, self.backend_adapter, self.device)
-            torch_inputs = bind_model_inputs(torch_inputs, self.backend_adapter)
-            torch_targets = move_value(targets, self.backend_adapter, self.device)
-            batch_size = _batch_size(torch_inputs)
-            if not self._accept_batch(batch_size, round_runtime, telemetry):
+            task_batch = prepare_task_batch(batch, task=self.task, batch_adapter=self.batch_adapter, training=True)
+            call = task_batch.inputs.map_values(lambda value: move_value(value, self.backend_adapter, self.device))
+            torch_inputs = bind_model_inputs(call.args, self.backend_adapter)
+            torch_targets = move_value(task_batch.targets, self.backend_adapter, self.device)
+            batch_size = task_batch.num_examples
+            runtime_batch_size = runtime_input_batch_size(runtime_handle.runtime, torch_inputs, call.kwargs)
+            if not self._accept_batch(runtime_batch_size, round_runtime, telemetry, num_examples=batch_size):
                 continue
 
             zero_grad(self.model, prefix_optimizer)
 
             prefix_started = time.perf_counter()
             boundary = runtime_handle.backend.run_prefix(
-                *normalize_inputs(torch_inputs),
+                *torch_inputs,
                 training=True,
+                input_kwargs=call.kwargs,
             )
             telemetry.prefix_compute_sec += time.perf_counter() - prefix_started
             step_id = uuid.uuid4().hex
@@ -262,7 +252,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
             "device": str(self.device),
             **telemetry.as_metrics(),
         }
-        return _model_to_ndarrays(self.model, self.backend_adapter), num_examples, metrics
+        return self.backend_adapter.export_ndarrays(self.model), num_examples, metrics
 
     def evaluate(self, parameters, config):
         round_runtime = self._prepare_round(parameters, config, training=False)
@@ -277,14 +267,15 @@ class AutoSplitSplitLearningClient(NumPyClient):
         weighted_loss = 0.0
         with inference_context(self.backend_adapter.backend_name):
             for batch in self.evaluate_data:
-                inputs, targets = self.batch_adapter(batch)
-                torch_inputs = move_value(inputs, self.backend_adapter, self.device)
-                torch_inputs = bind_model_inputs(torch_inputs, self.backend_adapter)
-                torch_targets = move_value(targets, self.backend_adapter, self.device)
-                batch_size = _batch_size(torch_inputs)
-                if not self._accept_batch(batch_size, round_runtime, telemetry):
+                task_batch = prepare_task_batch(batch, task=self.task, batch_adapter=self.batch_adapter, training=False)
+                call = task_batch.inputs.map_values(lambda value: move_value(value, self.backend_adapter, self.device))
+                torch_inputs = bind_model_inputs(call.args, self.backend_adapter)
+                torch_targets = move_value(task_batch.targets, self.backend_adapter, self.device)
+                batch_size = task_batch.num_examples
+                runtime_batch_size = runtime_input_batch_size(runtime_handle.runtime, torch_inputs, call.kwargs)
+                if not self._accept_batch(runtime_batch_size, round_runtime, telemetry, num_examples=batch_size):
                     continue
-                boundary = runtime_handle.backend.run_prefix(*normalize_inputs(torch_inputs))
+                boundary = runtime_handle.backend.run_prefix(*torch_inputs, input_kwargs=call.kwargs)
                 wire_boundary = boundary_to_envelope(
                     boundary,
                     round_id=round_id,
@@ -321,7 +312,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
             raise ValueError(
                 "TorchLens autosplit backend supports exactly one client-local prefix stage."
             )
-        _load_model_from_ndarrays(self.model, parameters, self.backend_adapter)
+        self.backend_adapter.load_ndarrays(self.model, parameters)
         previous_round = int(self._round_config.get(AUTOSPLIT_MODEL_VERSION_CONFIG_KEY, -1))
         current_round = int(config.get(AUTOSPLIT_MODEL_VERSION_CONFIG_KEY, 0))
         if previous_round >= 0 and previous_round != current_round:
@@ -362,6 +353,8 @@ class AutoSplitSplitLearningClient(NumPyClient):
         handle = self.autosplit_session.prepare_runtime(
             self.model,
             self.sample_inputs,
+            sample_kwargs=self.sample_kwargs,
+            batch_axes=self.batch_axes,
             boundary=str(config.get(AUTOSPLIT_BOUNDARY_CONFIG_KEY, "50%")),
             mode=str(config.get(AUTOSPLIT_MODE_CONFIG_KEY, "generated_eager")),
             trainable=True,
@@ -394,7 +387,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
         self._runtime_cache[cache_key] = round_runtime
         return round_runtime
 
-    def _validate_feature_abi(self, config, handle: SplitRuntimeHandle) -> None:
+    def _validate_feature_abi(self, config, handle: TorchLensRuntimeHandle) -> None:
         """Fail the round before any boundary upload when the ABIs disagree.
 
         The full runtime contract digest also covers the trace batch size and
@@ -423,16 +416,20 @@ class AutoSplitSplitLearningClient(NumPyClient):
 
     def _accept_batch(
         self,
-        batch_size: int,
+        batch_size: int | None,
         round_runtime: _RoundRuntime,
         telemetry: _RoundTelemetry,
+        *,
+        num_examples: int | None = None,
     ) -> bool:
         """Apply the partial-batch policy to a batch the runtime cannot replay."""
 
-        if batch_window_contains(round_runtime.batch_window, batch_size):
+        # A static image list has an example count but no symbolic replay batch
+        # axis. Validate only dimensions declared by the native runtime.
+        if batch_size is None or batch_window_contains(round_runtime.batch_window, batch_size):
             return True
         if self.partial_batch_policy == "skip":
-            telemetry.record_skip(batch_size)
+            telemetry.record_skip(batch_size if num_examples is None else num_examples)
             return False
         require_batch_in_window(
             batch_size,
@@ -481,23 +478,13 @@ class AutoSplitSplitLearningClient(NumPyClient):
         if self.optimizer_fn is not None:
             return self.optimizer_fn(self.model)
         if self.backend_adapter.backend_name == "jax":
+            if self.functional_update_fn is None:
+                raise ValueError("JAX split training requires an explicit functional_update_fn.")
             return None
-        try:
-            return self.backend_adapter.build_optimizer(self.model, {"name": "sgd", "lr": 0.01})
-        except (NotImplementedError, ValueError):
-            return None
+        return self.backend_adapter.build_optimizer(self.model, {"name": "sgd", "lr": 0.01})
 
     def _require_server_model_proxy(self):
         proxy = getattr(self, "server_model_proxy", None)
         if proxy is None:
             raise RuntimeError("AutoSplitSplitLearningClient requires a server_model_proxy.")
         return proxy
-
-    @staticmethod
-    def _default_batch_adapter(batch: Any) -> tuple[Any, Any]:
-        if isinstance(batch, (list, tuple)) and len(batch) == 2:
-            return batch[0], batch[1]
-        raise ValueError(
-            "Expected each batch to be a `(inputs, targets)` pair. "
-            "Provide `batch_adapter` to customize parsing."
-        )

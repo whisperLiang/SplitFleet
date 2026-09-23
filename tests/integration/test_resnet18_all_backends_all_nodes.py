@@ -38,7 +38,7 @@ def _run_isolated(request, backend: str) -> bool:
     if backend == "tf":
         env["CUDA_VISIBLE_DEVICES"] = ""
     if backend == "tinygrad":
-        env["DEVICE"] = "CPU"
+        env["DEV"] = "CPU"
         env["DEBUG"] = "0"
     result = subprocess.run(
         [sys.executable, "-m", "pytest", request.node.nodeid, "-q", "-s"],
@@ -51,6 +51,8 @@ def _run_isolated(request, backend: str) -> bool:
     )
     print(result.stdout, end="")
     assert result.returncode == 0, result.stdout
+    if " skipped" in result.stdout:
+        pytest.skip(result.stdout.strip().splitlines()[-1])
     return True
 
 
@@ -311,12 +313,15 @@ def _exercise_backend(backend: str) -> None:
 
     adapter = adapter_for(model, inputs)
     adapter.set_training(model, True)
+    # This exhaustive test varies the cut and client targets at fixed B=2.
+    # The admitted batch window alone does not request fixed-shape capture.
     seed = prepare_torchlens_runtime(
         model,
         _args(inputs, adapter),
         boundary="50%",
         trainable=True,
         dynamic_batch=(2, 2),
+        batch_axes={},
         model_name=f"resnet18-{backend}",
         model_family="resnet18",
     )
@@ -342,8 +347,7 @@ def _exercise_backend(backend: str) -> None:
                 f"viable={built} trained={trained}",
                 flush=True,
             )
-        label = str(node.label)
-        split = f"after:{label}"
+        split = f"after:{node.canonical_id}"
         try:
             if backend == "tinygrad":
                 model, inputs, client_targets, loss_fn = BUILDERS[backend]()
@@ -355,6 +359,7 @@ def _exercise_backend(backend: str) -> None:
                     boundary=split,
                     trainable=True,
                     dynamic_batch=(2, 2),
+                    batch_axes={},
                     model_name="resnet18-tinygrad",
                     model_family="resnet18",
                 )
@@ -399,6 +404,7 @@ def _exercise_backend(backend: str) -> None:
                         boundary=split,
                         trainable=True,
                         dynamic_batch=(2, 2),
+                        batch_axes={},
                         model_name="resnet18-tinygrad",
                         model_family="resnet18",
                     )
@@ -456,65 +462,19 @@ def _exercise_backend(backend: str) -> None:
             np.testing.assert_allclose(actual, expected_state, rtol=1e-6, atol=1e-7)
         trained += 1
 
-    frontier_trained = 0
-    if not trained:
-        adapter.load_ndarrays(model, initial_state)
-        runtime = seed.backend.repartition("50%")
-        base_state = adapter.export_ndarrays(model)
-        local_states = []
-        for client_index, targets in enumerate(client_targets):
-            adapter.load_ndarrays(model, base_state)
-            before_trainable = _trainable_arrays(backend, model, adapter)
-            optimizer = _optimizer(backend, model, adapter)
-            current_args = _args(inputs, adapter)
-            local_boundary = runtime.backend.run_prefix(*current_args, training=True)
-            contract = graph_contract_for_runtime_handle(runtime)
-            envelope = boundary_to_envelope(
-                local_boundary,
-                round_id=1,
-                client_id=f"resnet18-{backend}-frontier-{client_index}",
-                step_id=f"frontier-{client_index}",
-                plan_id=runtime.plan.plan_id,
-                split_id=contract.split_id,
-                canonical_graph_hash=contract.canonical_graph_hash,
-                boundary_schema_hash=contract.boundary_schema_hash,
-                model_version=1,
-            )
-            remote_boundary = envelope_to_boundary(envelope, runtime.runtime, None)
-            loss, gradients = runtime.backend.train_suffix(
-                remote_boundary,
-                targets,
-                loss_fn=loss_fn,
-                optimizer=optimizer,
-            )
-            assert np.isfinite(adapter.scalar_value(loss))
-            assert gradients, f"{backend} has no differentiable ResNet-18 frontier"
-            prefix_result = runtime.backend.backward_prefix(
-                local_boundary,
-                boundary_grads=gradients,
-                optimizer=optimizer,
-            )
-            if backend == "jax":
-                _apply_jax_update(adapter, prefix_result)
-            after_trainable = _trainable_arrays(backend, model, adapter)
-            assert _changed(before_trainable, after_trainable)
-            local_states.append(adapter.export_ndarrays(model))
-        federated_state = aggregate([(state, 1) for state in local_states])
-        adapter.load_ndarrays(model, federated_state)
-        loaded_state = adapter.export_ndarrays(model)
-        for actual, expected_state in zip(loaded_state, federated_state, strict=True):
-            np.testing.assert_allclose(actual, expected_state, rtol=1e-6, atol=1e-7)
-        frontier_trained = 1
-
     assert built > 0, f"ResNet-18 exposed no viable {backend} split candidates"
-    assert trained > 0 or frontier_trained, (
+    assert trained > 0, (
         f"ResNet-18 exposed no trainable {backend} split frontier"
+    )
+    assert trained + terminal == built and non_differentiable == 0, (
+        f"ResNet-18 did not train every operational {backend} split: "
+        f"viable={built}, trained={trained}, terminal={terminal}, "
+        f"non_differentiable={non_differentiable}"
     )
     print(
         f"RESNET18_ALL_NODES backend={backend} graph_nodes={len(graph_nodes)} "
         f"viable={built} trained={trained} terminal={terminal} "
-        f"non_differentiable={non_differentiable} unsupported=0 "
-        f"frontier_trained={frontier_trained}"
+        f"non_differentiable={non_differentiable} unsupported=0"
     )
 
 

@@ -7,7 +7,7 @@ from torch import nn
 
 from splitfleet.client.autosplit_split_client import AutoSplitSplitLearningClient
 from splitfleet.common import ServerModelFitIns
-from splitfleet.common.constants import CLIENT_ID_CONFIG_KEY
+from splitfleet.common.constants import AUTOSPLIT_PLAN_ID_CONFIG_KEY, CLIENT_ID_CONFIG_KEY
 from splitfleet.server.server_model.autosplit_tail_server_model import AutoSplitTailServerModel
 from splitfleet.server.server_model.proxy.server_model_proxy import ServerModelProxy
 from splitfleet.server.stage_runtime.manager import StageRuntimeManager
@@ -60,9 +60,6 @@ class InProcessServerModelProxy(ServerModelProxy):
     def close_stream(self):
         return None
 
-    def get_pending_batches_count(self) -> int:
-        return 0
-
 
 def _model_to_ndarrays(model: nn.Module):
     return [tensor.detach().cpu().numpy() for tensor in model.state_dict().values()]
@@ -81,10 +78,6 @@ def test_torchlens_split_learning_client_and_tail_exchange_boundary_payloads() -
         boundary="50%",
         loss_fn=nn.MSELoss(),
         optimizer_fn=lambda model: torch.optim.SGD(model.parameters(), lr=0.05),
-        init_server_model_fn=lambda: AutoSplitTailServerModel(
-            runtime_manager=StageRuntimeManager(),
-            model=strategy_model,
-        ),
     )
     manager = StageRuntimeManager(autosplit_session=strategy.autosplit_session)
     strategy.bind_stage_runtime_manager(manager)
@@ -200,12 +193,17 @@ def test_per_client_placements_execute_matching_prefix_and_tail_abis() -> None:
     assert len(observed_boundaries) == 2
 
 
-def test_autosplit_tail_server_model_prepares_runtime_after_train_mode() -> None:
+@pytest.mark.parametrize("spatial", [False, True])
+def test_autosplit_tail_server_model_prepares_runtime_after_train_mode(spatial) -> None:
+    from tests.test_autosplit_runtime import SpatialBatchNormNet
+
     torch.manual_seed(37)
-    base_model = BatchNormNet().eval()
+    base_model = (SpatialBatchNormNet() if spatial else BatchNormNet()).eval()
+    shape = (4, 2, 2) if spatial else (4,)
     strategy = AutoSplitStrategy(
         model=base_model,
-        sample_inputs=torch.randn(2, 4),
+        sample_inputs=torch.randn(2 if spatial else 3, *shape),
+        batch_axes=None if spatial else {},
         boundary="after:fc1",
         loss_fn=nn.MSELoss(),
     )
@@ -226,7 +224,7 @@ def test_autosplit_tail_server_model_prepares_runtime_after_train_mode() -> None
         )
     )
 
-    inputs = torch.randn(3, 4)
+    inputs = torch.randn(3, *shape)
     expected = copy.deepcopy(server_model.model).train()(inputs)
     boundary = server_model.runtime_handle.backend.run_prefix(inputs)
     split = server_model.runtime_handle.backend.run_suffix(boundary)
@@ -234,8 +232,16 @@ def test_autosplit_tail_server_model_prepares_runtime_after_train_mode() -> None
     assert torch.allclose(split, expected, atol=1e-5, rtol=1e-5)
 
 
+def _tail_with_plan():
+    strategy = AutoSplitStrategy(model=DeepNet(), sample_inputs=torch.randn(2, 4))
+    manager = StageRuntimeManager(autosplit_session=strategy.autosplit_session)
+    strategy.bind_stage_runtime_manager(manager)
+    config = strategy._autosplit_config()
+    return strategy._make_server_model(), config
+
+
 def test_tail_step_ids_are_consume_once_and_failed_steps_can_retry() -> None:
-    server_model = AutoSplitTailServerModel(runtime_manager=object(), model=DeepNet())
+    server_model, _ = _tail_with_plan()
     key = (3, "client-a", "step-1")
 
     server_model._begin_step(key)
@@ -246,3 +252,27 @@ def test_tail_step_ids_are_consume_once_and_failed_steps_can_retry() -> None:
     server_model._complete_step(key)
     with pytest.raises(ValueError, match="Duplicate split step"):
         server_model._begin_step(key)
+
+
+def test_tail_requires_a_prepared_runtime() -> None:
+    server_model = AutoSplitTailServerModel(runtime_manager=StageRuntimeManager(), model=DeepNet())
+    with pytest.raises(RuntimeError, match="No TorchLens runtime handle is registered"):
+        server_model.configure_fit(ServerModelFitIns(
+            parameters=server_model.get_parameters(),
+            config={AUTOSPLIT_PLAN_ID_CONFIG_KEY: "missing-plan"},
+            sid="",
+        ))
+
+
+@pytest.mark.parametrize("error_type", [NotImplementedError, ValueError])
+def test_tail_optimizer_errors_abort_round_configuration(monkeypatch, error_type) -> None:
+    server_model, config = _tail_with_plan()
+
+    def fail_optimizer(*args, **kwargs):
+        raise error_type("optimizer unavailable")
+
+    monkeypatch.setattr(server_model.backend_adapter, "build_optimizer", fail_optimizer)
+    with pytest.raises(error_type, match="optimizer unavailable"):
+        server_model.configure_fit(
+            ServerModelFitIns(parameters=server_model.get_parameters(), config=config, sid="")
+        )

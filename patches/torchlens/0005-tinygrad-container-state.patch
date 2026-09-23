@@ -1,0 +1,192 @@
+--- a/torchlens/backends/tinygrad/backend.py
++++ b/torchlens/backends/tinygrad/backend.py
+@@ -1,4 +1,7 @@
+-"""UOp-snapshot tinygrad backend preview."""
++"""UOp-snapshot tinygrad backend preview.
++
++Modified by SplitFleet to discover parameters and modules in state containers.
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -1922,6 +1925,7 @@
+     modules_by_class: defaultdict[type[Any], dict[int, str]],
+     param_owner_by_address: dict[str, str],
+     param_address_by_uop_id: dict[int, str],
++    parent_address: str | None = None,
+ ) -> None:
+     """Walk callable object attributes and populate tinygrad module metadata.
+ 
+@@ -1952,7 +1956,8 @@
+     primary = address_by_id.get(module_id)
+     if primary is not None:
+         metadata[primary].setdefault("all_addresses", [primary]).append(address)
+-        parent_address = address.rpartition(".")[0] or "self"
++        if parent_address is None:
++            raise ValueError("A repeated tinygrad module must have a parent.")
+         parent_children = metadata[parent_address]["address_children"]
+         parent_children.remove(address)
+         return
+@@ -1966,6 +1971,7 @@
+         "class_name": type(module).__name__,
+         "class_qualname": f"{type(module).__module__}.{type(module).__qualname__}",
+         "address_children": [child_address for child_address, _child in children],
++        "address_parent": parent_address,
+         "all_addresses": [address],
+         "training": False,
+         "forward_pre_hooks": [],
+@@ -1990,6 +1996,40 @@
+             modules_by_class=modules_by_class,
+             param_owner_by_address=param_owner_by_address,
+             param_address_by_uop_id=param_address_by_uop_id,
++            parent_address=address,
++        )
++
++
++def _iter_tinygrad_public_attrs(module: Any, address: str) -> Iterator[tuple[str, Any]]:
++    """Yield public attributes through state containers, preserving alias paths.
++
++    Containers are address components, not callable modules. Guard ancestors
++    per path so recursive containers terminate while shared state keeps every
++    address. Arbitrary objects are leaves and are never introspected here.
++    """
++
++    stack = [
++        (_join_module_address(address, name), value, frozenset())
++        for name, value in reversed(tuple(getattr(module, "__dict__", {}).items()))
++        if not name.startswith("_")
++    ]
++    while stack:
++        path, value, ancestors = stack.pop()
++        if hasattr(value, "_asdict"):
++            children = tuple(value._asdict().items())
++        elif isinstance(value, Mapping):
++            children = tuple(value.items())
++        elif isinstance(value, (list, tuple)):
++            children = tuple(enumerate(value))
++        else:
++            yield path, value
++            continue
++        if id(value) in ancestors:
++            continue
++        ancestors = ancestors | {id(value)}
++        stack.extend(
++            (_join_module_address(path, str(key)), child, ancestors)
++            for key, child in reversed(children)
+         )
+ 
+ 
+@@ -2006,20 +2046,18 @@
+     Returns
+     -------
+     list[tuple[str, Any]]
+-        Child address and child object pairs.
+-    """
+-
+-    children: list[tuple[str, Any]] = []
+-    for name, value in getattr(module, "__dict__", {}).items():
+-        if name.startswith("_") or not callable(value):
+-            continue
+-        if _is_tinygrad_module_like(value):
+-            children.append((_join_module_address(address, name), value))
+-    return children
++        Child address and child object pairs, including state-container paths.
++    """
++
++    return [
++        (child_address, value)
++        for child_address, value in _iter_tinygrad_public_attrs(module, address)
++        if _is_tinygrad_module_like(value)
++    ]
+ 
+ 
+ def _iter_tinygrad_tensor_attrs(module: Any, address: str) -> list[tuple[str, Any]]:
+-    """Return direct tinygrad tensor attributes for one object.
++    """Return tinygrad tensor attributes, including state containers.
+ 
+     Parameters
+     ----------
+@@ -2035,13 +2073,13 @@
+     """
+ 
+     return [
+-        (_join_module_address(address, name), value)
+-        for name, value in getattr(module, "__dict__", {}).items()
+-        if not name.startswith("_") and _is_tinygrad_tensor(value)
++        (param_address, value)
++        for param_address, value in _iter_tinygrad_public_attrs(module, address)
++        if _is_tinygrad_tensor(value)
+     ]
+ 
+ 
+-def _is_tinygrad_module_like(value: Any) -> bool:
++def _is_tinygrad_module_like(value: Any, seen: set[int] | None = None) -> bool:
+     """Return whether ``value`` is a tinygrad module-like callable object.
+ 
+     Parameters
+@@ -2057,14 +2095,16 @@
+ 
+     if inspect.isfunction(value) or inspect.ismethod(value) or not callable(value):
+         return False
++    visited = set() if seen is None else seen
++    if id(value) in visited:
++        return False
++    visited.add(id(value))
+     if _is_known_tinygrad_nn_type(value):
+         return True
+-    if any(_is_tinygrad_tensor(child) for child in getattr(value, "__dict__", {}).values()):
++    children = tuple(child for _path, child in _iter_tinygrad_public_attrs(value, "self"))
++    if any(_is_tinygrad_tensor(child) for child in children):
+         return True
+-    return any(
+-        callable(child) and _is_tinygrad_module_like(child)
+-        for child in getattr(value, "__dict__", {}).values()
+-    )
++    return any(_is_tinygrad_module_like(child, visited) for child in children)
+ 
+ 
+ def _is_known_tinygrad_nn_type(value: Any) -> bool:
+@@ -2257,11 +2297,14 @@
+         Stack from ``self`` to ``address``.
+     """
+ 
+-    parts = [] if address == "self" else address.split(".")
+-    addresses = ["self", *[".".join(parts[: index + 1]) for index in range(len(parts))]]
++    addresses: list[str] = []
++    current: str | None = address
++    while current is not None:
++        addresses.append(current)
++        current = module_tree.metadata[current]["address_parent"]
+     frames: list[TinygradModuleFrame] = []
+-    for current in addresses:
+-        metadata = module_tree.metadata.get(current, {})
++    for current in reversed(addresses):
++        metadata = module_tree.metadata[current]
+         frames.append(
+             TinygradModuleFrame(
+                 address=current,
+@@ -2329,18 +2372,18 @@
+     address:
+         Module address from the discovered tinygrad module tree.
+     metadata:
+-        Metadata for ``address``, unused by tinygrad.
++        Metadata carrying the actual callable parent of ``address``.
+     metadata_by_address:
+         Complete module metadata mapping, unused by tinygrad.
+ 
+     Returns
+     -------
+     bool
+-        True for non-root addresses with no dotted parent component.
+-    """
+-
+-    del metadata, metadata_by_address
+-    return address != "self" and "." not in address
++        True for modules whose callable parent is the root, including containers.
++    """
++
++    del metadata_by_address
++    return address != "self" and metadata["address_parent"] == "self"
+ 
+ 
+ def _tinygrad_op_top_level(address: str) -> bool:

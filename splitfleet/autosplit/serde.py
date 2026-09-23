@@ -1,132 +1,15 @@
-"""Serialization helpers for autosplit plans and stage payloads.
-
-Optimized for performance with:
-- Modern zipfile serialization format
-- Optional lz4 compression
-"""
+"""Portable JSON serialization for split placement descriptors."""
 
 from __future__ import annotations
 
-import io
 import json
-import warnings
 from dataclasses import asdict
-from typing import Any, Dict, Optional
+from typing import Any
 
-import lz4.frame
-import torch
-
-from splitfleet.autosplit.types import PlacementPlan
-
-# Compression header byte
-_COMPRESSION_LZ4 = 0x01
+from splitfleet.autosplit.types import SplitPlacementPlan
 
 
-def dumps_torch_object(
-    value: Any,
-    *,
-    compress: bool = False,
-    compression_level: int = 6,
-) -> bytes:
-    """Serialize a Python object containing tensors.
-
-    Args:
-        value: Object to serialize (can contain tensors).
-        compress: Whether to apply lz4 compression.
-        compression_level: Compression level (0-16).
-
-    Returns:
-        Serialized bytes with optional compression header.
-    """
-    warnings.warn(
-        "dumps_torch_object is deprecated and must not be used for split wire payloads; "
-        "use splitfleet.transport envelopes instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    buffer = io.BytesIO()
-    torch.save(value, buffer, _use_new_zipfile_serialization=True)
-    data = buffer.getvalue()
-
-    if not compress:
-        return data
-
-    compressed = lz4.frame.compress(data, compression_level=compression_level)
-    return bytes([_COMPRESSION_LZ4]) + compressed
-
-
-def loads_torch_object(
-    value: bytes,
-    *,
-    map_location: str | torch.device = "cpu",
-) -> Any:
-    """Deserialize a Python object containing tensors.
-
-    Automatically detects and decompresses if compression header present.
-
-    Args:
-        value: Serialized bytes.
-        map_location: Device to map tensors to.
-
-    Returns:
-        Deserialized object.
-    """
-    warnings.warn(
-        "loads_torch_object is deprecated and unsafe for untrusted wire payloads; "
-        "use splitfleet.transport envelopes instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    if not value:
-        raise ValueError("Cannot deserialize empty bytes")
-
-    # Check for compression header byte
-    if value[0] == _COMPRESSION_LZ4:
-        data = lz4.frame.decompress(value[1:])
-    else:
-        data = value
-
-    buffer = io.BytesIO(data)
-    return torch.load(buffer, map_location=map_location, weights_only=False)
-
-
-def dump_model_state(
-    model,
-    *,
-    compress: bool = False,
-) -> bytes:
-    """Serialize a model state dict for worker synchronization.
-
-    Args:
-        model: PyTorch model with state_dict() method.
-        compress: Whether to compress the state dict.
-
-    Returns:
-        Serialized state dict bytes.
-    """
-    return dumps_torch_object(model.state_dict(), compress=compress)
-
-
-def load_model_state(
-    model,
-    state_bytes: bytes,
-    *,
-    map_location: str | torch.device = "cpu",
-) -> None:
-    """Load a serialized model state dict into a model.
-
-    Args:
-        model: PyTorch model to load state into.
-        state_bytes: Serialized state dict bytes.
-        map_location: Device to map tensors to.
-    """
-    if not state_bytes:
-        return
-    state_dict = loads_torch_object(state_bytes, map_location=map_location)
-    model.load_state_dict(state_dict)
-
-
-def serialize_plan_descriptor(placement_plan: PlacementPlan) -> bytes:
+def serialize_plan_descriptor(placement_plan: SplitPlacementPlan) -> bytes:
     """Serialize the portable subset of a placement plan."""
 
     descriptor = {
@@ -138,11 +21,11 @@ def serialize_plan_descriptor(placement_plan: PlacementPlan) -> bytes:
         "split_id": placement_plan.split_id,
         "boundary": placement_plan.boundary,
         "mode": placement_plan.mode,
-        "candidate_id": getattr(placement_plan, "candidate_id", ""),
-        "boundary_tensor_labels": list(getattr(placement_plan, "boundary_tensor_labels", []) or []),
-        "payload_bytes": int(getattr(placement_plan, "payload_bytes", 0) or 0),
-        "feature_abi_id": getattr(placement_plan, "feature_abi_id", ""),
-        "runtime_contract": dict(getattr(placement_plan, "runtime_contract", {}) or {}),
+        "candidate_id": placement_plan.candidate_id,
+        "boundary_tensor_labels": list(placement_plan.boundary_tensor_labels),
+        "payload_bytes": placement_plan.payload_bytes,
+        "feature_abi_id": placement_plan.feature_abi_id,
+        "runtime_contract": dict(placement_plan.runtime_contract),
         "stage_count": placement_plan.stage_count,
         "client_stage_count": 1,
         "stage_to_worker": dict(placement_plan.stage_to_worker),
@@ -158,12 +41,12 @@ def serialize_plan_descriptor(placement_plan: PlacementPlan) -> bytes:
     return json.dumps(descriptor, sort_keys=True).encode("utf-8")
 
 
-def deserialize_plan_descriptor(payload: bytes) -> Dict[str, Any]:
+def deserialize_plan_descriptor(payload: bytes) -> dict[str, Any]:
     """Parse a serialized plan descriptor."""
 
-    if not payload:
-        return {}
     descriptor = json.loads(payload.decode("utf-8"))
+    if not isinstance(descriptor, dict):
+        raise ValueError("Split placement descriptor must be a JSON object")
     for field_name in ("engine", "backend", "runtime_backend", "plan_id", "split_id"):
         if not descriptor.get(field_name):
             raise ValueError(f"Split placement descriptor is missing {field_name!r}")

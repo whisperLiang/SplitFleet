@@ -33,7 +33,6 @@ class ServerModelServicer(server_model_pb2_grpc.ServerModelServicer):
         super().__init__()
         self.server_model_manager = server_model_manager
         self._lock = asyncio.Lock()
-        self.request_queues = {}
 
     async def _compute_response(
         self,

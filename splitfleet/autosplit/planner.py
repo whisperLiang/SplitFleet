@@ -14,17 +14,18 @@ from splitfleet.autosplit.torchlens_candidate import SplitCandidate
 from splitfleet.autosplit.types import (
     PlacementConstraint,
     PlacementObjective,
-    SplitPlan,
+    SplitPlacementPlan,
     WorkerSpec,
 )
 from splitfleet.split_engine import graph_contract_for_runtime_handle
+from splitfleet.tasks import ModelInputs
 
 
 TWO_STAGE_ERROR = "TorchLens autosplit backend supports prefix/suffix two-stage split only."
 ONE_CLIENT_STAGE_ERROR = "TorchLens autosplit backend supports exactly one client-local prefix stage."
 
 
-def _validate_stage_counts(
+def validate_stage_counts(
     *,
     preferred_stage_count: Optional[int],
     client_stage_count: Optional[int],
@@ -64,6 +65,8 @@ def _candidate_satisfies_constraints(
     validation: dict[str, Any],
     constraints: PlacementConstraint,
 ) -> bool:
+    if constraints.max_frontier_size is not None and candidate.boundary_count > constraints.max_frontier_size:
+        return False
     if candidate.estimated_payload_bytes > constraints.max_payload_bytes:
         return False
     if constraints.require_trainable_tail and not candidate.is_trainable_tail:
@@ -86,6 +89,8 @@ def _rejection_reason(
     validation: dict[str, Any],
     constraints: PlacementConstraint,
 ) -> str:
+    if constraints.max_frontier_size is not None and candidate.boundary_count > constraints.max_frontier_size:
+        return "max_frontier_size"
     if candidate.estimated_payload_bytes > constraints.max_payload_bytes:
         return "max_payload_bytes"
     if constraints.require_trainable_tail and not candidate.is_trainable_tail:
@@ -112,7 +117,7 @@ def _build_placement(
     constraints: PlacementConstraint,
     objective: PlacementObjective,
     model_name: Optional[str],
-) -> SplitPlan:
+) -> SplitPlacementPlan:
     suffix_worker = _coordinator_worker(worker_specs)
     if constraints.max_stage_memory_bytes and suffix_worker.memory_bytes:
         suffix_memory = runtime_handle.plan.metadata.get("suffix_memory_bytes") or 0
@@ -136,13 +141,12 @@ def _build_placement(
         "candidate_descriptor": candidate.to_dict(),
         "validation": dict(validation),
         "runtime_contract": contract,
-        "feature_layout_id": contract.get("feature_layout_id", ""),
         "feature_abi_id": contract.get("feature_abi_id", ""),
         "torchlens_version": runtime_handle.plan.torchlens_version,
         "_runtime_handle": runtime_handle,
     }
     graph_contract = graph_contract_for_runtime_handle(runtime_handle)
-    return SplitPlan(
+    return SplitPlacementPlan(
         plan_id=runtime_handle.plan.plan_id,
         split_id=runtime_handle.plan.split_id,
         graph_signature=runtime_handle.plan.graph_signature,
@@ -172,7 +176,6 @@ def _build_placement(
         dynamic_batch=runtime_handle.plan.dynamic_batch,
         trace_batch_size=runtime_handle.plan.trace_batch_size,
         canonical_split_key=candidate.boundary,
-        feature_layout_id=str(contract.get("feature_layout_id", "")),
         feature_abi_id=str(contract.get("feature_abi_id", "")),
         runtime_contract=contract,
         worker_specs={suffix_worker.worker_id: suffix_worker},
@@ -191,6 +194,7 @@ class AutoSplitPlanner:
         sample_inputs: Any,
         *,
         sample_kwargs: Optional[dict[str, Any]] = None,
+        batch_axes: dict[str, int] | None = None,
         worker_specs: Optional[Sequence[WorkerSpec]] = None,
         constraints: Optional[PlacementConstraint] = None,
         objective: Optional[PlacementObjective] = None,
@@ -203,12 +207,8 @@ class AutoSplitPlanner:
         trainable: bool = True,
         dynamic_batch: tuple[int, int] | None = None,
         trace_batch_mode: str | None = None,
-        compile_options: Any = None,
-    ) -> SplitPlan:
-        del compile_options
-        if sample_kwargs:
-            raise ValueError("TorchLens autosplit backend accepts positional model inputs only.")
-        _validate_stage_counts(
+    ) -> SplitPlacementPlan:
+        validate_stage_counts(
             preferred_stage_count=preferred_stage_count,
             client_stage_count=client_stage_count,
         )
@@ -216,10 +216,13 @@ class AutoSplitPlanner:
         objective = objective or PlacementObjective()
         workers = list(worker_specs or [WorkerSpec(worker_id="coordinator", device="cpu")])
 
+        call = ModelInputs.from_value(sample_inputs)
         backend = TorchLensSplitBackend(model_name=model_name or model.__class__.__name__)
         backend.trace(
             model,
-            sample_inputs,
+            call.args,
+            sample_kwargs=dict(call.kwargs) if sample_kwargs is None else sample_kwargs,
+            batch_axes=batch_axes,
             boundary=boundary,
             mode=mode,
             trainable=trainable,
@@ -227,10 +230,17 @@ class AutoSplitPlanner:
             trace_batch_mode=trace_batch_mode,
             model_name=model_name or model.__class__.__name__,
         )
-        candidates = backend.enumerate_candidates(
-            max_boundary_count=constraints.max_frontier_size,
-            max_payload_bytes=constraints.max_payload_bytes,
-            max_candidates=None,
+        # Explicit points (including percentages) are promises to the caller.
+        # Only ``auto`` is allowed to search for a different placement.
+        candidates = (
+            backend.enumerate_candidates(
+                max_boundary_count=constraints.max_frontier_size,
+                max_payload_bytes=constraints.max_payload_bytes,
+                max_candidates=None,
+                kinds=("before", "after"),
+            )
+            if boundary == "auto"
+            else [backend.current_candidate] if backend.current_candidate is not None else []
         )
         if not candidates:
             raise RuntimeError("TorchLens did not enumerate any legal split candidates for this model.")
@@ -308,14 +318,3 @@ class AutoSplitPlanner:
                 )
             )
         return placement
-
-
-def validate_stage_counts(
-    *,
-    preferred_stage_count: Optional[int],
-    client_stage_count: Optional[int],
-) -> None:
-    _validate_stage_counts(
-        preferred_stage_count=preferred_stage_count,
-        client_stage_count=client_stage_count,
-    )

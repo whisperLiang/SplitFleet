@@ -1,0 +1,13 @@
+--- a/torchlens/split/adapters/tinygrad.py
++++ b/torchlens/split/adapters/tinygrad.py
+@@ -418,7 +418,9 @@
+         """
+ 
+         del overlay
+-        if self.graph.shape_program is None or self._shape_binding is None:
++        # A fixed-shape capture has no batch-dependent literals to rewrite.
++        # Input binding already rejects every change to its traced shapes.
++        if not self._has_symbolic_batch or self._shape_binding is None:
+             return src
+         rewritten = list(src)
+         parent_by_position = dict(

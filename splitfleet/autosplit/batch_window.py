@@ -1,11 +1,9 @@
 """Dynamic batch window contract shared by the prefix and the suffix.
 
-A TorchLens split runtime is traced once with a sample batch and replays any
-batch size inside its ``dynamic_batch`` window.  Cross-device split federated
-learning depends on that window: every device runs its own local batches, and
-the negotiated window is the only thing that guarantees the same prefix and
-suffix runtime accept them.  The window also feeds the feature ABI id, so a
-client that silently picks its own window ends up with an incompatible runtime.
+A negotiated ``dynamic_batch`` window expresses the fleet's allowed batch
+sizes. TorchLens independently validates batch-axis and replay capabilities;
+falling inside the window does not override a failed native batch probe. The
+window also feeds the feature ABI id, so clients must use the broadcast policy.
 """
 
 from __future__ import annotations
@@ -51,7 +49,7 @@ def normalize_batch_window(value: Any) -> tuple[int, int] | None:
 
 
 def batch_window_contains(window: tuple[int, int] | None, batch_size: int) -> bool:
-    """Return whether ``batch_size`` can be replayed by a runtime with ``window``."""
+    """Return whether ``batch_size`` satisfies the negotiated fleet policy."""
 
     if window is None:
         return True

@@ -7,14 +7,13 @@ import uuid
 from typing import Any
 from threading import RLock
 
-import numpy as np
-
 from splitfleet.autosplit import (
-    SplitRuntimeHandle,
+    TorchLensRuntimeHandle,
     normalize_batch_window,
     require_batch_in_window,
 )
 from splitfleet.backends.utils import adapter_for
+from splitfleet.tasks import TaskAdapter
 from splitfleet.split_engine.contracts import GraphContract, ModelVersionContract, validate_contract
 from splitfleet.split_engine import graph_contract_for_runtime_handle
 from splitfleet.transport import (
@@ -35,15 +34,6 @@ from splitfleet.common.constants import (
 from splitfleet.server.server_model.server_model import ServerModel
 
 
-def _load_model_from_ndarrays(model: Any, ndarrays: list[np.ndarray], adapter=None) -> None:
-    (adapter or adapter_for(model, ())).load_ndarrays(model, ndarrays)
-
-
-def _model_to_ndarrays(model: Any, adapter=None) -> list[np.ndarray]:
-    adapter = adapter or adapter_for(model, ())
-    return adapter.export_ndarrays(model)
-
-
 def _request_num_examples(payload: bytes) -> int:
     """Read the example count the prefix measured for this step."""
 
@@ -59,26 +49,25 @@ class AutoSplitTailServerModel(ServerModel):
         *,
         runtime_manager,
         model: Any,
+        sample_inputs: Any = (),
         optimizer_fn=None,
         loss_fn=None,
+        task: TaskAdapter | None = None,
         boundary: str = "50%",
         mode: str = "generated_eager",
         device: str = "cpu",
     ) -> None:
         self.runtime_manager = runtime_manager
         self.optimizer_fn = optimizer_fn
-        self.loss_fn = loss_fn
+        self.task = task
+        self.loss_fn = loss_fn if loss_fn is not None else (task.loss if task is not None else None)
         self.boundary = boundary
         self.mode = mode
         self.device = device
-        try:
-            sample_inputs = runtime_manager._require_runtime_handle().plan.metadata.get("_example_inputs")
-        except (AttributeError, RuntimeError):
-            sample_inputs = ()
         self.backend_adapter = adapter_for(model, sample_inputs)
         self.model = self.backend_adapter.move_model(self.backend_adapter.clone_model(model), device)
         self.optimizer = None
-        self.runtime_handle: SplitRuntimeHandle | None = None
+        self.runtime_handle: TorchLensRuntimeHandle | None = None
         self.graph_contract: GraphContract | None = None
         self.batch_window: tuple[int, int] | None = None
         self.num_examples = 0
@@ -89,18 +78,20 @@ class AutoSplitTailServerModel(ServerModel):
         self._processed_steps: set[tuple[int, str, str]] = set()
         self._inflight_steps: set[tuple[int, str, str]] = set()
         self._step_lock = RLock()
-        self._runtime_cache: dict[tuple[str, str, bool, str], SplitRuntimeHandle] = {}
+        self._runtime_cache: dict[tuple[str, str, bool, str], TorchLensRuntimeHandle] = {}
 
     def get_parameters(self):
-        return _model_to_ndarrays(self.model, self.backend_adapter)
+        return self.backend_adapter.export_ndarrays(self.model)
 
     def configure_fit(self, ins: ServerModelFitIns) -> None:
         self._configure_common(ins.parameters, ins.config, sid=ins.sid, training=True)
         if self.optimizer_fn is not None:
             self.optimizer = self.optimizer_fn(self.model)
+        elif self.backend_adapter.backend_name == "jax":
+            # Functional parameter gradients return to the client for its update.
+            self.optimizer = None
         else:
-            try: self.optimizer = self.backend_adapter.build_optimizer(self.model, {"name": "sgd", "lr": 0.01})
-            except (NotImplementedError, ValueError): self.optimizer = None
+            self.optimizer = self.backend_adapter.build_optimizer(self.model, {"name": "sgd", "lr": 0.01})
 
     def get_fit_result(self) -> ServerModelFitRes:
         average_loss = self.loss_total / max(self.num_examples, 1)
@@ -128,7 +119,7 @@ class AutoSplitTailServerModel(ServerModel):
             examples = _request_num_examples(batch.data["metadata"])
             self._begin_step(step_key)
             try:
-                result = self.runtime_manager.run_train_tail_plan(
+                result = self.runtime_manager.autosplit_session.run_suffix_train(
                     runtime_handle,
                     boundary,
                     targets=targets,
@@ -166,7 +157,7 @@ class AutoSplitTailServerModel(ServerModel):
             self._validate_wire_identity(wire_boundary)
             boundary = envelope_to_boundary(wire_boundary, runtime_handle.runtime, self.device)
             targets = decode_bundle_wire(batch.data["targets"], self.device)
-            outputs = self.runtime_manager.run_eval_tail_plan(runtime_handle, boundary)
+            outputs = self.runtime_manager.autosplit_session.run_suffix_eval(runtime_handle, boundary)
             loss = self.runtime_manager.autosplit_session.compute_loss(outputs, targets, self.loss_fn)
             examples = _request_num_examples(batch.data["metadata"])
             responses.append(
@@ -196,7 +187,7 @@ class AutoSplitTailServerModel(ServerModel):
         self._inflight_steps.clear()
         self.model_version = int(config.get(AUTOSPLIT_MODEL_VERSION_CONFIG_KEY, 0))
         self.plan_id = str(config.get(AUTOSPLIT_PLAN_ID_CONFIG_KEY, ""))
-        _load_model_from_ndarrays(self.model, parameters, self.backend_adapter)
+        self.backend_adapter.load_ndarrays(self.model, parameters)
         # Hashing the model state is not free, so the round hashes it once and
         # both the contract check and the runtime cache key reuse the result.
         state_schema = self.backend_adapter.state_manifest(self.model).schema_hash
@@ -244,14 +235,15 @@ class AutoSplitTailServerModel(ServerModel):
             raise ValueError("Boundary graph contract mismatch")
         if boundary.boundary_schema_hash != contract.boundary_schema_hash:
             raise ValueError("Boundary ABI mismatch")
-        batch_size = int(boundary.batch_size or 0)
-        if batch_size > 0:
-            require_batch_in_window(
-                batch_size,
-                self.batch_window,
-                stage=f"Split suffix (sid={self.sid or 'shared'})",
-                trace_batch_mode=str(runtime_handle.plan.trace_batch_mode or ""),
-            )
+        batch_size = int(boundary.batch_size)
+        if batch_size < 1:
+            raise ValueError("Boundary batch size must be positive.")
+        require_batch_in_window(
+            batch_size,
+            self.batch_window,
+            stage=f"Split suffix (sid={self.sid or 'shared'})",
+            trace_batch_mode=str(runtime_handle.plan.trace_batch_mode or ""),
+        )
 
     def _begin_step(self, step_key: tuple[int, str, str]) -> None:
         with self._step_lock:
@@ -268,7 +260,7 @@ class AutoSplitTailServerModel(ServerModel):
         with self._step_lock:
             self._inflight_steps.discard(step_key)
 
-    def _require_runtime_handle(self) -> SplitRuntimeHandle:
+    def _require_runtime_handle(self) -> TorchLensRuntimeHandle:
         if self.runtime_handle is None:
             raise RuntimeError("AutoSplitTailServerModel has not been configured.")
         return self.runtime_handle

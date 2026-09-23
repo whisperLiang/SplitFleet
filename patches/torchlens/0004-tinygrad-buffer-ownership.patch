@@ -1,0 +1,107 @@
+--- a/torchlens/split/adapters/tinygrad.py
++++ b/torchlens/split/adapters/tinygrad.py
+@@ -240,31 +240,23 @@
+         return None
+ 
+     def _live_child_param_source_value(self, node: SplitTraceNode) -> Any | None:
+-        """Return a unique live parameter handle represented by a source buffer."""
++        """Bind a captured buffer to its exact live model tensor owner.
++
++        Exact captures and shape-only views preserve the buffer's value order.
++        Other views bind at their own capture node instead of flattening into
++        this buffer, which would apply transformations such as PERMUTE twice.
++        Captured paths remain valid after updates replace a live tensor's UOp.
++        """
+ 
+         if node.op_type != "buffer":
+             return None
+         capture = node.target
+-        captured_shape = _tinygrad_uop_shape(getattr(capture, "uop", None))
+-        handles: list[Any] = []
+-        seen: set[int] = set()
+         captured_uop = getattr(capture, "uop", None)
+-        captured_uop_id = id(captured_uop)
+-        for candidate in self.graph.nodes:
+-            candidate_uop = getattr(getattr(candidate, "target", None), "uop", None)
+-            if candidate_uop is None or not candidate.param_refs:
+-                continue
+-            try:
+-                contains_buffer = any(
+-                    id(item) == captured_uop_id for item in candidate_uop.toposort()
+-                )
+-            except Exception:
+-                contains_buffer = False
+-            if not contains_buffer:
+-                continue
+-            handle = self._live_param_value(candidate)
+-            if handle is None or id(handle) in seen:
+-                continue
++        captured_shape = _tinygrad_uop_shape(captured_uop)
++
++        def bind_shape(handle: Any) -> Any | None:
++            if not self._backend.is_tensor(handle):
++                return None
+             handle_shape = _tinygrad_uop_shape(handle)
+             if captured_shape is not None and handle_shape != captured_shape:
+                 if (
+@@ -272,10 +264,43 @@
+                     or prod(handle_shape) != prod(captured_shape)
+                     or not hasattr(handle, "reshape")
+                 ):
+-                    continue
+-                handle = handle.reshape(captured_shape)
++                    return None
++                return handle.reshape(captured_shape)
++            return handle
++
++        # An exact model-tensor capture is authoritative, including parameters
++        # nested in containers that have no module-tree parameter annotation.
++        captured_live = getattr(capture, "live_tensor", None)
++        if self._backend.is_tensor(captured_live):
++            return bind_shape(captured_live)
++        if captured_uop is None:
++            return None
++
++        ops = _tinygrad_ops()
++        handles: list[Any] = []
++        seen: set[int] = set()
++        for candidate in self.graph.nodes:
++            candidate_capture = getattr(candidate, "target", None)
++            handle = getattr(candidate_capture, "live_tensor", None)
++            if not self._backend.is_tensor(handle) or id(handle) in seen:
++                continue
++            candidate_uop = getattr(candidate_capture, "uop", None)
++            # RESHAPE changes dimensions without changing element order. Do
++            # not invert PERMUTE, SHRINK, EXPAND, or arbitrary computation by
++            # flattening its result into the source allocation.
++            while getattr(candidate_uop, "op", None) is ops.RESHAPE:
++                sources = tuple(getattr(candidate_uop, "src", ()) or ())
++                if not sources:
++                    break
++                candidate_uop = sources[0]
++            if candidate_uop is not captured_uop:
++                continue
++            # Record the original handle identity before reshape creates a
++            # view, so repeated captures of one tensor remain one owner.
+             seen.add(id(handle))
+-            handles.append(handle)
++            bound = bind_shape(handle)
++            if bound is not None:
++                handles.append(bound)
+         return handles[0] if len(handles) == 1 else None
+ 
+     def _tensor_device(self, value: Any) -> str | None:
+@@ -590,6 +615,13 @@
+                 f"{node.label!r} has no tinygrad UOp capture.",
+                 context=self._context(node, "missing tinygrad UOp capture"),
+             )
++        captured_live = getattr(capture, "live_tensor", None)
++        if node.op_type != "buffer" and self._backend.is_tensor(captured_live):
++            # Bind model-owned views at the operation captured for that exact
++            # tensor. Their current value already includes the view transform
++            # and their live handle carries gradients and state assignments.
++            bound = self._move_source_to_device(captured_live, target_device)
++            return bound if preserve_autograd else self._backend._realized_copy(bound)
+         if node.op_type == "buffer":
+             # BUFFER UOps identify an allocation, not a portable parameter
+             # value.  Rewriting only their DEVICE leaf can reinterpret a CPU

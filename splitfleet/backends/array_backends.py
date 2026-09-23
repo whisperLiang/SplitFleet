@@ -53,14 +53,16 @@ class ArrayBackendAdapter:
         return tuple(tuple(group) for group in positions.values() if len(group) > 1)
 
     def encode_tensor(self, tensor_id: str, tensor: Any) -> TensorEnvelope:
-        value = np.ascontiguousarray(self._to_numpy(tensor))
+        # ascontiguousarray promotes a scalar to shape (1,), which changes the
+        # replay schema for scalar losses, counters and reduction boundaries.
+        value = np.asarray(self._to_numpy(tensor))
         requires_grad = bool(
             getattr(tensor, "requires_grad", False)
             or getattr(tensor, "trainable", False)
             or (hasattr(tensor, "stop_gradient") and not bool(tensor.stop_gradient))
         )
         return TensorEnvelope(
-            str(tensor_id), tuple(value.shape), str(value.dtype), value.tobytes(),
+            str(tensor_id), tuple(value.shape), str(value.dtype), value.tobytes(order="C"),
             requires_grad=requires_grad,
         )
 
@@ -188,7 +190,10 @@ class JaxBackendAdapter(ArrayBackendAdapter):
         return self._external_params
     def bind_external_params(self, params):
         current = self._external_params
+        if current is params:
+            return
         if isinstance(current, dict) and isinstance(params, Mapping):
+            params = dict(params)
             current.clear()
             current.update(params)
         elif isinstance(current, list) and isinstance(params, (list, tuple)):
@@ -230,7 +235,10 @@ class TinygradBackendAdapter(ArrayBackendAdapter):
     def _to_numpy(self, value): return np.asarray(value.numpy())
     def _from_numpy(self, value, *, device=None):
         from tinygrad import Tensor
-        return Tensor(value, device=device)
+        # A received boundary must own a realized buffer. A lazy NPY-to-device
+        # COPY is not a stable leaf for TorchLens UOp replay: training can lose
+        # boundary gradients and replay incorrect values after buffer reuse.
+        return Tensor(value, device=device).realize()
     def _state(self, model):
         from tinygrad.nn.state import get_state_dict
         return get_state_dict(model)

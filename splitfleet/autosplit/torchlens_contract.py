@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from typing import Any, Mapping
 
 import numpy as np
@@ -230,10 +230,6 @@ def feature_abi_id(spec: FeatureAbiSpec | Mapping[str, Any]) -> str:
     return stable_digest(payload)
 
 
-def feature_layout_id(layout: Mapping[str, Any]) -> str:
-    return stable_digest(dict(layout))
-
-
 def runtime_identity_id(identity: Mapping[str, Any]) -> str:
     return stable_digest(dict(identity))
 
@@ -286,11 +282,6 @@ def build_runtime_contract(
         dynamic_batch=dynamic_batch,
         batch_symbol=batch_symbol,
     )
-    layout = {
-        str(label): _json_safe(dict(spec))
-        for label, spec in dict(feature_layout or {}).items()
-        if isinstance(spec, Mapping)
-    }
     identity = {
         "runtime_backend": runtime_backend,
         "torchlens_version": resolved_torchlens_version,
@@ -317,8 +308,6 @@ def build_runtime_contract(
         "boundary": str(boundary or canonical_split_key or ""),
         "boundary_tensor_labels": labels,
         "boundary_schema": abi_spec.boundary_schema,
-        "feature_layout": layout,
-        "feature_layout_id": feature_layout_id(layout) if layout else "",
         "feature_abi_spec": abi_spec.to_dict(),
         "feature_abi_id": feature_abi_id(abi_spec),
         "runtime_identity": _json_safe(identity),
@@ -332,55 +321,24 @@ def build_runtime_contract(
     return _json_safe(contract)
 
 
-def _contract_payload(contract: Mapping[str, Any] | object | None) -> dict[str, Any]:
+def _contract_payload(contract: Mapping[str, Any] | str | None) -> dict[str, Any]:
     if contract is None:
         return {}
     if isinstance(contract, str):
-        try:
-            value = json.loads(contract)
-        except json.JSONDecodeError:
-            return {}
-        return dict(value) if isinstance(value, Mapping) else {}
-    if isinstance(contract, Mapping):
-        return dict(contract)
-    to_dict = getattr(contract, "to_dict", None)
-    if callable(to_dict):
-        value = to_dict()
-        return dict(value) if isinstance(value, Mapping) else {}
-    return {}
-
-
-def _payload_feature_abi_id(payload: Mapping[str, Any]) -> str:
-    abi_id = str(payload.get("feature_abi_id") or "")
-    if abi_id:
-        return abi_id
-    abi_spec = payload.get("feature_abi_spec")
-    if isinstance(abi_spec, Mapping) and abi_spec:
-        return feature_abi_id(abi_spec)
-    layout_id = str(payload.get("feature_layout_id") or "")
-    return layout_id
-
-
-def _payload_runtime_identity_id(payload: Mapping[str, Any]) -> str:
-    identity_id = str(payload.get("runtime_identity_id") or "")
-    if identity_id:
-        return identity_id
-    identity = payload.get("runtime_identity")
-    if isinstance(identity, Mapping) and identity:
-        return runtime_identity_id(identity)
-    return ""
+        contract = json.loads(contract)
+    if not isinstance(contract, Mapping):
+        raise ValueError("Runtime contract must be a JSON object")
+    return dict(contract)
 
 
 def classify_contract_compatibility(
-    edge_contract: Mapping[str, Any] | object | None,
-    cloud_contract: Mapping[str, Any] | object | None,
+    edge_contract: Mapping[str, Any] | str | None,
+    cloud_contract: Mapping[str, Any] | str | None,
 ) -> dict[str, Any]:
     edge = _contract_payload(edge_contract)
     cloud = _contract_payload(cloud_contract)
-    edge_abi_id = _payload_feature_abi_id(edge)
-    cloud_abi_id = _payload_feature_abi_id(cloud)
-    edge_layout_id = str(edge.get("feature_layout_id") or "")
-    cloud_layout_id = str(cloud.get("feature_layout_id") or "")
+    edge_abi_id = str(edge.get("feature_abi_id") or "")
+    cloud_abi_id = str(cloud.get("feature_abi_id") or "")
     compatible = False
     reason = "feature_abi_id"
     if not edge:
@@ -390,17 +348,8 @@ def classify_contract_compatibility(
     elif edge_abi_id and cloud_abi_id:
         compatible = edge_abi_id == cloud_abi_id
         reason = "compatible" if compatible else "feature_abi_id"
-    else:
-        edge_spec = edge.get("feature_abi_spec")
-        cloud_spec = cloud.get("feature_abi_spec")
-        if isinstance(edge_spec, Mapping) and isinstance(cloud_spec, Mapping):
-            compatible = stable_json(edge_spec) == stable_json(cloud_spec)
-            reason = "compatible" if compatible else "feature_abi_spec"
-        else:
-            compatible = bool(edge_layout_id and cloud_layout_id and edge_layout_id == cloud_layout_id)
-            reason = "legacy_feature_layout_id_compatible" if compatible else "feature_layout_id"
-    edge_runtime_id = _payload_runtime_identity_id(edge)
-    cloud_runtime_id = _payload_runtime_identity_id(cloud)
+    edge_runtime_id = str(edge.get("runtime_identity_id") or "")
+    cloud_runtime_id = str(cloud.get("runtime_identity_id") or "")
     if compatible and edge_runtime_id and cloud_runtime_id and edge_runtime_id != cloud_runtime_id:
         reason = "runtime_identity_changed_but_feature_abi_compatible"
     return {
@@ -410,8 +359,6 @@ def classify_contract_compatibility(
         "cloud_feature_abi_id": cloud_abi_id,
         "edge_runtime_identity_id": edge_runtime_id,
         "cloud_runtime_identity_id": cloud_runtime_id,
-        "edge_feature_layout_id": edge_layout_id,
-        "cloud_feature_layout_id": cloud_layout_id,
         "edge_boundary_tensor_labels": [str(label) for label in list(edge.get("boundary_tensor_labels") or [])],
         "cloud_boundary_tensor_labels": [str(label) for label in list(cloud.get("boundary_tensor_labels") or [])],
     }
@@ -426,7 +373,6 @@ __all__ = [
     "build_runtime_contract",
     "classify_contract_compatibility",
     "feature_abi_id",
-    "feature_layout_id",
     "runtime_contract_digest",
     "runtime_identity_id",
     "stable_digest",

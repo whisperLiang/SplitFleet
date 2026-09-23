@@ -2,63 +2,17 @@
 
 from __future__ import annotations
 
-import copy
 import threading
 import uuid
-from collections import OrderedDict
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
-import torch
 
 from splitfleet.server.server_model.numpy_server_model import NumPyServerModel
-
-
-def _to_torch(value: Any, *, device: str) -> Any:
-    if isinstance(value, np.ndarray):
-        return torch.from_numpy(value).to(device)
-    if isinstance(value, dict):
-        return {key: _to_torch(item, device=device) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_to_torch(item, device=device) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_to_torch(item, device=device) for item in value)
-    return value
-
-
-def _batch_size(value: Any) -> int:
-    if isinstance(value, torch.Tensor):
-        return int(value.shape[0]) if value.ndim > 0 else 1
-    if isinstance(value, np.ndarray):
-        return int(value.shape[0]) if value.ndim > 0 else 1
-    if isinstance(value, dict):
-        for item in value.values():
-            size = _batch_size(item)
-            if size > 0:
-                return size
-    if isinstance(value, (list, tuple)) and value:
-        return _batch_size(value[0])
-    return 1
-
-
-def _model_to_ndarrays(model: torch.nn.Module) -> list[np.ndarray]:
-    return [tensor.detach().cpu().numpy() for tensor in model.state_dict().values()]
-
-
-def _load_model_from_ndarrays(model: torch.nn.Module, ndarrays: list[np.ndarray]) -> None:
-    if not ndarrays:
-        return
-    state_dict = model.state_dict()
-    if len(state_dict) != len(ndarrays):
-        raise ValueError(
-            "Autosplit server-model parameter mismatch: "
-            f"expected {len(state_dict)} tensors, received {len(ndarrays)}."
-        )
-    loaded_state = OrderedDict()
-    for (name, reference), array in zip(state_dict.items(), ndarrays):
-        loaded_state[name] = torch.as_tensor(array, dtype=reference.dtype, device=reference.device)
-    model.load_state_dict(loaded_state, strict=True)
-
+from splitfleet.backends.utils import adapter_for, bind_model_inputs
+from splitfleet.tasks import ModelInputs, TaskAdapter
+from splitfleet.tasks.transport import decode_task_batch
+from splitfleet.common.constants import AUTOSPLIT_PLAN_ID_CONFIG_KEY
 
 class AutoSplitServerModel(NumPyServerModel):
     """Expose autosplit training/eval as server-model methods consumable by clients."""
@@ -67,17 +21,20 @@ class AutoSplitServerModel(NumPyServerModel):
         self,
         *,
         runtime_manager,
-        model: torch.nn.Module,
+        model: Any,
         optimizer_fn=None,
         loss_fn=None,
+        task: TaskAdapter | None = None,
         device: str = "cpu",
     ) -> None:
         self.runtime_manager = runtime_manager
-        self.base_model = model
         self.optimizer_fn = optimizer_fn
-        self.loss_fn = loss_fn
+        self.task = task
+        self.loss_fn = loss_fn if loss_fn is not None else (task.loss if task is not None else None)
         self.device = device
-        self.model = copy.deepcopy(model).to(device)
+        sample_inputs = runtime_manager._require_runtime_handle().plan.metadata["_example_inputs"]
+        self.backend_adapter = adapter_for(model, sample_inputs)
+        self.model = self.backend_adapter.move_model(self.backend_adapter.clone_model(model), device)
         self.optimizer = None
         self.runtime_handle = None
         self.sid = ""
@@ -86,23 +43,24 @@ class AutoSplitServerModel(NumPyServerModel):
         self._lock = threading.Lock()
 
     def get_parameters(self):
-        return _model_to_ndarrays(self.model)
+        return self.backend_adapter.export_ndarrays(self.model)
 
     def configure_fit(self, parameters, config) -> None:
-        _ = config
-        self._configure(parameters=parameters, sid=config.get("sid", ""), training=True)
-        trainable = [param for param in self.model.parameters() if param.requires_grad]
-        if trainable:
-            if self.optimizer_fn is not None:
-                self.optimizer = self.optimizer_fn(self.model)
-            else:
-                self.optimizer = torch.optim.SGD(trainable, lr=0.01)
+        self._configure(parameters=parameters, sid=config.get("sid", ""), training=True,
+                        plan_id=config.get(AUTOSPLIT_PLAN_ID_CONFIG_KEY))
+        if self.optimizer_fn is not None:
+            self.optimizer = self.optimizer_fn(self.model)
         else:
-            self.optimizer = None
+            self.optimizer = self.backend_adapter.build_optimizer(self.model, {"name": "sgd", "lr": 0.01})
+        if self.optimizer is not None and self.backend_adapter.backend_name == "tf":
+            # Both split segments share this optimizer. Keras otherwise builds
+            # its variable registry on the suffix's first partial update and
+            # rejects the prefix variables when their gradients arrive.
+            self.optimizer.build(self.model.trainable_variables)
 
     def configure_evaluate(self, parameters, config) -> None:
-        _ = config
-        self._configure(parameters=parameters, sid=config.get("sid", ""), training=False)
+        self._configure(parameters=parameters, sid=config.get("sid", ""), training=False,
+                        plan_id=config.get(AUTOSPLIT_PLAN_ID_CONFIG_KEY))
         self.optimizer = None
 
     def get_fit_result(self):
@@ -112,68 +70,45 @@ class AutoSplitServerModel(NumPyServerModel):
             "avg_loss": average_loss,
         }
 
-    def train_batch(self, inputs, targets=None):
+    def train_task_batch(self, payload):
+        """Train a nested task batch after the ordinary NumPy RPC wire round trip."""
         with self._lock:
-            target_batches = targets if targets is not None else [None] * len(inputs)
             responses = []
-            for batch_inputs, batch_targets in zip(inputs, target_batches):
-                torch_inputs = _to_torch(batch_inputs, device=self.device)
-                torch_targets = _to_torch(batch_targets, device=self.device)
-                result = self.runtime_manager.run_train_plan(
-                    self.runtime_handle,
-                    torch_inputs,
-                    targets=torch_targets,
-                    loss_fn=self.loss_fn,
-                    prefix_optimizer=self.optimizer,
-                    suffix_optimizer=self.optimizer,
+            for encoded in payload:
+                batch = decode_task_batch(encoded, device=self.device, backend=self.backend_adapter.backend_name)
+                call = ModelInputs(bind_model_inputs(batch.inputs.args, self.backend_adapter), batch.inputs.kwargs)
+                result = self.runtime_manager.autosplit_session.run_train(
+                    self.runtime_handle, call, targets=batch.targets, loss_fn=self.loss_fn,
+                    prefix_optimizer=self.optimizer, suffix_optimizer=self.optimizer,
                 )
-                examples = _batch_size(torch_inputs)
-                loss_value = float(result["loss"].detach().cpu())
-                self.num_examples += examples
-                self.loss_total += loss_value * examples
-                responses.append(
-                    {
-                        "loss": np.asarray([loss_value], dtype=np.float32),
-                        "num_examples": np.asarray([examples], dtype=np.int64),
-                    }
-                )
+                loss_value = self.backend_adapter.scalar_value(result["loss"])
+                self.num_examples += batch.num_examples
+                self.loss_total += loss_value * batch.num_examples
+                responses.append({"loss": np.asarray([loss_value], dtype=np.float32),
+                                  "num_examples": np.asarray([batch.num_examples], dtype=np.int64)})
             return responses
 
-    def evaluate_batch(self, inputs, targets=None):
+    def evaluate_task_batch(self, payload):
         with self._lock:
-            target_batches = targets if targets is not None else [None] * len(inputs)
             responses = []
-            for batch_inputs, batch_targets in zip(inputs, target_batches):
-                torch_inputs = _to_torch(batch_inputs, device=self.device)
-                torch_targets = _to_torch(batch_targets, device=self.device)
-                outputs = self.runtime_manager.run_eval_plan(
-                    self.runtime_handle,
-                    torch_inputs,
-                )
-                loss = self.runtime_manager.autosplit_session.compute_loss(
-                    outputs,
-                    torch_targets,
-                    self.loss_fn,
-                )
-                responses.append(
-                    {
-                        "loss": np.asarray([float(loss.detach().cpu())], dtype=np.float32),
-                        "num_examples": np.asarray([_batch_size(torch_inputs)], dtype=np.int64),
-                    }
-                )
+            for encoded in payload:
+                batch = decode_task_batch(encoded, device=self.device, backend=self.backend_adapter.backend_name)
+                call = ModelInputs(bind_model_inputs(batch.inputs.args, self.backend_adapter), batch.inputs.kwargs)
+                outputs = self.runtime_manager.autosplit_session.run_eval(self.runtime_handle, call)
+                loss = self.runtime_manager.autosplit_session.compute_loss(outputs, batch.targets, self.loss_fn)
+                responses.append({"loss": np.asarray([self.backend_adapter.scalar_value(loss)], dtype=np.float32),
+                                  "num_examples": np.asarray([batch.num_examples], dtype=np.int64)})
             return responses
 
-    def _configure(self, *, parameters, sid: str, training: bool) -> None:
+    def _configure(self, *, parameters, sid: str, training: bool, plan_id: str | None = None) -> None:
         self.sid = sid
         self.num_examples = 0
         self.loss_total = 0.0
-        _load_model_from_ndarrays(self.model, parameters)
-        if training:
-            self.model.train()
-        else:
-            self.model.eval()
+        self.backend_adapter.load_ndarrays(self.model, parameters)
+        self.backend_adapter.set_training(self.model, training)
         plan_suffix = f"{sid or 'shared'}_{uuid.uuid4().hex[:8]}"
         self.runtime_handle = self.runtime_manager.clone_runtime_for_model(
             self.model,
             suffix=plan_suffix,
+            plan_id=plan_id,
         )

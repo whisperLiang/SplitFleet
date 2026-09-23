@@ -1,0 +1,87 @@
+--- a/torchlens/backends/tinygrad/_uop_graph.py
++++ b/torchlens/backends/tinygrad/_uop_graph.py
+@@ -1,4 +1,5 @@
+ """Traversal, operand addressing, and structural signatures for tinygrad UOp graphs."""
++# Modified by SplitFleet: compact, iterative DAG signatures for local build 1.
+ 
+ from __future__ import annotations
+ 
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ from collections.abc import Mapping, Sequence
++from hashlib import sha256
+ from typing import Any, cast
+ 
+ 
+@@ -177,7 +178,7 @@
+ 
+ 
+ def _uop_signature(uop: Any) -> str:
+-    """Return a structural UOp signature string.
++    """Return a compact structural UOp signature without expanding DAG paths.
+ 
+     Parameters
+     ----------
+@@ -187,12 +188,46 @@
+     Returns
+     -------
+     str
+-        Recursive operation/dtype/arg signature.
+-    """
+-
+-    src = getattr(uop, "src", ()) or ()
+-    children = ",".join(_uop_signature(child) for child in src)
+-    return f"{_uop_name(uop)}:{getattr(uop, 'dtype', None)}:{getattr(uop, 'arg', None)}[{children}]"
++        SHA-256 Merkle signature of operation, dtype, arg, and ordered sources.
++        Structurally identical graphs match independently of object sharing.
++
++    Notes
++    -----
++    Iterative postorder traversal hashes each reachable UOp once per call, so
++    shared subgraphs take O(V + E) work and deep graphs do not use recursion.
++    The identity memo is local: no graph objects or stale signatures survive
++    the call. Length-prefixed metadata and fixed-size child digests keep fields
++    and operand positions unambiguous.
++    """
++
++    digests: dict[int, bytes] = {}
++    stack = [(uop, False)]
++    while stack:
++        node, expanded = stack.pop()
++        node_id = id(node)
++        if node_id in digests:
++            continue
++        sources = tuple(getattr(node, "src", ()) or ())
++        if not expanded:
++            stack.append((node, True))
++            stack.extend((source, False) for source in reversed(sources))
++            continue
++
++        digest = sha256(b"torchlens.tinygrad.uop.v1\0")
++        for field in (
++            _uop_name(node),
++            str(getattr(node, "dtype", None)),
++            str(getattr(node, "arg", None)),
++        ):
++            encoded = field.encode("utf-8")
++            digest.update(len(encoded).to_bytes(8, "big"))
++            digest.update(encoded)
++        digest.update(len(sources).to_bytes(8, "big"))
++        for source in sources:
++            digest.update(digests[id(source)])
++        digests[node_id] = digest.digest()
++
++    return "sha256:" + digests[id(uop)].hex()
+ 
+ 
+ def _tinygrad_signature_key(
+@@ -208,7 +243,7 @@
+     Parameters
+     ----------
+     uop_signature
+-        Recursive structural UOp signature.
++        Compact structural UOp signature.
+     ordinal
+         Legacy topological ordinal retained in the internal call signature for
+         compatibility. tinygrad 0.13's graph normalization introduces

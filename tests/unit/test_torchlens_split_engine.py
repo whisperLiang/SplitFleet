@@ -29,7 +29,7 @@ def _request(training: bool = True) -> SplitRequest:
     return SplitRequest(
         percent(50),
         backend="torch",
-        features=SplitFeatures(dynamic_batch=(2, 8), training=training),
+        features=SplitFeatures(training=training),
     )
 
 
@@ -66,9 +66,17 @@ def test_engine_training_keeps_context_local_and_consumes_once() -> None:
     boundary, token = engine.run_prefix(handle, torch.randn(3, 4), training=True)
     assert token is not None
     assert all(isinstance(tensor.payload, bytes) for tensor in boundary.tensors)
-    result = engine.run_suffix(handle, boundary, torch.randn(3, 2), optimizer)
+    result = engine.run_suffix(
+        handle, boundary, torch.randn(3, 2), optimizer,
+        loss_fn=torch.nn.functional.mse_loss,
+    )
     assert result.gradients is not None
     assert result.loss is not None
+    for field_name, bad_value in (("backend", "jax"), ("split_id", "wrong-split"),
+                                  ("plan_id", "wrong-plan"), ("model_version", 1)):
+        with pytest.raises(ValueError, match="Gradient"):
+            engine.backward_prefix(handle, token, replace(result.gradients, **{field_name: bad_value}), optimizer)
+    # A rejected response must not consume the graph needed by the valid reply.
     engine.backward_prefix(handle, token, result.gradients, optimizer)
 
     with pytest.raises(KeyError, match="No pending"):
@@ -104,6 +112,7 @@ def test_cpu_prefix_to_gpu_suffix_has_same_contract_and_trains() -> None:
         boundary,
         torch.randn(3, 2, device="cuda"),
         torch.optim.SGD(gpu_model.parameters(), lr=0.01),
+        loss_fn=torch.nn.functional.mse_loss,
     )
     assert token is not None and result.gradients is not None
     client_engine.backward_prefix(
@@ -131,6 +140,7 @@ def test_gpu_prefix_to_gpu_suffix_trains_with_independent_runtimes() -> None:
         boundary,
         torch.randn(3, 2, device="cuda"),
         torch.optim.SGD(server_model.parameters(), lr=0.01),
+        loss_fn=torch.nn.functional.mse_loss,
     )
     assert token is not None and result.gradients is not None
     client_engine.backward_prefix(

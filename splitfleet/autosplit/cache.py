@@ -141,7 +141,7 @@ class PlanCacheStore:
                     self._memory_cache.move_to_end(model_name)
                     return cached.entry
 
-        # Fall back to disk
+        # Check the persistent cache after the in-memory fast path.
         entry = self._load_from_disk(model_name)
         if entry is not None:
             with self._cache_lock:

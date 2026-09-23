@@ -35,10 +35,12 @@ def train_torch_suffix(
 ):
     """Train suffix while replaying non-leaf views of leaf gradient roots.
 
-    TorchLens 2.31 replays its leaf roots directly. Models such as timm ResNet
+    TorchLens 2.34.1 replays its leaf roots directly. Models such as timm ResNet
     use in-place residual adds, which PyTorch correctly rejects on leaf tensors.
     A zero-add view remains connected to the root while being safe for replay.
     """
+    if loss_fn is None:
+        raise ValueError("Suffix training requires an explicit loss_fn.")
     runtime.validate_boundary(boundary)
     roots: dict[str, torch.Tensor] = {}
     replay: dict[str, Any] = {}
@@ -62,12 +64,7 @@ def train_torch_suffix(
         None,
     )
     output, forward_ms = _timed_phase(lambda: runtime.run_suffix(replay_boundary), device)
-    if loss_fn is not None:
-        loss = loss_fn(output, targets)
-    elif targets is not None and isinstance(output, torch.Tensor) and isinstance(targets, torch.Tensor):
-        loss = torch.nn.functional.mse_loss(output, targets)
-    else:
-        raise ValueError("Torch suffix training requires loss_fn for non-tensor outputs")
+    loss = loss_fn(output, targets)
     def backward_and_step():
         loss.backward()
         gradients = {

@@ -13,6 +13,9 @@ def _run_isolated(request, *, extra_env=None) -> bool:
     if os.environ.get("SPLITFLEET_OPTIONAL_BACKEND_CHILD") == "1":
         return False
     env = os.environ.copy()
+    for variable in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                     "TF_NUM_INTRAOP_THREADS", "TF_NUM_INTEROP_THREADS"):
+        env[variable] = "1"
     env["SPLITFLEET_OPTIONAL_BACKEND_CHILD"] = "1"
     env.update(extra_env or {})
     result = subprocess.run(
@@ -54,7 +57,7 @@ def _exercise(model, inputs, targets, loss_fn, backend: str) -> None:
     runtime.backend.backward_prefix(training_boundary, gradients)
 
 
-def _exercise_engine_protocol(model, inputs, targets, backend: str) -> None:
+def _exercise_engine_protocol(model, inputs, targets, loss_fn, backend: str) -> None:
     from splitfleet.autosplit.runtime import compute_loss
     from splitfleet.autosplit.torchlens_runtime import make_split_spec
     from splitfleet.backends import BACKEND_ADAPTERS
@@ -68,11 +71,11 @@ def _exercise_engine_protocol(model, inputs, targets, backend: str) -> None:
         model,
         args,
         make_split_spec(
-            "50%", backend=backend, dynamic_batch=(batch_size, batch_size),
+            "50%", backend=backend,
         ),
     )
     boundary, token = engine.run_prefix(handle, args, training=True)
-    result = engine.run_suffix(handle, boundary, targets)
+    result = engine.run_suffix(handle, boundary, targets, loss_fn=loss_fn)
     assert result.gradients is not None
     assert np.isfinite(result.loss)
     assert token is not None
@@ -81,7 +84,7 @@ def _exercise_engine_protocol(model, inputs, targets, backend: str) -> None:
     eval_boundary, _ = engine.run_prefix(handle, args, training=False)
     eval_result = engine.run_suffix(handle, eval_boundary)
     outputs = decode_bundle(eval_result.outputs, device=None, backend=backend)
-    loss = compute_loss(outputs, targets)
+    loss = compute_loss(outputs, targets, loss_fn)
     assert np.isfinite(BACKEND_ADAPTERS.create(backend).scalar_value(loss))
 
 
@@ -104,7 +107,7 @@ def test_tensorflow_split_engine_protocol_optional(request) -> None:
     ])
     inputs = tf.ones((3, 4))
     targets = tf.zeros((3, 2))
-    _exercise_engine_protocol(model, inputs, targets, "tf")
+    _exercise_engine_protocol(model, inputs, targets, tf.keras.losses.MeanSquaredError(), "tf")
 
 
 def test_jax_split_training_optional(request) -> None:
@@ -115,7 +118,30 @@ def test_jax_split_training_optional(request) -> None:
     def model(params, x): return jnp.tanh(x) @ params["weight"]
     inputs, targets = (params, jnp.ones((3, 4))), jnp.zeros((3, 2))
     _exercise(model, inputs, targets, lambda output, target: jnp.mean((output - target) ** 2), "jax")
-    _exercise_engine_protocol(model, inputs, targets, "jax")
+    _exercise_engine_protocol(model, inputs, targets, lambda output, target: jnp.mean((output - target) ** 2), "jax")
+
+
+def test_jax_reshape_payload_includes_passthrough_parameters(request) -> None:
+    if _run_isolated(request, extra_env={"CUDA_VISIBLE_DEVICES": ""}): return
+    jnp = pytest.importorskip("jax.numpy")
+    from splitfleet.autosplit import prepare_torchlens_runtime
+
+    params = {"first": jnp.ones((4, 8)), "last": jnp.ones((8, 3))}
+
+    def model(parameters, inputs):
+        return (inputs @ parameters["first"]).reshape(-1, 8) @ parameters["last"]
+
+    inputs = jnp.ones((2, 10, 4))
+    handle = prepare_torchlens_runtime(
+        model, (params, inputs), boundary="after:reshape_1_5:1",
+        batch_axes={"/args/1": 0}, dynamic_batch=(1, 8),
+    )
+    capture_batch = handle.runtime.traced_batch_size
+    payload = handle.backend.run_prefix(params, inputs[:capture_batch])
+    actual_bytes = sum(np.asarray(tensor).nbytes for tensor in payload.tensors.values())
+
+    assert len(payload.tensors) == 2  # Reshaped activations and the suffix parameter matrix.
+    assert handle.plan.boundary_bytes == actual_bytes == (capture_batch * 10 * 8 + 8 * 3) * 4
 
 
 def test_paddle_split_training_optional(request) -> None:
@@ -124,7 +150,7 @@ def test_paddle_split_training_optional(request) -> None:
     model = paddle.nn.Sequential(paddle.nn.Linear(4, 8), paddle.nn.ReLU(), paddle.nn.Linear(8, 2))
     inputs, targets = paddle.randn((3, 4)), paddle.randn((3, 2))
     _exercise(model, inputs, targets, paddle.nn.MSELoss(), "paddle")
-    _exercise_engine_protocol(model, inputs, targets, "paddle")
+    _exercise_engine_protocol(model, inputs, targets, paddle.nn.MSELoss(), "paddle")
 
 
 def test_tinygrad_split_training_optional(request) -> None:
@@ -132,14 +158,14 @@ def test_tinygrad_split_training_optional(request) -> None:
     try:
         installed_version = version("tinygrad")
     except PackageNotFoundError:
-        pytest.skip("tinygrad is not installed; TorchLens 2.31 requires tinygrad==0.13.0 on Python >=3.11")
+        pytest.skip("tinygrad is not installed; TorchLens 2.34.1 requires tinygrad==0.13.0 on Python >=3.11")
     if installed_version != "0.13.0":
-        pytest.skip("TorchLens 2.31 requires tinygrad==0.13.0 (Python >=3.11)")
-    if _run_isolated(request, extra_env={"DEVICE": "CPU", "DEBUG": "0"}): return
+        pytest.skip("TorchLens 2.34.1 requires tinygrad==0.13.0 (Python >=3.11)")
+    if _run_isolated(request, extra_env={"DEV": "CPU", "DEBUG": "0"}): return
     tinygrad = pytest.importorskip("tinygrad")
     from tinygrad import Tensor
     class Model:
         def __call__(self, x): return (x * 2.0).relu() + 1.0
     inputs, targets = Tensor.randn(2, 4), Tensor.randn(2, 4)
     _exercise(Model(), inputs, targets, lambda output, target: ((output - target) ** 2).mean(), "tinygrad")
-    _exercise_engine_protocol(Model(), inputs, targets, "tinygrad")
+    _exercise_engine_protocol(Model(), inputs, targets, lambda output, target: ((output - target) ** 2).mean(), "tinygrad")
