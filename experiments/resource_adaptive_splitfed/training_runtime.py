@@ -31,6 +31,35 @@ from .resource_monitor import EnergyMeter, PeakMemoryTracker, ServerJobPool
 from .split_candidates import ExperimentSplitCandidate
 
 
+def fedprox_penalty(
+    model: torch.nn.Module,
+    reference_parameters: Mapping[str, torch.Tensor],
+) -> torch.Tensor:
+    """Return ``0.5 * ||w - w_global||^2`` over trainable parameters.
+
+    The caller applies FedProx's ``mu`` coefficient.  Keeping the coefficient
+    outside makes the primitive directly testable and prevents an experiment
+    configuration value from being hidden in model state.
+    """
+
+    trainable = [(name, parameter) for name, parameter in model.named_parameters() if parameter.requires_grad]
+    if not trainable:
+        raise ValueError("FedProx requires at least one trainable model parameter.")
+    missing = [name for name, _ in trainable if name not in reference_parameters]
+    if missing:
+        raise ValueError(f"FedProx reference is missing trainable parameters: {missing}")
+    penalty = trainable[0][1].new_zeros(())
+    for name, parameter in trainable:
+        reference = reference_parameters[name].to(device=parameter.device, dtype=parameter.dtype)
+        if reference.shape != parameter.shape:
+            raise ValueError(
+                f"FedProx reference shape mismatch for {name!r}: "
+                f"{tuple(reference.shape)} != {tuple(parameter.shape)}"
+            )
+        penalty = penalty + 0.5 * torch.sum((parameter - reference) ** 2)
+    return penalty
+
+
 @dataclass
 class SwitchMeasurement:
     old_split_key: str
@@ -76,6 +105,7 @@ class LogicalClientRuntime:
         device: str | torch.device = "cpu",
         learning_rate: float = 0.01,
         max_batch_size: int | None = None,
+        proximal_mu: float = 0.0,
     ) -> None:
         self.client_id = str(client_id)
         self.device = torch.device(device)
@@ -83,10 +113,14 @@ class LogicalClientRuntime:
         self.sample_inputs = sample_inputs.to(self.device)
         self.candidates = dict(candidates)
         self.learning_rate = float(learning_rate)
+        self.proximal_mu = float(proximal_mu)
+        if self.proximal_mu < 0:
+            raise ValueError("FedProx proximal_mu must be non-negative.")
         self.max_batch_size = max(1, int(max_batch_size or sample_inputs.shape[0]))
         self.current_split_key = "full_local"
         self._runtime_cache: dict[str, Any] = {}
         self.optimizer: torch.optim.Optimizer | None = None
+        self._proximal_reference: dict[str, torch.Tensor] = {}
 
     def activate(
         self,
@@ -98,9 +132,19 @@ class LogicalClientRuntime:
         old = self.current_split_key
         _, model_transfer_ms = timed_call(lambda: logical_state.load_model(self.model), self.device)
         self.model.train()
+        self._proximal_reference = {
+            name: parameter.detach().clone()
+            for name, parameter in self.model.named_parameters()
+            if parameter.requires_grad
+        }
         runtime_prepare_ms = 0.0
         runtime = None
         if split_key != "full_local":
+            if self.proximal_mu:
+                raise ValueError(
+                    "FedProx is a full-local FL baseline in this experiment; "
+                    "do not combine proximal_mu with a split candidate."
+                )
             candidate = self.candidates[split_key]
             runtime = self._runtime_cache.get(split_key)
             if runtime is None:
@@ -163,9 +207,14 @@ class LogicalClientRuntime:
                 outputs, forward_ms = timed_call(lambda: self.model(inputs), self.device)
                 _check_deadline(deadline_ns)
                 loss = loss_fn(outputs, targets)
+                objective = loss
+                if self.proximal_mu:
+                    objective = objective + self.proximal_mu * fedprox_penalty(
+                        self.model, self._proximal_reference
+                    )
 
                 def backward() -> None:
-                    loss.backward()
+                    objective.backward()
                     self.optimizer.step()
 
                 _, backward_ms = timed_call(backward, self.device)

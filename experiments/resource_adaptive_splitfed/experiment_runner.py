@@ -41,6 +41,7 @@ from .training_runtime import BatchMeasurement, LogicalClientRuntime, SwitchMeas
 
 METHODS = {
     "fedavg_full_local",
+    "fedprox",
     "fixed_early",
     "fixed_middle",
     "fixed_late",
@@ -225,7 +226,7 @@ def _select_splits(
     best_global_fixed: str,
     oracle_choices: Mapping[str, str],
 ) -> dict[str, str]:
-    if method in {"fedavg_full_local", "fedavg_full_local_with_timeout"}:
+    if method in {"fedavg_full_local", "fedprox", "fedavg_full_local_with_timeout"}:
         return {client_id: "full_local" for client_id in clients}
     if method in {"fixed_early", "fixed_middle", "fixed_late"}:
         return {client_id: _fixed_key(method) for client_id in clients}
@@ -485,6 +486,9 @@ def run_experiment(config: dict[str, Any], method: str, seed: int, run_id: str) 
     set_reproducible_seed(seed)
     if config.get("optimizer", {}).get("name", "sgd").lower() != "sgd" or float(config.get("optimizer", {}).get("momentum", 0.0)) != 0.0:
         raise ValueError("RA-SplitFed currently requires SGD with momentum=0; optimizer state is never silently discarded.")
+    fedprox_mu = float((config.get("fedprox") or {}).get("mu", 0.01))
+    if method == "fedprox" and fedprox_mu <= 0:
+        raise ValueError("The FedProx baseline requires fedprox.mu > 0.")
     torch.set_num_threads(int(config.get("torch_num_threads", max(1, torch.get_num_threads()))))
     device = str(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
     model_factory = lambda: build_model(
@@ -565,6 +569,7 @@ def run_experiment(config: dict[str, Any], method: str, seed: int, run_id: str) 
             device=device,
             learning_rate=float(config.get("optimizer", {}).get("lr", 0.01)),
             max_batch_size=int(config.get("batch_size", 32)),
+            proximal_mu=fedprox_mu if method == "fedprox" else 0.0,
         )
         for index in range(num_clients)
     }

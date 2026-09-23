@@ -70,7 +70,7 @@ torchlens = { path = "./torchlens-2.34.1-1-py3-none-any.whl" }
 include = ["splitfleet*", "experiments*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests", "experiments/resource_adaptive_splitfed/tests"]
+testpaths = ["tests", "experiments/resource_adaptive_splitfed/tests", "experiments/unified_multitask"]
 addopts = "-q"
 markers = [
     "integration: real-model or optional-dependency integration checks",

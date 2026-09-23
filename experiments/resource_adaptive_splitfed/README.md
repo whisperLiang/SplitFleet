@@ -234,6 +234,8 @@ minimum hold. An optional per-round switch cap is also enforced.
 ## Methods
 
 - `fedavg_full_local`: every client trains the complete model locally.
+- `fedprox`: full-local FL with a configurable proximal objective
+  (`fedprox.mu`, default `0.01`) anchored to the round's global parameters.
 - `fixed_early`, `fixed_middle`, `fixed_late`: one uniform semantic cut.
 - `best_global_fixed`: the fastest mean cut in the separate profile/calibration
   run; it is never selected from final training results.

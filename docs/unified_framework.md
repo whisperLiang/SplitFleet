@@ -105,6 +105,24 @@ Flower 中，策略和每个客户端都应传入相同的 `batch_axes={}` 并�
 
 默认分类/分割交叉熵约定 logits 为 `[N, C, ...]`，类别轴在第 1 维。采用 channels-last 的模型需要转换输出或提供 `loss_fn`。默认损失支持已注册的五种张量框架；任务可通过自定义 `prepare_batch` 和 `loss` 扩展。直接调用底层 split runtime 时必须显式传入 `loss_fn`，不会根据输出和标签猜测 MSE。
 
+数据集级实验通过 `TaskSpec` 把任务适配器、模型/数据工厂、主次指标和候选切点收敛为
+同一个显式契约。核心包不会在发现任务时下载数据或导入可选框架，因此内置 spec 只绑定
+适配器和参考指标；实验包可派生 spec 并补充 `model_factory`、`dataset_factory` 与
+`candidate_cuts`。`TASK_SPECS` 内置图像分类、文本分类、目标检测、语义分割和实例分割，
+并提供 `image_cls`、`text_cls`、`detection`、`segmentation` 等别名。
+
+```python
+from splitfleet.tasks import TASK_SPECS, TaskSpec
+
+base = TASK_SPECS.get("detection")
+task = base.make_adapter(model_loss=False, loss_fn=detection_criterion)
+print(base.primary_metric)  # map50
+```
+
+参考指标实现只依赖 NumPy：分类 accuracy/macro-F1、语义分割 mIoU/Dice，以及按类别、
+按置信度排序且每个真值最多匹配一次的 all-point interpolated mAP@0.5。大型正式评估仍可在
+`TaskSpec` 中替换为数据集官方 evaluator。
+
 ```python
 from splitfleet.tasks import TextClassificationTask
 
@@ -195,3 +213,5 @@ JSON 保存每个任务、每个切点的结果、误差和能力诊断。退出
 | JAX | 8 | 26 | 10 | 6 | 12 | 62 |
 
 每个通过项同时检查完整输出、任务损失、所有参数梯度、一次 SGD 更新，以及激活和边界梯度的序列化往返。检测 fixture 使用每图一个监督对象的分类与框回归，实例分割额外使用 mask BCE；这些是用于验证训练机制的小模型，不能代表 Faster R-CNN、Mask R-CNN 或真实数据集上的最终精度。
+实例分割当前纳入切点、损失与梯度的机制正确性矩阵；内置 `TaskSpec` 仅提供
+`box_map50`，尚未提供实例 mask AP，因此不把它计入四任务数据集级效果结论。

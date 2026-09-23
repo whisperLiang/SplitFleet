@@ -26,6 +26,7 @@ torch_num_threads: 1
 seeds: [1, 2, 3, 4, 5]
 methods:
   - fedavg_full_local
+  - fedprox
   - fixed_early
   - fixed_middle
   - fixed_late
@@ -39,6 +40,8 @@ optimizer:
   name: sgd
   lr: 0.01
   momentum: 0.0
+fedprox:
+  mu: 0.01
 scheduler:
   min_relative_improvement_to_switch: 0.10
   min_rounds_between_switches: 3
