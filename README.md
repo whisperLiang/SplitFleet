@@ -1,7 +1,7 @@
 # SplitFleet
 
-The complete RA-SplitFed experiment package is documented in
-[`experiments/resource_adaptive_splitfed/README.md`](experiments/resource_adaptive_splitfed/README.md).
+The CoSplit-UCB experiment package is documented in
+[`experiments/cosplit_ucb/README.md`](experiments/cosplit_ucb/README.md).
 
 SplitFleet is a unified split federated learning framework built on top of [Flower](https://flower.ai/) and TorchLens. It separates framework backends, operation-level model partitioning, task adapters, boundary transport, and federated aggregation.
 
@@ -37,10 +37,10 @@ Currently supported:
 - split training with suffix gradients returned to the prefix
 - shared server tail
 - per-client server tail
-- per-client and per-round placement selection through
-  `AutoSplitStrategy.client_placement_fn`
-- capability-aware per-client placement through
-  [`CapabilityAwarePlacementPolicy`](splitfleet/server/placement/capability_placement.py)
+- one joint per-round dynamic placement policy interface through
+  `AutoSplitStrategy.placement_policy`
+- cooperative online placement through
+  [`CoSplitUCBPlacementPolicy`](splitfleet/server/placement/cosplit_ucb/policy.py)
 - a fleet-wide dynamic batch window negotiated by the strategy, permitting
   heterogeneous batch sizes when native TorchLens batch validation succeeds
 - SplitFed-style client and server aggregation
@@ -227,33 +227,51 @@ the dropped batch and example counts are reported in the round metrics rather
 than silently absorbed. This skip policy does not handle fixed-shape mismatches
 or native batch-probe failures inside the admitted window.
 
-### Capability-aware placement across heterogeneous devices
+### CoSplit-UCB placement across heterogeneous devices
 
-`CapabilityAwarePlacementPolicy` is usable directly as `client_placement_fn`. It
-moves a slow device toward a lighter client prefix and a fast device toward a
-heavier one, using a boundary ladder ordered from the lightest to the heaviest
-client prefix:
+SplitFleet has one built-in dynamic partition policy: CoSplit-UCB. TorchLens
+discovers valid operation-level cuts, CoSplit-UCB learns component costs and
+jointly assigns selected clients under bounded suffix-server concurrency, and
+Flower performs client selection and aggregation. `boundary="auto"` only means
+automatic boundary discovery; dynamic selection belongs to the policy.
 
 ```python
-from splitfleet.server.placement import CapabilityAwarePlacementPolicy
+from splitfleet.server.placement import (
+    CoSplitUCBPlacementPolicy,
+    TorchLensCandidateProvider,
+)
 
-placement = CapabilityAwarePlacementPolicy(
-    boundary_ladder=["after:layer1", "after:layer2", "after:layer3"],
+placement = CoSplitUCBPlacementPolicy(
+    candidate_provider=TorchLensCandidateProvider(
+        model=model,
+        sample_inputs=sample_inputs,
+    ),
 )
 strategy = AutoSplitStrategy(
     model=model,
     sample_inputs=sample_inputs,
-    client_placement_fn=placement,
+    placement_policy=placement,
     aggregation_policy="splitfed",
 )
 ```
 
-The strategy feeds every fit result and failure back into the policy, decides
-once per round so fit and evaluate agree, and applies hysteresis so a fleet of
-similar devices stays on a stable cut. Split clients report the signals the
-policy consumes — `fit_duration_sec`, `prefix_compute_sec`, `tail_wait_sec`,
-`upload_bytes`, `download_bytes`, `num_batches`, `min_batch_size`,
-`max_batch_size`, and the skipped-batch counters.
+CoSplit-UCB treats fine-grained split selection as a cooperative,
+non-stationary contextual-bandit problem. It learns client, network, server and
+repartitioning costs from real split-training feedback, shares edge knowledge
+by execution profile, keeps link learners per client, and uses a shared server
+learner. A lane simulator derives queueing and minimizes synchronous round
+makespan. Slack-aware exploration is accepted only inside a conservative global
+slowdown budget. The default parameters are starting points, not claimed optima.
+
+The solver schedules each client's sequential training batches on shared server
+lanes; the switch cost is paid once per round. It uses the latest observed batch
+count for each client, or a count supplied by runtime telemetry. Exploration is
+held back when a selected client's batch count is still unknown. Existing
+learner observations decay by elapsed training rounds before the next placement
+prediction. Client-reported backend, device, accelerator, and precision identify
+which clients share edge-side learning.
+Production diagnostics record round wall time from fit dispatch to result
+collection separately from the longest client-reported fit duration.
 
 A device whose per-client suffix replica is missing at aggregation time is
 logged and dropped from that round's SplitFed reassembly; the rounds the other
@@ -278,7 +296,7 @@ mode are the two deltas summed. Shared buffers are not treated as tied.
 
 - [`splitfleet/autosplit`](splitfleet/autosplit): TorchLens adapter, two-stage planner, runtime facade, serde, and cache.
 - [`splitfleet/server/strategy/autosplit_strategy.py`](splitfleet/server/strategy/autosplit_strategy.py): Flower strategy metadata and aggregation policy.
-- [`splitfleet/server/placement`](splitfleet/server/placement): per-client placement policies for heterogeneous devices.
+- [`splitfleet/server/placement/cosplit_ucb`](splitfleet/server/placement/cosplit_ucb): the sole production dynamic policy, including cooperative learners, feasibility, joint solving, safe exploration, and state.
 - [`splitfleet/autosplit/batch_window.py`](splitfleet/autosplit/batch_window.py): the dynamic batch window contract shared by the prefix and the suffix.
 - [`splitfleet/server/stage_runtime`](splitfleet/server/stage_runtime): active TorchLens runtime handle management for coordinator-local suffix execution.
 - [`splitfleet/server/server_model/autosplit_tail_server_model.py`](splitfleet/server/server_model/autosplit_tail_server_model.py): server suffix model bridge.
@@ -323,7 +341,8 @@ uv run --no-sync pytest tests/unit/test_torchlens_boundary_serde.py -q
 uv run --no-sync pytest tests/unit/test_torchlens_candidate_contract.py -q
 uv run --no-sync pytest tests/unit/test_stage_runtime_contract.py -q
 uv run --no-sync pytest tests/unit/test_batch_window.py -q
-uv run --no-sync pytest tests/unit/test_capability_placement.py -q
+uv run --no-sync pytest tests/unit/test_cosplit_policy.py -q
+uv run --no-sync pytest tests/unit/test_cosplit_solver.py -q
 uv run --no-sync pytest tests/test_cross_device_cross_batch.py -q
 uv run --no-sync pytest tests/test_splitfed_aggregation.py -q
 uv run --no-sync pytest tests/test_server_round_finalization.py -q
@@ -332,7 +351,7 @@ uv run --no-sync pytest tests/test_server_round_finalization.py -q
 `tests/test_cross_device_cross_batch.py` covers the cross-device and cross-batch
 round behaviour: window broadcast and adoption, heterogeneous batch sizes in one
 round, prefix and suffix rejection of out-of-window batches, the skip policy,
-feature-ABI refusal, capability-aware placement through the strategy, and
+feature-ABI refusal, CoSplit-UCB placement through the strategy, and
 SplitFed aggregation with a missing suffix replica.
 
 Integration checks:

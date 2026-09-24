@@ -1,0 +1,95 @@
+schema: splitfleet.physical-large-model-protocol.v1
+created_at: "2026-08-10T00:00:00+08:00"
+status: formal_matrix_authorized_after_valid_profile
+classification: post_hoc_exploratory_stress_experiment
+trigger: user_requested_test_after_resnet18_seed1_results
+
+topology:
+  server: {id: fy205, address: 192.168.66.205}
+  clients:
+    - {id: win136, address: 192.168.66.136, expected_device: cpu}
+    - {id: orin140, address: 192.168.66.140, expected_device: cuda}
+    - {id: orin118, address: 192.168.66.118, expected_device: cuda}
+    - {id: orin238, address: 192.168.66.238, expected_device: cuda}
+
+model_selection:
+  status: selected
+  ordered_candidates: [wide_resnet50_2, resnet101, resnet50]
+  rule: largest_candidate_passing_full_local_and_all_three_split_checks_on_all_clients
+  prohibited_selection_inputs: [comparative_round_time, test_accuracy]
+  selected_model: wide_resnet50_2
+  selected_at: "2026-08-10T23:15:00+08:00"
+  feasibility_evidence:
+    full_local_run_id: pilotA8_wide_resnet50_2_fedavg_full_local_seed1_20260810
+    split_run_id: pilotA8_wide_resnet50_2_split_feasibility_seed1_20260810
+    split_validation_sha256: ca44fadbca05048b91991ca15da685f3905e19574ef505043ba876ee0ea57ba3
+    split_validation_valid: true
+    clients_per_split: 4
+    failure_records: 0
+  limitation: >-
+    The 8 GiB orin140 client used swap during the split feasibility run. The
+    run nevertheless completed without OOM or an unsupported graph contract,
+    so the frozen selection rule requires selecting wide_resnet50_2.
+
+workload:
+  dataset: cifar10
+  normalization: groupnorm
+  partition: {type: dirichlet, alpha: 0.5}
+  max_train_samples: 8000
+  test_samples: 10000
+  rounds: 100
+  common_warmup_rounds: [1, 3]
+  measured_training_rounds: [4, 100]
+  batch_size: 16
+  max_batches_per_round: 4
+  optimizer: {name: sgd, lr: 0.02, momentum: 0.0, weight_decay: 0.0}
+  seeds: [1, 2, 3, 4, 5]
+  candidate_cuts: [stem, layer2, layer4]
+
+methods:
+  - fedavg_full_local
+  - best_global_fixed
+  - static_heterogeneous
+  - edge_local_adaptive
+  - cosplit_ucb
+
+profile:
+  required: true
+  status: valid_and_selection_frozen
+  rounds: 9
+  schedule: [stem, layer2, layer4, stem, layer2, layer4, stem, layer2, layer4]
+  selection_source: large_model_profile_only
+  run_id: profileA8_wide_resnet50_2_candidates_seed1_20260810
+  validation_sha256: 05f0b57b925bac61a26a866e920c31431803491606eb61e24464ad7cbaa24032
+  failure_records: 0
+  steady_round_mean_sec: {stem: 71.12961334647844, layer2: 71.85382540649152, layer4: 68.27390832948731}
+  frozen_selection:
+    best_global_fixed: layer4
+    static_heterogeneous: {win136: stem, orin140: layer4, orin118: layer4, orin238: layer4}
+
+resource_scenario:
+  phases:
+    - {name: common_warmup, rounds: [1, 3]}
+    - {name: natural_lan, rounds: [4, 25]}
+    - {name: constrained_win136_boundary_link, rounds: [26, 60], uplink_mbps: 10, downlink_mbps: 50}
+    - {name: recovered_natural_lan, rounds: [61, 100]}
+  disclosure: >-
+    Application pacing applies to split-boundary messages, not physical NICs
+    or full-model Flower synchronization. Natural-LAN phases are also reported.
+
+analysis:
+  classification: exploratory
+  system_rounds: [4, 100]
+  report_mean_round_time: true
+  report_nearest_rank_p95_round_time: true
+  report_final_accuracy: true
+  report_accuracy_vs_wall_clock: true
+  report_time_to_common_accuracy_thresholds: true
+  report_model_and_boundary_bytes: true
+  report_client_and_server_memory: true
+  failed_runs: retain_and_report
+  missing_data: no_imputation
+
+claim_boundary: >-
+  Results test whether scale changes the observed system trade-off. They do not
+  alter or rescue the original ResNet-18 confirmatory hypotheses.

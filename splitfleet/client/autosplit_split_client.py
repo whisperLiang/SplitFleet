@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import platform
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, field
+from statistics import median
 from typing import Any, Callable, Iterable, Optional
 
 from splitfleet.autosplit import (
@@ -48,14 +50,93 @@ from splitfleet.common.constants import (
     AUTOSPLIT_MODEL_VERSION_CONTRACT_CONFIG_KEY,
     AUTOSPLIT_MODE_CONFIG_KEY,
     AUTOSPLIT_PLAN_ID_CONFIG_KEY,
+    AUTOSPLIT_RUNTIME_BACKEND_CONFIG_KEY,
     AUTOSPLIT_RUNTIME_CONTRACT_CONFIG_KEY,
     AUTOSPLIT_SPLIT_ID_CONFIG_KEY,
     AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY,
+    CLIENT_ID_CONFIG_KEY,
+    TRANSPORT_CLIENT_SEND_NS_METADATA_KEY,
+    TRANSPORT_SERVER_RECEIVE_NS_METADATA_KEY,
+    TRANSPORT_SERVER_SEND_NS_METADATA_KEY,
 )
-from splitfleet.common.constants import CLIENT_ID_CONFIG_KEY
 
 
 PARTIAL_BATCH_POLICIES = ("error", "skip")
+
+
+def _model_precision(model: Any) -> str:
+    """Return a stable precision class when a backend exposes parameter dtypes."""
+
+    parameters = getattr(model, "parameters", None)
+    try:
+        values = parameters() if callable(parameters) else getattr(model, "trainable_variables", ())
+        first = next(iter(values))
+        dtype = str(first.dtype).lower()
+    except (AttributeError, StopIteration, TypeError, RuntimeError, ValueError):
+        return "fp32"
+    if "bfloat16" in dtype:
+        return "bf16"
+    if "float16" in dtype:
+        return "fp16"
+    if "float64" in dtype or "double" in dtype:
+        return "fp64"
+    return "fp32"
+
+
+def _accelerator_name(device: str) -> str:
+    kind = str(device).split(":", 1)[0].lower()
+    if kind == "cpu":
+        return platform.machine().lower() or "generic_cpu"
+    if kind == "cuda":
+        try:
+            import torch
+
+            return str(torch.cuda.get_device_name(device)).lower().replace("|", "/")
+        except (RuntimeError, AssertionError, ValueError, OSError, ImportError, AttributeError):
+            return "generic_cuda"
+    return f"generic_{kind}"
+
+
+def _synchronize_prefix_device(backend_name: str, device: str) -> None:
+    """Include queued CUDA work in measured prefix phases."""
+
+    if backend_name == "torch" and str(device).split(":", 1)[0].lower() == "cuda":
+        import torch
+
+        torch.cuda.synchronize(device)
+
+
+def _transport_phase_ms(
+    metadata: dict[str, Any],
+    *,
+    client_send_ns: int,
+    client_receive_ns: int,
+) -> tuple[float | None, float | None]:
+    """Return one-way phases only when cross-host clocks are causally ordered.
+
+    Deployments must synchronize wall clocks (for example with PTP or NTP).
+    Invalid ordering leaves both measurements missing; round-trip duration is
+    never divided using an assumed upload/download ratio.
+    """
+
+    try:
+        server_receive_ns = int(
+            metadata[TRANSPORT_SERVER_RECEIVE_NS_METADATA_KEY]
+        )
+        server_send_ns = int(metadata[TRANSPORT_SERVER_SEND_NS_METADATA_KEY])
+    except (KeyError, TypeError, ValueError):
+        return None, None
+    if not (
+        int(client_send_ns)
+        <= server_receive_ns
+        <= server_send_ns
+        <= int(client_receive_ns)
+    ):
+        return None, None
+    return (
+        (server_receive_ns - int(client_send_ns)) / 1_000_000.0,
+        (int(client_receive_ns) - server_send_ns) / 1_000_000.0,
+    )
 
 
 @dataclass(frozen=True)
@@ -85,6 +166,11 @@ class _RoundTelemetry:
     download_bytes: int = 0
     min_batch_size: int = 0
     max_batch_size: int = 0
+    _client_forward_samples_ms: list[float] = field(default_factory=list, repr=False)
+    _client_backward_samples_ms: list[float] = field(default_factory=list, repr=False)
+    _server_service_samples_ms: list[float] = field(default_factory=list, repr=False)
+    _network_upload_samples_ms: list[float] = field(default_factory=list, repr=False)
+    _network_download_samples_ms: list[float] = field(default_factory=list, repr=False)
 
     def record_batch(self, batch_size: int) -> None:
         self.num_batches += 1
@@ -97,8 +183,38 @@ class _RoundTelemetry:
         self.skipped_batches += 1
         self.skipped_examples += max(int(batch_size), 0)
 
+    def record_component(self, name: str, milliseconds: float | None) -> None:
+        if milliseconds is None:
+            return
+        value = float(milliseconds)
+        if value < 0:
+            return
+        samples = getattr(self, f"_{name}_samples_ms")
+        samples.append(value)
+
     def as_metrics(self) -> dict[str, Any]:
-        return asdict(self)
+        metrics: dict[str, Any] = {
+            "num_batches": self.num_batches,
+            "skipped_batches": self.skipped_batches,
+            "skipped_examples": self.skipped_examples,
+            "prefix_compute_sec": self.prefix_compute_sec,
+            "tail_wait_sec": self.tail_wait_sec,
+            "upload_bytes": self.upload_bytes,
+            "download_bytes": self.download_bytes,
+            "min_batch_size": self.min_batch_size,
+            "max_batch_size": self.max_batch_size,
+        }
+        for name in (
+            "client_forward",
+            "client_backward",
+            "server_service",
+            "network_upload",
+            "network_download",
+        ):
+            samples = getattr(self, f"_{name}_samples_ms")
+            if samples:
+                metrics[f"{name}_ms"] = float(median(samples))
+        return metrics
 
 
 class AutoSplitSplitLearningClient(NumPyClient):
@@ -147,6 +263,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
         self.device = device
         self.partial_batch_policy = partial_batch_policy
         self._runtime_cache: dict[str, _RoundRuntime] = {}
+        self._last_split_prepare_sec = 0.0
         self._context_store = PrefixContextStore()
         self._round_config: dict[str, Any] = {}
 
@@ -156,6 +273,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
 
     def fit(self, parameters, config):
         fit_start = time.perf_counter()
+        previous_plan_id = str(self._round_config.get(AUTOSPLIT_PLAN_ID_CONFIG_KEY, ""))
         prepare_start = time.perf_counter()
         round_runtime = self._prepare_round(parameters, config, training=True)
         runtime_prepare_sec = time.perf_counter() - prepare_start
@@ -181,13 +299,17 @@ class AutoSplitSplitLearningClient(NumPyClient):
 
             zero_grad(self.model, prefix_optimizer)
 
+            _synchronize_prefix_device(self.backend_adapter.backend_name, self.device)
             prefix_started = time.perf_counter()
             boundary = runtime_handle.backend.run_prefix(
                 *torch_inputs,
                 training=True,
                 input_kwargs=call.kwargs,
             )
-            telemetry.prefix_compute_sec += time.perf_counter() - prefix_started
+            _synchronize_prefix_device(self.backend_adapter.backend_name, self.device)
+            forward_sec = time.perf_counter() - prefix_started
+            telemetry.prefix_compute_sec += forward_sec
+            telemetry.record_component("client_forward", forward_sec * 1000.0)
             step_id = uuid.uuid4().hex
             self._context_store.put(round_id, client_id, step_id, boundary)
             wire_boundary = boundary_to_envelope(
@@ -218,13 +340,17 @@ class AutoSplitSplitLearningClient(NumPyClient):
             if gradient_envelope.model_version != round_id:
                 raise RuntimeError("Gradient response model version mismatch")
             local_boundary = self._context_store.pop(round_id, client_id, step_id)
+            _synchronize_prefix_device(self.backend_adapter.backend_name, self.device)
             backward_started = time.perf_counter()
             prefix_result = runtime_handle.backend.backward_prefix(
                 local_boundary,
                 boundary_grads=envelope_to_gradients(gradient_envelope, self.device),
                 optimizer=prefix_optimizer,
             )
-            telemetry.prefix_compute_sec += time.perf_counter() - backward_started
+            _synchronize_prefix_device(self.backend_adapter.backend_name, self.device)
+            backward_sec = time.perf_counter() - backward_started
+            telemetry.prefix_compute_sec += backward_sec
+            telemetry.record_component("client_backward", backward_sec * 1000.0)
             if self.backend_adapter.backend_name == "jax" and self.functional_update_fn is not None:
                 update_target = (
                     self.backend_adapter.external_params
@@ -242,14 +368,27 @@ class AutoSplitSplitLearningClient(NumPyClient):
             telemetry.record_batch(batch_size)
 
         average_loss = weighted_loss / max(num_examples, 1)
+        fit_duration_sec = time.perf_counter() - fit_start
+        current_plan_id = str(config[AUTOSPLIT_PLAN_ID_CONFIG_KEY])
         metrics = {
             "loss": average_loss,
-            "fit_duration_sec": time.perf_counter() - fit_start,
+            "fit_duration_sec": fit_duration_sec,
+            "fit_duration_ms": fit_duration_sec * 1000.0,
             "runtime_prepare_sec": runtime_prepare_sec,
+            "switch_ms": (
+                self._last_split_prepare_sec * 1000.0
+                if previous_plan_id and previous_plan_id != current_plan_id
+                else 0.0
+            ),
             "num_examples": num_examples,
             "boundary": str(runtime_handle.plan.boundary),
             "plan_id": str(runtime_handle.plan.plan_id),
             "device": str(self.device),
+            "framework_backend": str(self.backend_adapter.backend_name),
+            "runtime_backend": str(config[AUTOSPLIT_RUNTIME_BACKEND_CONFIG_KEY]),
+            "device_type": str(self.device).split(":", 1)[0].lower(),
+            "accelerator": _accelerator_name(self.device),
+            "precision": _model_precision(self.model),
             **telemetry.as_metrics(),
         }
         return self.backend_adapter.export_ndarrays(self.model), num_examples, metrics
@@ -301,7 +440,11 @@ class AutoSplitSplitLearningClient(NumPyClient):
                 telemetry.record_batch(batch_size)
 
         average_loss = weighted_loss / max(num_examples, 1)
-        metrics = {"loss": average_loss, **telemetry.as_metrics()}
+        metrics = {
+            "loss": average_loss,
+            "boundary": str(runtime_handle.plan.boundary),
+            **telemetry.as_metrics(),
+        }
         return float(average_loss), num_examples, metrics
 
     def _prepare_round(self, parameters, config, *, training: bool) -> _RoundRuntime:
@@ -329,12 +472,16 @@ class AutoSplitSplitLearningClient(NumPyClient):
             if version_contract.state_schema_hash != state_schema:
                 raise RuntimeError("Client model state schema mismatch")
         self.backend_adapter.set_training(self.model, training)
-        return self._ensure_round_runtime(config, state_schema)
+        split_prepare_started = time.perf_counter()
+        runtime = self._ensure_round_runtime(config, state_schema)
+        self._last_split_prepare_sec = time.perf_counter() - split_prepare_started
+        return runtime
 
     def _ensure_round_runtime(self, config, state_schema: str) -> _RoundRuntime:
         plan_id = str(config[AUTOSPLIT_PLAN_ID_CONFIG_KEY])
         split_id = str(config.get(AUTOSPLIT_SPLIT_ID_CONFIG_KEY, ""))
         graph_signature = str(config.get(AUTOSPLIT_GRAPH_SIGNATURE_CONFIG_KEY, ""))
+        feature_abi_id = str(config.get(AUTOSPLIT_FEATURE_ABI_ID_CONFIG_KEY, ""))
         module_mode = "train" if model_training(self.model) else "eval"
         # The server negotiates the dynamic batch window for the whole fleet.
         # A device that re-derives it from its own sample batch would prepare a
@@ -343,7 +490,8 @@ class AutoSplitSplitLearningClient(NumPyClient):
         trace_batch_mode = str(config.get(AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY, "")) or None
         cache_key = "|".join([
             self.backend_adapter.backend_name, torchlens_runtime_version(), self.model.__class__.__qualname__,
-            state_schema, plan_id, split_id, graph_signature, str(self.device), module_mode,
+            state_schema, plan_id, split_id, graph_signature, feature_abi_id,
+            str(self.device), module_mode,
             describe_batch_window(dynamic_batch), str(trace_batch_mode or ""),
         ])
         cached = self._runtime_cache.get(cache_key)
@@ -450,6 +598,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
     ):
         boundary_payload = encode_boundary(boundary)
         target_payload = encode_bundle_wire(targets, backend=self.backend_adapter.backend_name)
+        client_send_ns = time.time_ns()
         request = BatchData(
             data={
                 "boundary": boundary_payload,
@@ -457,12 +606,16 @@ class AutoSplitSplitLearningClient(NumPyClient):
                 "metadata": json.dumps({"num_examples": num_examples}).encode("utf-8"),
             },
             control_code=ControlCode.OK,
+            metadata={
+                TRANSPORT_CLIENT_SEND_NS_METADATA_KEY: str(client_send_ns)
+            },
         )
         started = time.perf_counter()
         response = getattr(self._require_server_model_proxy(), method_name)(
             request,
             _streams_=False,
         )
+        client_receive_ns = time.time_ns()
         if telemetry is not None:
             telemetry.tail_wait_sec += time.perf_counter() - started
             telemetry.upload_bytes += len(boundary_payload) + len(target_payload)
@@ -470,6 +623,15 @@ class AutoSplitSplitLearningClient(NumPyClient):
                 len(value) for value in response.data.values() if isinstance(value, bytes)
             )
         metadata = json.loads(response.data["metadata"].decode("utf-8"))
+        if telemetry is not None:
+            telemetry.record_component("server_service", metadata.get("server_service_ms"))
+            upload_ms, download_ms = _transport_phase_ms(
+                response.metadata,
+                client_send_ns=client_send_ns,
+                client_receive_ns=client_receive_ns,
+            )
+            telemetry.record_component("network_upload", upload_ms)
+            telemetry.record_component("network_download", download_ms)
         if "gradients" in response.data:
             metadata["gradients"] = decode_gradients(response.data["gradients"])
         return metadata

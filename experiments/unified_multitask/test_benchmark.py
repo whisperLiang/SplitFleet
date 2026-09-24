@@ -44,6 +44,7 @@ def test_four_task_splitfed_matches_full_local_model_updates(task: str) -> None:
 
     assert telemetry["boundary_upload_bytes"] > 0
     assert telemetry["boundary_download_bytes"] > 0
+    assert telemetry["switch_ms"] is None
     for name in full:
         torch.testing.assert_close(split[name], full[name], rtol=2e-4, atol=2e-6, msg=name)
 

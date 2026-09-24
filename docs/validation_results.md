@@ -76,7 +76,7 @@ DEV=CPU DEBUG=0 uv run --no-sync python docs/diagnostics/tinygrad_signature_cost
 
 ## 可复现命令
 
-完整 CPU 回归包括 `tests` 与 `experiments/resource_adaptive_splitfed/tests`；可选框架使用子进程隔离，避免多个框架的原生库在同一进程内冲突。
+完整 CPU 回归包括 `tests` 与 `experiments/cosplit_ucb/tests`；可选框架使用子进程隔离，避免多个框架的原生库在同一进程内冲突。
 
 ```bash
 mkdir -p results

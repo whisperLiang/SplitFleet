@@ -5,9 +5,17 @@ import pytest
 import torch
 from torch import nn
 
-from splitfleet.client.autosplit_split_client import AutoSplitSplitLearningClient
+from splitfleet.client.autosplit_split_client import (
+    AutoSplitSplitLearningClient,
+    _transport_phase_ms,
+)
 from splitfleet.common import ServerModelFitIns
-from splitfleet.common.constants import AUTOSPLIT_PLAN_ID_CONFIG_KEY, CLIENT_ID_CONFIG_KEY
+from splitfleet.common.constants import (
+    AUTOSPLIT_PLAN_ID_CONFIG_KEY,
+    CLIENT_ID_CONFIG_KEY,
+    TRANSPORT_SERVER_RECEIVE_NS_METADATA_KEY,
+    TRANSPORT_SERVER_SEND_NS_METADATA_KEY,
+)
 from splitfleet.server.server_model.autosplit_tail_server_model import AutoSplitTailServerModel
 from splitfleet.server.server_model.proxy.server_model_proxy import ServerModelProxy
 from splitfleet.server.stage_runtime.manager import StageRuntimeManager
@@ -63,6 +71,23 @@ class InProcessServerModelProxy(ServerModelProxy):
 
 def _model_to_ndarrays(model: nn.Module):
     return [tensor.detach().cpu().numpy() for tensor in model.state_dict().values()]
+
+
+def test_transport_phase_measurement_requires_causally_ordered_clocks() -> None:
+    metadata = {
+        TRANSPORT_SERVER_RECEIVE_NS_METADATA_KEY: "1002000000",
+        TRANSPORT_SERVER_SEND_NS_METADATA_KEY: "1012000000",
+    }
+    assert _transport_phase_ms(
+        metadata,
+        client_send_ns=1_000_000_000,
+        client_receive_ns=1_015_000_000,
+    ) == (2.0, 3.0)
+    assert _transport_phase_ms(
+        metadata,
+        client_send_ns=1_020_000_000,
+        client_receive_ns=1_030_000_000,
+    ) == (None, None)
 
 
 def test_torchlens_split_learning_client_and_tail_exchange_boundary_payloads() -> None:
@@ -141,12 +166,24 @@ def test_torchlens_splitfed_keeps_per_client_tail_semantics() -> None:
 def test_per_client_placements_execute_matching_prefix_and_tail_abis() -> None:
     torch.manual_seed(31)
     strategy_model = DeepNet()
+    class PlacementPolicy:
+        def plan_round(self, *, round_id, client_ids, training):
+            _ = (round_id, training)
+            return {
+                cid: "after:fc1" if cid == "early" else "after:fc2"
+                for cid in client_ids
+            }
+
+        def observe_round(self, **kwargs):
+            _ = kwargs
+
+        def observe_failure(self, **kwargs):
+            _ = kwargs
+
     strategy = AutoSplitStrategy(
         model=strategy_model,
         sample_inputs=torch.randn(2, 4),
-        client_placement_fn=lambda _round, cid, _training: (
-            "after:fc1" if cid == "early" else "after:fc2"
-        ),
+        placement_policy=PlacementPolicy(),
         loss_fn=nn.MSELoss(),
         optimizer_fn=lambda model: torch.optim.SGD(model.parameters(), lr=0.01),
     )
@@ -155,6 +192,7 @@ def test_per_client_placements_execute_matching_prefix_and_tail_abis() -> None:
     inputs = torch.randn(3, 4)
     targets = torch.randn(3, 2)
     observed_boundaries = set()
+    strategy._plan_round_placements(1, ["early", "late"], training=True)
 
     for cid in ("early", "late"):
         placement = strategy._placement_for_client(1, cid, training=True)

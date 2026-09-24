@@ -12,18 +12,35 @@ from flwr.common import Code, FitRes, Status, ndarrays_to_parameters, parameters
 from torch import nn
 
 from splitfleet.autosplit.batch_window import BatchWindowError, normalize_batch_window
-from splitfleet.client.autosplit_split_client import AutoSplitSplitLearningClient
+from splitfleet.client.autosplit_split_client import (
+    AutoSplitSplitLearningClient,
+    _synchronize_prefix_device,
+)
 from splitfleet.common import ServerModelFitIns, ServerModelFitRes
 from splitfleet.common.constants import (
     AUTOSPLIT_DYNAMIC_BATCH_CONFIG_KEY,
     AUTOSPLIT_FEATURE_ABI_ID_CONFIG_KEY,
     AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY,
 )
-from splitfleet.server.placement import CapabilityAwarePlacementPolicy, CapabilityPlacementConfig
+from splitfleet.server.placement import (
+    CoSplitUCBConfig,
+    CoSplitUCBPlacementPolicy,
+    SplitCandidateDescriptor,
+    StaticCandidateProvider,
+)
 from splitfleet.server.server_model.autosplit_tail_server_model import AutoSplitTailServerModel
 from splitfleet.server.server_model.proxy.server_model_proxy import ServerModelProxy
 from splitfleet.server.stage_runtime.manager import StageRuntimeManager
 from splitfleet.server.strategy import AutoSplitStrategy
+
+
+def test_prefix_timing_synchronizes_only_torch_cuda(monkeypatch) -> None:
+    devices = []
+    monkeypatch.setattr(torch.cuda, "synchronize", devices.append)
+    _synchronize_prefix_device("torch", "cpu")
+    _synchronize_prefix_device("jax", "cuda:0")
+    _synchronize_prefix_device("torch", "cuda:1")
+    assert devices == ["cuda:1"]
 
 
 class DeepNet(nn.Module):
@@ -211,50 +228,48 @@ def test_suffix_rejects_an_upload_outside_the_window() -> None:
         )
 
 
-def test_capability_placement_drives_per_client_boundaries_through_the_strategy() -> None:
-    policy = CapabilityAwarePlacementPolicy(
-        boundary_ladder=["after:fc1", "after:fc2"],
-        start_index=1,
-        config=CapabilityPlacementConfig(warmup_rounds=0, min_rounds_between_switches=0),
+def test_cosplit_ucb_assignment_drives_matching_strategy_boundaries() -> None:
+    candidates = [
+        SplitCandidateDescriptor(
+            boundary=boundary,
+            split_id=boundary,
+            graph_position_ratio=position,
+            prefix_node_count=prefix,
+            suffix_node_count=6 - prefix,
+            total_node_count=6,
+            boundary_forward_bytes=128,
+            boundary_gradient_bytes=128,
+            boundary_tensor_count=1,
+            prefix_parameter_bytes=None,
+            suffix_parameter_bytes=None,
+            client_memory_bytes=None,
+            server_memory_bytes=None,
+            trainable=True,
+            feature_abi_id=boundary,
+            graph_signature="deep-net",
+            framework_backend="pytorch",
+        )
+        for boundary, position, prefix in (("after:fc1", 0.3, 2), ("after:fc2", 0.7, 4))
+    ]
+    policy = CoSplitUCBPlacementPolicy(
+        candidate_provider=StaticCandidateProvider(candidates),
+        config=CoSplitUCBConfig(max_explorations_per_round=0, min_residence_rounds=0),
     )
     strategy = AutoSplitStrategy(
         model=DeepNet(),
         sample_inputs=torch.randn(2, 4),
-        client_placement_fn=policy,
+        placement_policy=policy,
         loss_fn=nn.MSELoss(),
     )
     manager = StageRuntimeManager(autosplit_session=strategy.autosplit_session)
     strategy.bind_stage_runtime_manager(manager)
 
-    # Placements are keyed by the requested boundary; the plan itself carries the
-    # canonical TorchLens label for that cut.
-    assert strategy._placement_for_client(1, "slow", training=True) is (
-        strategy._placement_plans["after:fc2"]
-    )
-    strategy.aggregate_fit(
-        1,
-        [
-            (
-                _FakeClientProxy(cid),
-                FitRes(
-                    status=Status(Code.OK, ""),
-                    parameters=ndarrays_to_parameters([np.zeros(1)]),
-                    num_examples=8,
-                    metrics={"fit_duration_sec": duration},
-                ),
-            )
-            for cid, duration in (("slow", 10.0), ("fast", 1.0))
-        ],
-        [],
-    )
-
-    slow_plan = strategy._placement_for_client(2, "slow", training=True)
-    fast_plan = strategy._placement_for_client(2, "fast", training=True)
-    assert slow_plan is strategy._placement_plans["after:fc1"]
-    assert fast_plan is strategy._placement_plans["after:fc2"]
-    assert slow_plan.boundary != fast_plan.boundary
-    # Round 1 entries are dropped once round 2 is planned.
-    assert all(key[0] == 2 for key in strategy._client_placement_cache)
+    assignments = strategy._plan_round_placements(1, ["slow", "fast"], training=True)
+    slow_plan = strategy._placement_for_client(1, "slow", training=True)
+    fast_plan = strategy._placement_for_client(1, "fast", training=True)
+    assert slow_plan is strategy._placement_plans[assignments["slow"]]
+    assert fast_plan is strategy._placement_plans[assignments["fast"]]
+    assert strategy._plan_round_placements(1, ["slow", "fast"], training=True) == assignments
 
 
 class _FakeClientProxy:

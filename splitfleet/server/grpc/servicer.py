@@ -1,11 +1,16 @@
 from typing import AsyncIterable
 import asyncio
+import time
 
 from splitfleet.proto import server_model_pb2_grpc
 from splitfleet.proto import server_model_pb2
 from splitfleet.server.server_model.manager import ServerModelManager
 from splitfleet.server.server_model.utils import ClientRequestGroup
 from splitfleet.common import BatchData, ControlCode
+from splitfleet.common.constants import (
+    TRANSPORT_SERVER_RECEIVE_NS_METADATA_KEY,
+    TRANSPORT_SERVER_SEND_NS_METADATA_KEY,
+)
 from splitfleet.common.serde import (
     control_code_from_proto,
     control_code_to_proto,
@@ -39,6 +44,7 @@ class ServerModelServicer(server_model_pb2_grpc.ServerModelServicer):
         cid: str,
         request: server_model_pb2.BatchData
     ) -> BatchData:
+        server_receive_ns = time.time_ns()
         data = BatchData(
             data = from_grpc_format(request.data),
             control_code=control_code_from_proto(request.control_code),
@@ -62,7 +68,14 @@ class ServerModelServicer(server_model_pb2_grpc.ServerModelServicer):
                 callback_fn()
 
         await event.wait()
-        return event.get_result()
+        response = event.get_result()
+        response.metadata[TRANSPORT_SERVER_RECEIVE_NS_METADATA_KEY] = str(
+            server_receive_ns
+        )
+        response.metadata[TRANSPORT_SERVER_SEND_NS_METADATA_KEY] = str(
+            time.time_ns()
+        )
+        return response
 
     def _trigger_computation(self, request_group: ClientRequestGroup, method_name: str):
         batches, events = request_group.get_data()

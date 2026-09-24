@@ -3,16 +3,16 @@
 This package executes the same client training and sample-weighted logical
 model aggregation interface for image classification, text classification,
 object detection, and semantic segmentation. Its methods are `fedavg`,
-`fedprox`, `splitfed_fixed`, and `splitfleet` (the repository's capability-aware
-per-client cut policy). The split methods execute TorchLens training prefixes
+`fedprox`, `splitfed_fixed`, and `splitfleet` (the framework plus its production
+CoSplit-UCB policy). The split methods execute TorchLens training prefixes
 and suffixes, with encoded/decoded activation and gradient envelopes.
 
 The runner is **sequential and in-process**. It verifies multi-task integration
 and learning curves on real datasets. Its elapsed time includes TorchLens
 capture on each client and local wire serialization; it does not measure a real
 LAN, separate edge device memory, or a physical heterogeneous fleet. Use
-`experiments/physical_ra_splitfed` for multi-host system claims and
-`experiments/resource_adaptive_splitfed` for controlled resource sweeps.
+`experiments/physical_cosplit_ucb` for multi-host system claims and
+`experiments/cosplit_ucb` for controlled resource sweeps.
 
 ## Data layout
 

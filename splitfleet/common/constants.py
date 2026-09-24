@@ -22,3 +22,10 @@ AUTOSPLIT_GRAPH_CONTRACT_CONFIG_KEY = "autosplit_graph_contract"
 AUTOSPLIT_GRAPH_CONTRACT_DIGEST_CONFIG_KEY = "autosplit_graph_contract_digest"
 AUTOSPLIT_MODEL_VERSION_CONFIG_KEY = "autosplit_model_version"
 AUTOSPLIT_MODEL_VERSION_CONTRACT_CONFIG_KEY = "autosplit_model_version_contract"
+
+# Wall-clock transport stamps are carried as decimal nanoseconds in gRPC
+# metadata. One-way values are accepted only when both hosts' timestamps form
+# a valid causal ordering; unsynchronized clocks remain explicit missing data.
+TRANSPORT_CLIENT_SEND_NS_METADATA_KEY = "splitfleet_client_send_ns"
+TRANSPORT_SERVER_RECEIVE_NS_METADATA_KEY = "splitfleet_server_receive_ns"
+TRANSPORT_SERVER_SEND_NS_METADATA_KEY = "splitfleet_server_send_ns"

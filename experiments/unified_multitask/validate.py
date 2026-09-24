@@ -113,7 +113,7 @@ def validate_run(path: str | Path) -> dict[str, Any]:
 
 
 def _stable_hash(value: Any) -> str:
-    from experiments.resource_adaptive_splitfed.config_utils import stable_hash
+    from experiments.cosplit_ucb.config_utils import stable_hash
 
     return stable_hash(value)
 

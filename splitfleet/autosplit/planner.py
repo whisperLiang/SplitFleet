@@ -48,18 +48,6 @@ def _coordinator_worker(worker_specs: Sequence[WorkerSpec]) -> WorkerSpec:
     return WorkerSpec(worker_id="coordinator", device="cpu")
 
 
-def _score(candidate: SplitCandidate, worker: WorkerSpec, objective: PlacementObjective) -> float:
-    bandwidth_bytes_per_s = max(float(worker.bandwidth_mbps), 1.0) * 125_000.0
-    bandwidth_cost = candidate.estimated_payload_bytes / bandwidth_bytes_per_s
-    latency_cost = max(int(candidate.descriptor.get("suffix_node_count", 1)), 1) / 1_000.0
-    privacy_cost = 0.0 if candidate.privacy_leakage == float("inf") else candidate.privacy_leakage
-    return (
-        objective.bandwidth_weight * bandwidth_cost
-        + objective.latency_weight * latency_cost
-        + objective.privacy_weight * privacy_cost
-    )
-
-
 def _candidate_satisfies_constraints(
     candidate: SplitCandidate,
     validation: dict[str, Any],
@@ -123,7 +111,6 @@ def _build_placement(
         suffix_memory = runtime_handle.plan.metadata.get("suffix_memory_bytes") or 0
         if suffix_memory and int(suffix_memory) > constraints.max_stage_memory_bytes:
             raise RuntimeError("TorchLens suffix stage exceeds max_stage_memory_bytes.")
-    score = _score(candidate, suffix_worker, objective)
     contract = dict(runtime_handle.plan.runtime_contract)
     metadata = {
         "backend": "torchlens",
@@ -154,7 +141,9 @@ def _build_placement(
         mode=runtime_handle.plan.mode,
         prefix_worker_id="client",
         suffix_worker_id=suffix_worker.worker_id,
-        score=score,
+        # Static/manual planning does not predict latency. Dynamic cost
+        # learning and ranking belong exclusively to CoSplit-UCB.
+        score=0.0,
         backend="torchlens",
         engine="torchlens",
         split_request={"boundary": runtime_handle.plan.boundary, "mode": runtime_handle.plan.mode},

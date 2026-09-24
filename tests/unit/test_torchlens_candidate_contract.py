@@ -7,6 +7,7 @@ from torch import nn
 from splitfleet.autosplit.torchlens_backend import TorchLensSplitBackend
 from splitfleet.autosplit.planner import AutoSplitPlanner
 from splitfleet.autosplit.types import PlacementConstraint
+from splitfleet.server.placement import TorchLensCandidateProvider
 from splitfleet.tasks import ModelInputs
 from splitfleet.autosplit.torchlens_contract import (
     build_feature_abi_spec,
@@ -83,6 +84,24 @@ def test_torchlens_candidate_replay_validation_executes_runtime() -> None:
     assert report["success"] is True
     assert report["max_abs_diff"] <= 1e-5
     assert report["max_rel_diff"] <= 1e-4
+
+
+def test_cosplit_provider_caches_all_valid_before_and_after_operations() -> None:
+    provider = TorchLensCandidateProvider(
+        model=ToyNet().eval(),
+        sample_inputs=torch.randn(2, 4),
+        dynamic_batch=(2, 8),
+    )
+    first = provider.get_candidates(training=True)
+    second = provider.get_candidates(training=True)
+
+    assert first is second
+    assert any(candidate.boundary.startswith("before:") for candidate in first)
+    assert any(candidate.boundary.startswith("after:") for candidate in first)
+    assert all(candidate.graph_signature for candidate in first)
+    assert all(candidate.feature_abi_id for candidate in first)
+    assert all(candidate.runtime_contract for candidate in first)
+    assert all(candidate.metadata["boundary_tensor_labels"] for candidate in first)
 
 
 def test_torchlens_trace_preserves_user_tl_prefixed_attributes() -> None:

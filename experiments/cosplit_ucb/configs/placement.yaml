@@ -1,0 +1,21 @@
+placement:
+  policy: cosplit_ucb
+  cosplit_ucb:
+    ridge_lambda: 1.0
+    discount_gamma: 0.98
+    alpha_edge: 1.0
+    alpha_network: 1.0
+    alpha_server: 1.0
+    alpha_switch: 0.5
+    safe_exploration_epsilon: 0.05
+    max_explorations_per_round: 1
+    min_residence_rounds: 2
+    forced_probe_interval: 10
+    failure_cooldown_rounds: 3
+    target_scale_ms: 1000.0
+    server_concurrency: 1
+    max_coordinate_passes: 3
+    max_candidates: null
+    warm_start: true
+    state_path: null
+    seed: 233

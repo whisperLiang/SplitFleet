@@ -1,0 +1,13 @@
+experiment: cosplit_ucb_smoke
+results_root: results/cosplit_ucb
+methods: [cosplit_ucb]
+seeds: [233]
+rounds: 30
+candidate_count: 5
+server_concurrency: 1
+discount_gamma: 0.80
+safe_exploration_epsilon: 0.25
+max_explorations_per_round: 1
+min_residence_rounds: 1
+forced_probe_interval: 4
+target_scale_ms: 100.0

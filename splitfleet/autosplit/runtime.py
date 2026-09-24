@@ -205,6 +205,7 @@ class AutoSplitSession:
         *,
         loss_fn=None,
         optimizer=None,
+        measurements: dict[str, float] | None = None,
     ) -> dict[str, Any]:
         handle = self.get_runtime_handle(runtime_handle)
         if loss_fn is None:
@@ -214,6 +215,7 @@ class AutoSplitSession:
             targets,
             loss_fn=loss_fn,
             optimizer=optimizer,
+            measurements=measurements,
         )
         return {
             "loss": loss,

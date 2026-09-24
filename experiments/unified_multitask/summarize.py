@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from experiments.resource_adaptive_splitfed.statistics import holm_adjust, paired_effect
+from experiments.cosplit_ucb.statistics import holm_adjust, paired_effect
 
 from .validate import validate_run
 
@@ -62,7 +62,6 @@ def summarize(
                 "test_examples": int(metadata["test_examples"]),
                 "learning_rate": float(metadata["learning_rate"]),
                 "dirichlet_alpha": metadata.get("dirichlet_alpha"),
-                "candidate_cuts": metadata["candidate_cuts"],
                 "sample_selection": metadata.get("sample_selection"),
                 "hostname": metadata["hostname"],
                 "device": metadata["device"],

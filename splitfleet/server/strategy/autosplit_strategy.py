@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import time
 from logging import ERROR, WARNING
-from typing import Any, Callable, Dict, Optional, Sequence
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 import numpy as np
 from flwr.common import log, ndarrays_to_parameters, parameters_to_ndarrays
@@ -59,7 +60,9 @@ from splitfleet.common.constants import (
     AUTOSPLIT_RUNTIME_CONTRACT_DIGEST_CONFIG_KEY,
     AUTOSPLIT_TORCHLENS_VERSION_CONFIG_KEY,
     AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY,
+    CLIENT_ID_CONFIG_KEY,
 )
+from splitfleet.server.placement import PlacementFeedback, RoundPlacementPolicy
 from splitfleet.server.server_model.autosplit_tail_server_model import AutoSplitTailServerModel
 from splitfleet.server.strategy.plain_strategy import PlainSlStrategy
 
@@ -121,7 +124,7 @@ class AutoSplitStrategy(PlainSlStrategy):
         loss_fn=None,
         optimizer_fn=None,
         runtime_device: str = "cpu",
-        client_placement_fn: Optional[Callable[[int, str, bool], Any]] = None,
+        placement_policy: Optional[RoundPlacementPolicy] = None,
         tied_weight_update_mode: str = "reject",
         client_selection: str | None = "flower_default",
         client_selector: Optional[ClientSelector] = None,
@@ -157,7 +160,7 @@ class AutoSplitStrategy(PlainSlStrategy):
             replica_scope_policy is None
             and (
                 self.aggregation_policy.requires_per_client_replica_scope()
-                or client_placement_fn is not None
+                or placement_policy is not None
             )
         ):
             self.replica_scope_policy = ReplicaScopePolicy(replica_scope=ReplicaScope.PER_CLIENT)
@@ -169,7 +172,7 @@ class AutoSplitStrategy(PlainSlStrategy):
                 "SplitFed aggregation requires `ReplicaScope.PER_CLIENT` server replicas."
             )
         if (
-            client_placement_fn is not None
+            placement_policy is not None
             and self.replica_scope_policy.resolve() != ReplicaScope.PER_CLIENT
         ):
             raise ValueError(
@@ -188,7 +191,7 @@ class AutoSplitStrategy(PlainSlStrategy):
         self.loss_fn = loss_fn if loss_fn is not None else (task.loss if task is not None else None)
         self.optimizer_fn = optimizer_fn
         self.runtime_device = runtime_device
-        self.client_placement_fn = client_placement_fn
+        self.placement_policy = placement_policy
         normalized_tied_mode = str(tied_weight_update_mode).strip().lower()
         if normalized_tied_mode not in TIED_WEIGHT_UPDATE_MODES:
             raise ValueError(
@@ -199,7 +202,8 @@ class AutoSplitStrategy(PlainSlStrategy):
         self._placement_plan = None
         self._placement_plans: dict[str, Any] = {}
         self._evaluation_placement_plans: dict[str, Any] = {}
-        self._client_placement_cache: dict[tuple[int, str, bool], Any] = {}
+        self._round_placement_assignments: dict[tuple[int, bool], dict[str, str]] = {}
+        self._round_fit_dispatch_start: dict[int, float] = {}
         self._autosplit_config_cache: dict[tuple[str, bool], Dict[str, Any]] = {}
         self._round_initial_client_states: dict[int, list[np.ndarray]] = {}
         self._round_initial_server_states: dict[int, list[np.ndarray]] = {}
@@ -297,34 +301,63 @@ class AutoSplitStrategy(PlainSlStrategy):
                 self._runtime_manager.set_placement_plan(self._placement_plan)
         return placement
 
-    def _placement_for_client(self, server_round: int, cid: str, *, training: bool):
-        if self.client_placement_fn is None:
-            return self.get_or_create_placement_plan(training=training)
-        cache_key = (int(server_round), str(cid), bool(training))
-        cached = self._client_placement_cache.get(cache_key)
+    def _plan_round_placements(
+        self,
+        server_round: int,
+        client_ids: Sequence[str],
+        *,
+        training: bool,
+    ) -> dict[str, str]:
+        """Plan selected clients together and cache the only assignment for the round."""
+
+        key = (int(server_round), bool(training))
+        cached = self._round_placement_assignments.get(key)
+        normalized = tuple(str(cid) for cid in client_ids)
         if cached is not None:
+            missing = set(normalized) - set(cached)
+            if missing:
+                raise ValueError(
+                    f"round {server_round} placement was already fixed without clients {sorted(missing)}"
+                )
             return cached
-        self._prune_placement_cache(int(server_round))
-        selected = self.client_placement_fn(int(server_round), str(cid), bool(training))
-        if selected is None:
-            placement = self.get_or_create_placement_plan(training=training)
-        elif hasattr(selected, "plan_id") and hasattr(selected, "boundary"):
-            placement = selected
-            placements = self._placement_plans if training else self._evaluation_placement_plans
-            placements.setdefault(str(placement.boundary), placement)
-            if self._runtime_manager is not None:
-                self._runtime_manager.register_placement_plan(placement)
+        if self.placement_policy is None:
+            assignments = {cid: str(self.boundary) for cid in normalized}
         else:
-            placement = self.get_or_create_placement_plan(str(selected), training=training)
-        self._client_placement_cache[cache_key] = placement
-        return placement
+            assignments = dict(
+                self.placement_policy.plan_round(
+                    round_id=int(server_round),
+                    client_ids=normalized,
+                    training=bool(training),
+                )
+            )
+            if set(assignments) != set(normalized):
+                raise ValueError("placement policy must return exactly one boundary per selected client")
+        self._round_placement_assignments[key] = {
+            str(cid): str(boundary) for cid, boundary in assignments.items()
+        }
+        self._prune_placement_cache(int(server_round))
+        return self._round_placement_assignments[key]
+
+    def _placement_for_client(self, server_round: int, cid: str, *, training: bool):
+        if self.placement_policy is None:
+            return self.get_or_create_placement_plan(training=training)
+        assignments = self._round_placement_assignments.get((int(server_round), bool(training)))
+        if assignments is None:
+            assignments = self._plan_round_placements(
+                server_round, [str(cid)], training=training
+            )
+        try:
+            boundary = assignments[str(cid)]
+        except KeyError as exc:
+            raise ValueError(f"no round placement exists for client {cid!r}") from exc
+        return self.get_or_create_placement_plan(boundary, training=training)
 
     def _prune_placement_cache(self, server_round: int) -> None:
         """Keep only the current round so long runs do not accumulate entries."""
 
-        stale = [key for key in self._client_placement_cache if key[0] < server_round]
+        stale = [key for key in self._round_placement_assignments if key[0] < server_round]
         for key in stale:
-            self._client_placement_cache.pop(key, None)
+            self._round_placement_assignments.pop(key, None)
 
     def _discard_round_state(self, through: int) -> None:
         """Drop per-round bookkeeping for every round up to and including ``through``.
@@ -434,11 +467,18 @@ class AutoSplitStrategy(PlainSlStrategy):
             np.array(value, copy=True) for value in parameters_to_ndarrays(parameters)
         ]
         instructions = super().configure_fit(server_round, parameters, client_manager)
+        self._plan_round_placements(
+            server_round,
+            [client.cid for client, _ in instructions],
+            training=True,
+        )
         for client, fit_ins in instructions:
             placement = self._placement_for_client(server_round, client.cid, training=True)
+            fit_ins.config[CLIENT_ID_CONFIG_KEY] = str(client.cid)
             fit_ins.config.update(
                 self._autosplit_config(server_round, training=True, placement=placement)
             )
+        self._round_fit_dispatch_start[int(server_round)] = time.perf_counter()
         return instructions
 
     def select_fit_clients(
@@ -502,8 +542,14 @@ class AutoSplitStrategy(PlainSlStrategy):
 
     def configure_evaluate(self, server_round, parameters, client_manager):
         instructions = super().configure_evaluate(server_round, parameters, client_manager)
+        self._plan_round_placements(
+            server_round,
+            [client.cid for client, _ in instructions],
+            training=False,
+        )
         for client, evaluate_ins in instructions:
             placement = self._placement_for_client(server_round, client.cid, training=False)
+            evaluate_ins.config[CLIENT_ID_CONFIG_KEY] = str(client.cid)
             evaluate_ins.config.update(
                 self._autosplit_config(server_round, training=False, placement=placement)
             )
@@ -513,6 +559,7 @@ class AutoSplitStrategy(PlainSlStrategy):
         self._round_initial_server_states[int(server_round)] = [
             np.array(value, copy=True) for value in parameters
         ]
+        self._plan_round_placements(server_round, cids, training=True)
         server_configs = super().configure_server_fit(server_round, parameters, cids)
         for config in server_configs:
             config.config["sid"] = config.sid
@@ -524,6 +571,7 @@ class AutoSplitStrategy(PlainSlStrategy):
         return server_configs
 
     def configure_server_evaluate(self, server_round, parameters, cids):
+        self._plan_round_placements(server_round, cids, training=False)
         server_configs = super().configure_server_evaluate(server_round, parameters, cids)
         for config in server_configs:
             config.config["sid"] = config.sid
@@ -534,7 +582,26 @@ class AutoSplitStrategy(PlainSlStrategy):
             )
         return server_configs
 
+    def aggregate_evaluate(self, server_round, results, failures):
+        aggregated = super().aggregate_evaluate(server_round, results, failures)
+        observe_evaluation = getattr(self.placement_policy, "observe_evaluation", None)
+        if observe_evaluation is not None:
+            planned = self._round_placement_assignments.get((int(server_round), False), {})
+            observe_evaluation(
+                round_id=int(server_round),
+                executions={
+                    str(proxy.cid): str((res.metrics or {}).get("boundary") or planned[str(proxy.cid)])
+                    for proxy, res in results
+                },
+            )
+        return aggregated
+
     def aggregate_fit(self, server_round, results, failures):
+        dispatch_start = self._round_fit_dispatch_start.pop(int(server_round), None)
+        round_wall_ms = (
+            (time.perf_counter() - dispatch_start) * 1000.0
+            if dispatch_start is not None else None
+        )
         usable_results = [
             (client, fit_res)
             for client, fit_res in results
@@ -552,6 +619,9 @@ class AutoSplitStrategy(PlainSlStrategy):
         if self.client_selector is not None:
             self._update_client_selector_after_fit(server_round, results, failures)
         self._update_placement_policy_after_fit(server_round, results, failures)
+        observe_wall_time = getattr(self.placement_policy, "observe_round_wall_time", None)
+        if observe_wall_time is not None and round_wall_ms is not None:
+            observe_wall_time(round_id=int(server_round), duration_ms=round_wall_ms)
         self.requests_state = {}
         self._round_active_clients = []
         for failure in failures:
@@ -598,30 +668,88 @@ class AutoSplitStrategy(PlainSlStrategy):
     def _update_placement_policy_after_fit(self, server_round, results, failures) -> None:
         """Feed round outcomes back into a stateful placement policy, if any."""
 
-        policy = self.client_placement_fn
-        observe_fit = getattr(policy, "observe_fit_metrics", None)
+        policy = self.placement_policy
+        observe_round = getattr(policy, "observe_round", None)
         observe_failure = getattr(policy, "observe_failure", None)
-        if observe_fit is None and observe_failure is None:
+        if observe_round is None and observe_failure is None:
             return
-        if observe_fit is not None:
+        if observe_round is not None:
+            observations = []
             for client, fit_res in results:
                 cid = getattr(client, "cid", None)
                 if cid is None:
                     continue
                 metrics = dict(fit_res.metrics or {})
-                metrics.setdefault("num_examples", fit_res.num_examples)
-                observe_fit(
-                    round_id=int(server_round),
-                    cid=str(cid),
-                    num_examples=fit_res.num_examples,
-                    metrics=metrics,
+                boundary = str(
+                    metrics.get("boundary")
+                    or self._round_placement_assignments.get((int(server_round), True), {}).get(str(cid), "")
                 )
+                observations.append(PlacementFeedback(
+                    round_id=int(server_round),
+                    client_id=str(cid),
+                    boundary=boundary,
+                    client_forward_ms=self._optional_metric(metrics, "client_forward_ms"),
+                    client_backward_ms=self._optional_metric(metrics, "client_backward_ms"),
+                    network_upload_ms=self._optional_metric(metrics, "network_upload_ms"),
+                    network_download_ms=self._optional_metric(metrics, "network_download_ms"),
+                    server_service_ms=self._optional_metric(metrics, "server_service_ms"),
+                    switch_ms=self._optional_metric(metrics, "switch_ms"),
+                    completion_ms=self._optional_metric(metrics, "fit_duration_ms"),
+                    num_examples=fit_res.num_examples,
+                    num_batches=int(metrics.get("num_batches", 0)),
+                    client_peak_memory_mb=self._optional_metric(metrics, "client_peak_memory_mb"),
+                    server_peak_memory_mb=self._optional_metric(metrics, "server_peak_memory_mb"),
+                    execution_profile=(
+                        {
+                            "framework_backend": str(metrics["framework_backend"]),
+                            "runtime_backend": str(metrics["runtime_backend"]),
+                            "device_type": str(metrics.get("device_type", "cpu")),
+                            "accelerator": str(metrics.get("accelerator", "generic_cpu")),
+                            "precision": str(metrics.get("precision", "fp32")),
+                        }
+                        if "framework_backend" in metrics and "runtime_backend" in metrics
+                        else None
+                    ),
+                    success=True,
+                ))
+            observe_round(round_id=int(server_round), feedback=observations)
         if observe_failure is not None:
             for failure in failures:
                 cid = self._failure_cid(failure)
                 if cid is None:
                     continue
-                observe_failure(round_id=int(server_round), cid=cid, reason=failure)
+                boundary = self._round_placement_assignments.get(
+                    (int(server_round), True), {}
+                ).get(cid)
+                observe_failure(
+                    round_id=int(server_round),
+                    client_id=cid,
+                    boundary=boundary,
+                    kind=self._classify_placement_failure(failure),
+                    reason=failure,
+                )
+
+    @staticmethod
+    def _optional_metric(metrics: Mapping[str, Any], key: str) -> float | None:
+        value = metrics.get(key)
+        if value is None:
+            return None
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return None
+        return result if np.isfinite(result) and result >= 0 else None
+
+    @staticmethod
+    def _classify_placement_failure(failure: Any) -> str:
+        text = str(failure).lower()
+        if "out of memory" in text or "oom" in text:
+            return "oom"
+        if "abi" in text or "contract" in text:
+            return "abi"
+        if "timeout" in text:
+            return "network"
+        return "runtime"
 
     def _update_client_selector_after_fit(self, server_round, results, failures) -> None:
         for client, fit_res in results:

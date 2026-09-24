@@ -29,7 +29,7 @@
 ### RQ2：逐客户端、逐轮自适应切点是否改善异构联邦训练？
 
 **H2（系统主假设）**：在共享初始模型、数据分区、客户端采样、优化器、批预算和
-资源轨迹的配对 seed 中，`resource_adaptive_splitfed` 相对 `best_global_fixed`：
+资源轨迹的配对 seed 中，`cosplit_ucb` 相对 `best_global_fixed`：
 
 - 平均轮次时间至少降低 15%；
 - p95 客户端完成时间至少降低 20%；
@@ -82,8 +82,8 @@ VOC07 的 11 点 AP 依据 [PASCAL VOC 挑战论文](https://www.microsoft.com/e
 | 静态 SFL | fixed-early/middle/late | 三个预先冻结的静态切点 |
 | 静态 SFL | best-global-fixed | 只由独立 profile 集选择的最佳统一切点 |
 | 异构 SFL | static-heterogeneous | 按设备档位固定切点，不随轮次变化 |
-| 局部自适应 | edge-local-adaptive | 每客户端独立最小化其预测时间 |
-| 提议方法 | resource-adaptive-splitfed | 联合考虑客户端、网络、服务器队列和切换成本 |
+| CoSplit-UCB 消融 | cosplit_ucb_no_global_solver | 每客户端独立选择，用于量化联合 solver 的贡献 |
+| 提议方法 | cosplit_ucb | cooperative online learning、共享服务器排队与安全探索 |
 | 上界（非基线） | oracle | 资源阶段首轮穷举，仅作 regret 参照，不参加优越性检验 |
 
 SplitFed V1 的同步、双侧更新与轮末聚合由静态 SFL 组覆盖。V2/V3 改变服务器更新顺序
@@ -129,8 +129,8 @@ SplitFed V1 的同步、双侧更新与轮末聚合由静态 SFL 组覆盖。V2/
 | 产物 | 路径 | 成功标准 |
 | --- | --- | --- |
 | 功能矩阵 | `results/unified_task_validation.json` | 机器可读、无 failed；unsupported 单列 |
-| 原始实验记录 | `results/resource_adaptive_splitfed/<run_id>/` | 通过严格 validator，无插补 |
-| 配对统计 | `results/resource_adaptive_splitfed/aggregated/paired_comparisons.csv` | 含 effect、CI、精确 p、Holm 与非劣性字段 |
+| 原始实验记录 | `results/cosplit_ucb/<run_id>/` | 通过严格 validator，无插补 |
+| 配对统计 | `results/cosplit_ucb/aggregated/paired_comparisons.csv` | 含 effect、CI、精确 p、Holm 与非劣性字段 |
 | 复现报告 | `docs/experiment_validation_report.md` | Material Passport + 11/11 fallacy scan |
 
 ## 可复现入口
@@ -141,18 +141,14 @@ uv run --no-sync python -m splitfleet.validation \
   --backends torch jax --all-nodes \
   --output results/unified_task_validation.json
 
-# 受控系统实验先 profile，再执行同 seed 的方法矩阵
-uv run --no-sync python -m experiments.resource_adaptive_splitfed.resource_profile \
-  --config experiments/resource_adaptive_splitfed/configs/profile_resnet18_cifar10.yaml \
-  --run-id profile_resnet18_cifar10
+# CoSplit-UCB 在线 smoke 不要求完整离线 profiling
+uv run --no-sync python -m experiments.cosplit_ucb.run_suite \
+  --config experiments/cosplit_ucb/configs/smoke.yaml \
+  --run-prefix smoke --resume
 
-uv run --no-sync python -m experiments.resource_adaptive_splitfed.run_suite \
-  --config experiments/resource_adaptive_splitfed/configs/static_heterogeneity.yaml \
-  --run-prefix static --resume
-
-uv run --no-sync python -m experiments.resource_adaptive_splitfed.aggregate_results \
-  --results-root results/resource_adaptive_splitfed \
-  --output results/resource_adaptive_splitfed/aggregated
+uv run --no-sync python -m experiments.cosplit_ucb.aggregate_results \
+  --results-root results/cosplit_ucb \
+  --output results/cosplit_ucb/aggregated
 ```
 
 ## 当前证据边界

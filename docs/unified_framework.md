@@ -29,9 +29,14 @@ uv sync --extra dev --extra integration --extra multibackend --extra experiment
 | `splitfleet.autosplit` | 切点诊断、选择、运行时、动态批次范围及缓存 |
 | `splitfleet.transport` | 无 pickle 的边界、目标与梯度协议 |
 | `splitfleet.client` / `splitfleet.server` | Flower 轮次、前缀/后缀执行与 SplitFed 聚合 |
+| `splitfleet.server.placement.cosplit_ucb` | 唯一内置动态切点策略：在线分量学习、全局并发求解和安全探索 |
 | `splitfleet.validation` | 与未分割模型比较的任务验证矩阵 |
 
 “多后端”指在各自框架中执行完整的前缀/后缀训练。它不意味着把同一个模型的 PyTorch 前缀直接连接到 TensorFlow 后缀，也不自动把不同模型结构的参数进行联邦平均。
+
+动态切点的职责严格分开：TorchLens 发现并验证算子级候选，CoSplit-UCB
+选择每轮所有客户端的联合 assignment，Flower 负责客户端选择与聚合。
+`boundary="auto"` 仅表示自动发现边界，不等同于资源自适应选择。
 
 可在不导入 TensorFlow 等大型框架的情况下发现依赖：
 

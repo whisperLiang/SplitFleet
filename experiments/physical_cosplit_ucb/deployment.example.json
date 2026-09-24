@@ -1,0 +1,59 @@
+{
+  "server": {
+    "python": "/home/whisperliang/SplitFleet/.venv/bin/python",
+    "workdir": "/home/whisperliang/SplitFleet",
+    "bind": "0.0.0.0:18097",
+    "connect": "192.168.66.205:18097",
+    "device": "cuda:0"
+  },
+  "clients": [
+    {
+      "id": "win136",
+      "ssh": "18514@192.168.66.136",
+      "shell": "powershell",
+      "python": ".\\.venv\\Scripts\\python.exe",
+      "workdir": "D:\\ProgramCode\\SplitFleet",
+      "device": "cpu"
+    },
+    {
+      "id": "orin140",
+      "ssh": "nvidia@192.168.66.140",
+      "shell": "posix",
+      "python": "./.venv-real-device/bin/python",
+      "workdir": "/home/nvidia/SplitFleet",
+      "device": "cuda:0"
+    },
+    {
+      "id": "orin118",
+      "ssh": "nvidia@192.168.66.118",
+      "shell": "posix",
+      "python": "./.venv-real-device/bin/python",
+      "workdir": "/home/nvidia/SplitFleet",
+      "device": "cuda:0"
+    },
+    {
+      "id": "orin238",
+      "ssh": "nvidia@192.168.66.238",
+      "shell": "posix",
+      "python": "./.venv-real-device/bin/python",
+      "workdir": "/home/nvidia/SplitFleet",
+      "device": "cuda:0"
+    }
+  ],
+  "experiment": {
+    "model": "resnet18",
+    "rounds": 3,
+    "seed": 233,
+    "batch_size": 32,
+    "local_epochs": 1,
+    "learning_rate": 0.001,
+    "momentum": 0.9,
+    "weight_decay": 0.0005,
+    "dirichlet_alpha": 0.5,
+    "data_root": "data",
+    "download": false,
+    "server_concurrency": 1,
+    "max_candidates": 8,
+    "evaluation_batch_size": 256
+  }
+}

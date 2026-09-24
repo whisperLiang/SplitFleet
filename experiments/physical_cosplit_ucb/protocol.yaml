@@ -1,0 +1,80 @@
+schema: splitfleet.physical-flower-cifar10-protocol.v2
+frozen_at: "2026-08-14T23:30:00+08:00"
+status: implementation_validation_pending
+experiment: physical_cosplit_ucb
+evidence_mode: physical_multi_host
+
+reference_implementation:
+  repository: https://github.com/flwrlabs/flower
+  quickstart: examples/quickstart-pytorch/pytorchexample/task.py
+  advanced_example: examples/advanced-pytorch/pytorch_example/task.py
+  cifar_baseline: baselines/flwr_baselines/flwr_baselines/publications/adaptive_federated_optimization/cifar/utils.py
+
+topology:
+  server: {id: fy205, address: 192.168.66.205, role: persistent_suffix_and_aggregation}
+  clients:
+    - {id: win136, address: 192.168.66.136, expected_device: cpu}
+    - {id: orin140, address: 192.168.66.140, expected_device: cuda}
+    - {id: orin118, address: 192.168.66.118, expected_device: cuda}
+    - {id: orin238, address: 192.168.66.238, expected_device: cuda}
+
+workload:
+  model: wide_resnet50_2
+  dataset: cifar10
+  data_pipeline: flower-cifar10-v1
+  train_samples: 50000
+  test_samples: 10000
+  train_transforms: [random_crop_32_padding_4, random_horizontal_flip, to_tensor, normalize]
+  evaluation_transforms: [to_tensor, normalize]
+  normalization:
+    mean: [0.4914, 0.4822, 0.4465]
+    std: [0.2023, 0.1994, 0.2010]
+  partition:
+    type: flower_dirichlet
+    alpha: 0.5
+    min_partition_size: 10
+    self_balancing: false
+    shuffle: true
+  rounds: 100
+  local_epochs: 1
+  batch_size: 32
+  optimizer: {name: sgd, lr: 0.001, momentum: 0.9, weight_decay: 0.0005}
+  seeds: [1, 2, 3]
+  candidate_cuts: [stem, layer2, layer4]
+
+training_semantics:
+  client_update: complete_local_partition_for_each_local_epoch
+  truncated_batch_budget: prohibited
+  aggregation: sample_weighted_mean_sorted_by_logical_client_id
+  centralized_evaluation: complete_official_cifar10_test_split_every_round
+  split_runtime: native_prefix
+  parameter_sync_mode: prefix_parameters
+  server_replica_scope: per_client_persistent_suffix
+  torchlens_in_timed_path: false
+
+methods:
+  - fedavg_full_local
+  - best_global_fixed
+  - static_heterogeneous
+  - edge_local_adaptive
+  - cosplit_ucb
+
+profile:
+  required: true
+  reuse_historical_profile: prohibited
+  rounds: 9
+  schedule: [stem, layer2, layer4, stem, layer2, layer4, stem, layer2, layer4]
+
+validity:
+  expected_clients: 4
+  failures: invalidate_and_retain
+  missing_data: no_imputation
+  require_source_manifest_match: true
+  require_partition_hash_match: true
+  require_zero_suffix_parameter_traffic_on_clients: true
+
+claim_boundary: >-
+  Results produced by the former 8000-sample/four-batch microbenchmark are
+  deleted and must not be combined with this protocol. Timing and accuracy
+  claims require fresh profiles and fresh runs under this complete local-epoch
+  Flower-style data pipeline.

@@ -3,7 +3,7 @@
 This is a controlled in-process correctness/convergence runner.  Its timing
 includes TorchLens capture and local wire encode/decode and is not a physical
 network or heterogeneous-device measurement.  Physical system conclusions
-must use the separate multi-host RA-SplitFed harness.
+must use the separate multi-host CoSplit-UCB harness.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import platform
+from statistics import median
 import time
 from itertools import chain
 from pathlib import Path
@@ -20,12 +21,17 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from experiments.resource_adaptive_splitfed.config_utils import git_commit, stable_hash, tensor_state_hash
-from experiments.resource_adaptive_splitfed.logical_state import aggregate_named_states
-from experiments.resource_adaptive_splitfed.model_data import dirichlet_partition
-from experiments.resource_adaptive_splitfed.training_runtime import fedprox_penalty
+from experiments.cosplit_ucb.config_utils import git_commit, stable_hash, tensor_state_hash
+from experiments.cosplit_ucb.logical_state import aggregate_named_states
+from experiments.cosplit_ucb.model_data import dirichlet_partition
+from experiments.cosplit_ucb.training_runtime import fedprox_penalty
 from splitfleet.autosplit.torchlens_backend import prepare_torchlens_runtime
-from splitfleet.server.placement import CapabilityAwarePlacementPolicy
+from splitfleet.server.placement import (
+    CoSplitUCBConfig,
+    CoSplitUCBPlacementPolicy,
+    PlacementFeedback,
+    TorchLensCandidateProvider,
+)
 from splitfleet.split_engine import graph_contract_for_runtime_handle
 from splitfleet.tasks import ModelInputs
 from splitfleet.transport import decode_boundary, decode_gradients, encode_boundary, encode_gradients
@@ -102,6 +108,11 @@ def _train_client(
         for name, tensor in global_state.items()
         if name in dict(model.named_parameters())
     }
+    def synchronize_device() -> None:
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+
+    synchronize_device()
     started = time.perf_counter()
     runtime_prepare_started = time.perf_counter()
     runtime = None
@@ -118,12 +129,16 @@ def _train_client(
             batch_axes={},
             model_name=model.__class__.__name__,
         )
+    synchronize_device()
     runtime_prepare_sec = time.perf_counter() - runtime_prepare_started
     counts = 0
     losses = 0.0
     upload_bytes = 0
     download_bytes = 0
     batches = 0
+    client_forward_samples = []
+    client_backward_samples = []
+    server_service_samples = []
     for raw_index, raw in enumerate(chain((first_raw,), iterator)):
         if max_batches is not None and raw_index >= max_batches:
             break
@@ -140,9 +155,13 @@ def _train_client(
             objective.backward()
             optimizer.step()
         else:
+            synchronize_device()
+            phase_started = time.perf_counter()
             local = runtime.backend.run_prefix(
                 *call.args, training=True, input_kwargs=dict(call.kwargs)
             )
+            synchronize_device()
+            client_forward_samples.append((time.perf_counter() - phase_started) * 1000.0)
             contract = graph_contract_for_runtime_handle(runtime)
             envelope = boundary_to_envelope(
                 local,
@@ -158,18 +177,29 @@ def _train_client(
             wire = encode_boundary(envelope)
             upload_bytes += len(wire)
             remote = envelope_to_boundary(decode_boundary(wire), runtime.runtime, device)
+            measurements: dict[str, float] = {}
             loss, gradients = runtime.backend.train_suffix(
-                remote, targets, loss_fn=adapter.loss, optimizer=optimizer
+                remote,
+                targets,
+                loss_fn=adapter.loss,
+                optimizer=optimizer,
+                measurements=measurements,
             )
+            server_service_samples.append(float(measurements["server_total_ms"]))
             gradient_wire = encode_gradients(gradients_to_envelope(envelope, gradients))
             download_bytes += len(gradient_wire)
             received = envelope_to_gradients(decode_gradients(gradient_wire), device)
+            synchronize_device()
+            phase_started = time.perf_counter()
             runtime.backend.backward_prefix(local, boundary_grads=received, optimizer=optimizer)
+            synchronize_device()
+            client_backward_samples.append((time.perf_counter() - phase_started) * 1000.0)
         counts += count
         losses += float(loss.detach().cpu()) * count
         batches += 1
     if counts == 0:
         raise RuntimeError("Client executed no training examples.")
+    synchronize_device()
     elapsed = time.perf_counter() - started
     state = {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
     return state, {
@@ -182,6 +212,13 @@ def _train_client(
         "task_loss": losses / counts,
         "fit_duration_sec": elapsed,
         "runtime_prepare_sec": runtime_prepare_sec,
+        # This in-process runner rebuilds a TorchLens runtime for every client
+        # every round, even when the cut is unchanged. Its preparation time is
+        # not an observation of the incremental cost of switching cuts.
+        "switch_ms": None,
+        "client_forward_ms": float(median(client_forward_samples)) if client_forward_samples else None,
+        "client_backward_ms": float(median(client_backward_samples)) if client_backward_samples else None,
+        "server_service_ms": float(median(server_service_samples)) if server_service_samples else None,
         "boundary_upload_bytes": upload_bytes,
         "boundary_download_bytes": download_bytes,
     }
@@ -253,10 +290,32 @@ def run_benchmark(
         min_partition_size=batch_size,
     )
     assignment_hash = stable_hash(assignments)
-    candidate_cuts = workload.task.resolve_candidate_cuts(model)
-    if fixed_boundary not in candidate_cuts:
-        raise ValueError(f"fixed_boundary must be one of {candidate_cuts}.")
-    policy = CapabilityAwarePlacementPolicy(boundary_ladder=candidate_cuts) if method == "splitfleet" else None
+    fixed_candidate_cuts = workload.task.resolve_candidate_cuts(model)
+    if fixed_boundary not in fixed_candidate_cuts:
+        raise ValueError(f"fixed_boundary must be one of {fixed_candidate_cuts}.")
+    policy = None
+    candidate_cuts = fixed_candidate_cuts
+    if method == "splitfleet":
+        sample_loader = DataLoader(
+            workload.train_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=workload.collate_fn,
+        )
+        sample_call, _sample_targets, _sample_count = _batch(
+            workload, next(iter(sample_loader)), device_obj
+        )
+        provider = TorchLensCandidateProvider(
+            model=model,
+            sample_inputs=sample_call,
+            batch_axes={},
+            max_candidates=8,
+        )
+        policy = CoSplitUCBPlacementPolicy(
+            candidate_provider=provider,
+            config=CoSplitUCBConfig(max_candidates=8, seed=seed),
+        )
+        candidate_cuts = tuple(value.boundary for value in provider.get_candidates())
     destination = Path(output)
     destination.mkdir(parents=True, exist_ok=False)
     metadata = {
@@ -282,6 +341,7 @@ def run_benchmark(
         "fixed_boundary": fixed_boundary if method == "splitfed_fixed" else None,
         "proximal_mu": proximal_mu if method == "fedprox" else None,
         "candidate_cuts": candidate_cuts,
+        "placement_policy": "cosplit_ucb" if method == "splitfleet" else None,
         "initial_model_hash": initial_hash,
         "partition_hash": assignment_hash,
         "data_content_hash": workload.data_content_hash,
@@ -305,12 +365,23 @@ def run_benchmark(
             updates = []
             weights = []
             records = []
+            round_placements = (
+                dict(
+                    policy.plan_round(
+                        round_id=round_id,
+                        client_ids=sorted(assignments, key=int),
+                        training=True,
+                    )
+                )
+                if policy is not None
+                else {}
+            )
             for client_id in sorted(assignments, key=int):
                 boundary = None
                 if method == "splitfed_fixed":
                     boundary = fixed_boundary
                 elif policy is not None:
-                    boundary = policy(round_id, client_id, True)
+                    boundary = round_placements[client_id]
                 state, record = _train_client(
                     workload,
                     global_state,
@@ -331,13 +402,25 @@ def run_benchmark(
                 records.append(record)
                 client_stream.write(json.dumps(record, sort_keys=True) + "\n")
                 client_stream.flush()
-                if policy is not None:
-                    policy.observe_fit_metrics(
-                        round_id=round_id,
-                        cid=client_id,
-                        num_examples=record["num_examples"],
-                        metrics=record,
-                    )
+            if policy is not None:
+                policy.observe_round(
+                    round_id=round_id,
+                    feedback=[
+                        PlacementFeedback(
+                            round_id=round_id,
+                            client_id=record["client_id"],
+                            boundary=record["boundary"],
+                            client_forward_ms=record["client_forward_ms"],
+                            client_backward_ms=record["client_backward_ms"],
+                            server_service_ms=record["server_service_ms"],
+                            switch_ms=record["switch_ms"],
+                            completion_ms=record["fit_duration_sec"] * 1000.0,
+                            num_examples=record["num_examples"],
+                            num_batches=record["num_batches"],
+                        )
+                        for record in records
+                    ],
+                )
             global_state = aggregate_named_states(updates, weights)
             model.load_state_dict(global_state, strict=True)
             metrics = _evaluate(workload, model, batch_size=batch_size, device=device_obj)

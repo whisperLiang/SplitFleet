@@ -3,7 +3,7 @@
 The server owns the suffix replicas and the Flower control plane.  Each client
 owns its data and executes a real TorchLens prefix before sending the encoded
 boundary to the server.  The workload is intentionally small enough to serve
-as a deployment smoke test before launching the full RA-SplitFed suite.
+as a deployment smoke test before launching the physical CoSplit-UCB suite.
 """
 
 from __future__ import annotations

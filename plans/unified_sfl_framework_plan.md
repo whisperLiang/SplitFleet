@@ -49,7 +49,7 @@
 按你的选择 `.136 → 205`：
 
 1. 从 `.136` 取回 11 个已修改文件 + 未跟踪的 `splitfleet/common/address.py`、
-   `experiments/physical_ra_splitfed/`、`experiments/real_device_splitfed.py`
+   `experiments/physical_cosplit_ucb/`、`experiments/real_device_splitfed.py`
 2. 校验 205 的 `import splitfleet.server.app` 与 `client.grpc.connection` 通过
 3. 在 205 上提交，使其成为唯一基准；此后统一由 205 下发到边端
 4. 边端同步改用「排除 `.venv-real-device` / `data/` / `*.tar.gz`」的 rsync，

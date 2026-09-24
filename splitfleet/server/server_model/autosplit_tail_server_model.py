@@ -118,6 +118,7 @@ class AutoSplitTailServerModel(ServerModel):
             targets = decode_bundle_wire(batch.data["targets"], self.device)
             examples = _request_num_examples(batch.data["metadata"])
             self._begin_step(step_key)
+            measurements: dict[str, float] = {}
             try:
                 result = self.runtime_manager.autosplit_session.run_suffix_train(
                     runtime_handle,
@@ -125,11 +126,16 @@ class AutoSplitTailServerModel(ServerModel):
                     targets=targets,
                     loss_fn=self.loss_fn,
                     optimizer=self.optimizer,
+                    measurements=measurements,
                 )
             except Exception:
                 self._abort_step(step_key)
                 raise
             self._complete_step(step_key)
+            if "server_total_ms" not in measurements:
+                raise RuntimeError(
+                    "Split suffix runtime did not report server_total_ms"
+                )
             loss_value = self.backend_adapter.scalar_value(result["loss"])
             self.num_examples += examples
             self.loss_total += loss_value * examples
@@ -139,7 +145,11 @@ class AutoSplitTailServerModel(ServerModel):
                     data={
                         "gradients": encode_gradients(gradients),
                         "metadata": json.dumps(
-                            {"loss": loss_value, "num_examples": examples},
+                            {
+                                "loss": loss_value,
+                                "num_examples": examples,
+                                "server_service_ms": float(measurements["server_total_ms"]),
+                            },
                             sort_keys=True,
                         ).encode("utf-8"),
                     },
