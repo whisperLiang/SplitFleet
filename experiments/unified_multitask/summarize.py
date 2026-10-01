@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from experiments.cosplit_ucb.statistics import holm_adjust, paired_effect
+from experiments.common.statistics import holm_adjust, paired_effect
 
 from .validate import validate_run
 
@@ -147,12 +147,6 @@ def summarize(
                 row[metric]["holm_adjusted_p_value"] = value
     report = {
         "schema": "splitfleet.unified-benchmark-summary.v1",
-        "material_passport": {
-            "origin_skill": "experiment-agent",
-            "origin_mode": "validate",
-            "verification_status": "ANALYZED",
-            "version_label": "validation_v1",
-        },
         "valid_runs": len(runs),
         "excluded_runs": excluded,
         "comparisons": comparisons,

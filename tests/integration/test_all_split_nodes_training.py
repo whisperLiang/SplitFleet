@@ -29,7 +29,7 @@ def _isolated(request, *, env_overrides=None) -> bool:
 
 def _all_nodes(model, inputs, targets, loss_fn, backend_name: str) -> None:
     from splitfleet.autosplit.torchlens_backend import TorchLensSplitBackend, prepare_torchlens_runtime
-    from splitfleet.backends.utils import adapter_for
+    from splitfleet.backends.utils import adapter_for, inference_context
     from splitfleet.split_engine import graph_contract_for_runtime_handle
     from splitfleet.transport.split_wire import boundary_to_envelope, envelope_to_boundary
 
@@ -40,15 +40,28 @@ def _all_nodes(model, inputs, targets, loss_fn, backend_name: str) -> None:
     enumerator.trace(
         model, inputs, boundary="50%", trainable=True, dynamic_batch=dynamic_batch,
     )
-    candidates = enumerator.enumerate_candidates()
+    candidates = list(enumerator.iter_candidates(kinds=("after",)))
     assert candidates, f"TorchLens enumerated no {backend_name} split candidates"
 
     trained: list[str] = []
     replay_only: list[str] = []
     non_differentiable: list[str] = []
+    def as_numpy(value):
+        if hasattr(value, "detach"):
+            value = value.detach()
+        if hasattr(value, "cpu"):
+            value = value.cpu()
+        return value.numpy() if hasattr(value, "numpy") else np.asarray(value)
+
     for candidate in candidates:
-        report = enumerator.validate_candidate(candidate)
-        assert report["success"], (candidate.boundary, report)
+        enumerator.split(candidate)
+        with inference_context(backend_name):
+            expected = model(*args)
+            actual = enumerator.run_suffix(enumerator.run_prefix(*args))
+        np.testing.assert_allclose(
+            as_numpy(actual), as_numpy(expected), atol=1e-5, rtol=1e-4,
+            err_msg=candidate.boundary,
+        )
         if candidate.descriptor.get("suffix_node_count") == 0:
             replay_only.append(candidate.boundary)
             continue

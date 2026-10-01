@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from splitfleet.autosplit import AutoSplitSession
+from splitfleet.autosplit.types import PlacementConstraint, PlacementObjective
 from splitfleet.server.stage_runtime.manager import StageRuntimeManager
 
 
@@ -100,10 +101,157 @@ def test_clone_runtime_rejects_feature_abi_mismatch(monkeypatch) -> None:
     bad.plan.feature_abi_id = "bad-abi"
     bad.feature_abi_id = "bad-abi"
 
-    monkeypatch.setattr(manager.autosplit_session, "prepare_runtime", lambda *args, **kwargs: bad)
+    monkeypatch.setattr("splitfleet.server.stage_runtime.manager.clone_runtime_handle", lambda *args: bad)
 
     with pytest.raises(RuntimeError, match="feature ABI is incompatible"):
         manager.clone_runtime_for_model(copy.deepcopy(model), suffix="bad")
+
+
+def test_incompatible_torch_replica_does_not_retrace(monkeypatch) -> None:
+    manager, model, _placement = _manager_with_plan()
+    replica = copy.deepcopy(model)
+    replica.fc1.out_features = 9
+    monkeypatch.setattr(
+        manager.autosplit_session, "prepare_runtime",
+        lambda *args, **kwargs: pytest.fail("unexpected second trace"),
+    )
+
+    with pytest.raises(RuntimeError, match="cannot bind this model replica"):
+        manager.clone_runtime_for_model(replica)
+
+
+def test_clone_reuses_capture_with_independent_parameters_and_gradients(monkeypatch) -> None:
+    manager, model, _placement = _manager_with_plan()
+    first_model = copy.deepcopy(model)
+    second_model = copy.deepcopy(model)
+    with torch.no_grad():
+        first_model.fc2.weight.add_(0.5)
+
+    def unexpected_trace(*args, **kwargs):
+        pytest.fail("compatible model replicas must not be traced again")
+
+    monkeypatch.setattr(manager.autosplit_session, "prepare_runtime", unexpected_trace)
+    first = manager.clone_runtime_for_model(first_model, suffix="first")
+    second = manager.clone_runtime_for_model(second_model, suffix="second")
+    inputs = torch.randn(2, 4)
+    torch.testing.assert_close(first.runtime.replay(inputs), first_model(inputs))
+    torch.testing.assert_close(second.runtime.replay(inputs), second_model(inputs))
+    before = {name: value.detach().clone() for name, value in model.named_parameters()}
+    first.runtime.replay(inputs).square().sum().backward()
+    assert first_model.fc2.weight.grad is not None
+    assert model.fc2.weight.grad is None
+    assert second_model.fc2.weight.grad is None
+    torch.optim.SGD(first_model.parameters(), lr=0.01).step()
+    for name, value in model.named_parameters():
+        torch.testing.assert_close(value, before[name])
+        torch.testing.assert_close(dict(second_model.named_parameters())[name], before[name])
+    torch.testing.assert_close(first.runtime.replay(inputs), first_model(inputs))
+
+
+class BufferedNet(TinyNet):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("scale", torch.ones(2))
+
+    def forward(self, x):
+        return super().forward(x) * self.scale
+
+
+def test_clone_rebinds_replaced_buffers(monkeypatch) -> None:
+    model = BufferedNet().eval()
+    session = AutoSplitSession()
+    placement = session.plan(model, torch.randn(2, 4), dynamic_batch=(1, 8))
+    manager = StageRuntimeManager(autosplit_session=session)
+    manager.set_placement_plan(placement)
+    replica = copy.deepcopy(model)
+    monkeypatch.setattr(session, "prepare_runtime", lambda *args, **kwargs: pytest.fail("unexpected trace"))
+    handle = manager.clone_runtime_for_model(replica)
+    replica.scale = torch.tensor([3.0, 4.0])
+    inputs = torch.randn(2, 4)
+    torch.testing.assert_close(handle.runtime.replay(inputs), replica(inputs))
+    torch.testing.assert_close(model.scale, torch.ones(2))
+
+
+class StatefulTiedNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.first = nn.Linear(4, 4, bias=False)
+        self.norm = nn.BatchNorm1d(4)
+        self.last = nn.Linear(4, 4, bias=False)
+        self.last.weight = self.first.weight
+
+    def forward(self, inputs):
+        return self.last(torch.relu(self.norm(self.first(inputs))))
+
+
+def test_clone_preserves_tied_weights_and_isolates_training_buffers(monkeypatch) -> None:
+    model = StatefulTiedNet().train()
+    inputs = torch.randn(2, 4)
+    session = AutoSplitSession()
+    placement = session.plan(model, inputs, dynamic_batch=(1, 8))
+    manager = StageRuntimeManager(autosplit_session=session)
+    manager.set_placement_plan(placement)
+    replica = copy.deepcopy(model)
+    full = copy.deepcopy(model)
+    before = {name: value.clone() for name, value in model.named_buffers()}
+    monkeypatch.setattr(session, "prepare_runtime", lambda *args, **kwargs: pytest.fail("unexpected trace"))
+    handle = manager.clone_runtime_for_model(replica)
+    expected = full(inputs)
+    actual = handle.runtime.run_suffix(handle.runtime.run_training_prefix(inputs))
+    torch.testing.assert_close(actual, expected)
+    actual.square().sum().backward()
+    expected.square().sum().backward()
+    assert replica.first.weight is replica.last.weight
+    for name, value in replica.named_parameters():
+        torch.testing.assert_close(value.grad, dict(full.named_parameters())[name].grad)
+    for name, value in replica.named_buffers():
+        torch.testing.assert_close(value, dict(full.named_buffers())[name])
+        torch.testing.assert_close(dict(model.named_buffers())[name], before[name])
+
+
+def test_rebind_declines_changed_configuration_and_aliases() -> None:
+    from splitfleet.autosplit.torchlens_clone import rebind_torch_runtime
+
+    model = StatefulTiedNet().train()
+    handle = AutoSplitSession().prepare_runtime(model, torch.randn(2, 4))
+    replica = copy.deepcopy(model)
+    replica.norm.eps = 0.1
+    assert rebind_torch_runtime(handle.runtime, replica) is None
+    replica = copy.deepcopy(model)
+    replica.last.weight = nn.Parameter(replica.last.weight.detach().clone())
+    assert rebind_torch_runtime(handle.runtime, replica) is None
+
+
+def test_full_candidates_match_client_contract_and_survive_global_evaluation(monkeypatch) -> None:
+    from experiments.rfdetr_nano_physical import RFDETRCandidateProvider
+    from splitfleet.split_engine import graph_contract_for_runtime_handle
+    from splitfleet.split_engine.contracts import validate_contract
+
+    model = nn.Sequential(*[layer for _ in range(6) for layer in (nn.Linear(4, 4), nn.ReLU())]).train()
+    sample = torch.randn(1, 4)
+    provider = RFDETRCandidateProvider(model=model, sample_inputs=sample)
+    candidates = provider.get_candidates()
+    assert len(candidates) > 3
+    assert any(candidate.boundary.startswith("before:") for candidate in candidates)
+    assert any(candidate.boundary.startswith("after:") for candidate in candidates)
+    session = AutoSplitSession()
+    client = session.prepare_runtime(model, sample, batch_axes={"/args/0": 0},
+                                     boundary=candidates[0].boundary, dynamic_batch=(1, 1))
+    model.eval()
+    manager = StageRuntimeManager(autosplit_session=session)
+    monkeypatch.setattr(session, "prepare_runtime", lambda *args, **kwargs: pytest.fail("unexpected trace"))
+    for candidate in candidates:
+        placement = provider.get_placement_plan(
+            candidate.boundary, worker_specs=[],
+            constraints=PlacementConstraint(), objective=PlacementObjective(),
+        )
+        base = placement.metadata["_runtime_handle"]
+        client = client.backend.repartition(candidate.boundary)
+        validate_contract(graph_contract_for_runtime_handle(base), graph_contract_for_runtime_handle(client))
+        manager.bind_runtime_handle(base)
+        clone = manager.clone_runtime_for_model(copy.deepcopy(model).train())
+        assert clone.plan.metadata["_reused_capture"]
+        validate_contract(graph_contract_for_runtime_handle(base), graph_contract_for_runtime_handle(clone))
 
 
 @pytest.mark.parametrize("method,args", [

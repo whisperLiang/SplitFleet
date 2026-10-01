@@ -1,0 +1,34 @@
+{
+  "server": {
+    "identity": "whisperliang@192.168.66.205",
+    "python": "/home/whisperliang/SplitFleet/.venv/bin/python",
+    "workdir": "/home/whisperliang/SplitFleet",
+    "bind": "0.0.0.0:18118",
+    "connect": "192.168.66.205:18118",
+    "device": "cuda:0"
+  },
+  "barrier": {
+    "bind": "0.0.0.0:18119",
+    "connect": "192.168.66.205:18119"
+  },
+  "hosts": [
+    {
+      "id": "orin140",
+      "ssh": "nvidia@192.168.66.140",
+      "python": "/home/nvidia/SplitFleet/.venv-real-device/bin/python",
+      "workdir": "/home/nvidia/SplitFleet"
+    },
+    {
+      "id": "orin118",
+      "ssh": "nvidia@192.168.66.118",
+      "python": "/home/nvidia/SplitFleet/.venv-real-device/bin/python",
+      "workdir": "/home/nvidia/SplitFleet"
+    },
+    {
+      "id": "orin238",
+      "ssh": "nvidia@192.168.66.238",
+      "python": "/home/nvidia/SplitFleet/.venv-real-device/bin/python",
+      "workdir": "/home/nvidia/SplitFleet"
+    }
+  ]
+}

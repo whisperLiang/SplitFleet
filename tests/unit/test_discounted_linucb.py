@@ -117,3 +117,11 @@ def test_restore_rejects_incompatible_confidence_and_corrupt_covariance() -> Non
     state["A"] = [[-1.0, 0.0], [0.0, 2.0]]
     with pytest.raises(ValueError, match="positive definite"):
         model.load_state_dict(state)
+
+
+def test_singular_covariance_is_rejected_without_changing_the_estimator() -> None:
+    model = _model()
+    model.A[:] = 0.0
+    with pytest.raises(np.linalg.LinAlgError):
+        model.predict(np.array([1.0, 0.0]))
+    assert np.array_equal(model.A, np.zeros((2, 2)))

@@ -343,6 +343,7 @@ def load_workload(
     max_train_samples: int | None = None,
     max_test_samples: int | None = None,
     seed: int = 2026,
+    detection_image_size: int = 96,
 ) -> Workload:
     """Load one task without implicit downloads or changing its evaluation set."""
 
@@ -381,8 +382,10 @@ def load_workload(
         model_factory = lambda: TextClassifier(len(vocabulary) + 2)
         collate = None
     elif task == "object_detection":
-        train = VOCBoxes(root, image_set="trainval", download=download)
-        test = VOCBoxes(root, image_set="test", download=download)
+        train = VOCBoxes(root, image_set="trainval", download=download,
+                         image_size=detection_image_size)
+        test = VOCBoxes(root, image_set="test", download=download,
+                        image_size=detection_image_size)
         model_factory = lambda: GridDetector(len(VOC_CLASSES))
         collate = _detection_collate
     else:

@@ -9,6 +9,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from experiments.common.identity import stable_hash
 from splitfleet.tasks import TASK_SPECS
 
 from .run import METHODS
@@ -47,7 +48,7 @@ def validate_run(path: str | Path) -> dict[str, Any]:
     assigned_indices = [int(index) for values in assignments.values() for index in values]
     if sorted(assigned_indices) != list(range(int(metadata["train_examples"]))):
         errors.append("Assignments do not cover the training set exactly once.")
-    if metadata.get("partition_hash") != _stable_hash(assignments):
+    if metadata.get("partition_hash") != stable_hash(assignments):
         errors.append("Partition hash differs from assignments.json.")
     if not isinstance(metadata.get("data_content_hash"), str) or len(metadata["data_content_hash"]) != 64:
         errors.append("Dataset content hash is missing.")
@@ -111,11 +112,6 @@ def validate_run(path: str | Path) -> dict[str, Any]:
         "partition_hash": metadata.get("partition_hash"),
     }
 
-
-def _stable_hash(value: Any) -> str:
-    from experiments.cosplit_ucb.config_utils import stable_hash
-
-    return stable_hash(value)
 
 
 def _finite_between(value: Any, low: float, high: float | None) -> bool:

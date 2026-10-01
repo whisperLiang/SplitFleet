@@ -15,7 +15,6 @@ from .learners import CandidateContexts, CooperativeLearners
 from .solver import GlobalPlacementSolver
 from .state import BanditStateStore
 from .types import (
-    CandidateEstimate,
     ExecutionProfileKey,
     PlacementFeedback,
     RuntimeTelemetryProvider,
@@ -41,6 +40,7 @@ class CoSplitUCBPlacementPolicy:
         config: CoSplitUCBConfig | None = None,
         telemetry_provider: RuntimeTelemetryProvider | Mapping[str, Any] | None = None,
         state_store: BanditStateStore | None = None,
+        device_cost_prior=None,
     ) -> None:
         self.config = config or CoSplitUCBConfig()
         self.candidate_provider = candidate_provider
@@ -59,7 +59,8 @@ class CoSplitUCBPlacementPolicy:
             forced_probe_interval=self.config.forced_probe_interval,
             seed=self.config.seed,
         )
-        self.telemetry_provider = telemetry_provider
+        self.telemetry_provider = telemetry_provider if telemetry_provider is not None else device_cost_prior
+        self.device_cost_prior = device_cost_prior
         self.state_store = state_store or (
             BanditStateStore(self.config.state_path) if self.config.state_path else None
         )
@@ -108,6 +109,10 @@ class CoSplitUCBPlacementPolicy:
                 key=lambda value: (value.graph_position_ratio, value.boundary),
             )
         )
+
+    def bind_clients(self, clients, round_id: int) -> None:
+        if self.device_cost_prior is not None:
+            self.device_cost_prior.bind_clients(clients, round_id)
 
     def _client_telemetry(self, client_id: str) -> Mapping[str, Any]:
         provider = self.telemetry_provider
@@ -258,8 +263,7 @@ class CoSplitUCBPlacementPolicy:
                     profile,
                     contexts,
                 )
-                client_estimates.append(
-                    self.learners.predict(
+                prediction = self.learners.predict(
                         client_id=client_id,
                         boundary=candidate.boundary,
                         profile=profile,
@@ -267,7 +271,9 @@ class CoSplitUCBPlacementPolicy:
                         feasible=feasibility.feasible,
                         infeasible_reason=feasibility.reason,
                     )
-                )
+                if self.device_cost_prior is not None and training:
+                    prediction = self.device_cost_prior.estimate(client_id, candidate, prediction)
+                client_estimates.append(prediction)
             if lock_previous and any(
                 value.feasible and value.boundary == previous_boundary for value in client_estimates
             ):

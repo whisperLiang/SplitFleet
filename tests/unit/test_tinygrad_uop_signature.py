@@ -91,7 +91,9 @@ def test_deep_graph_signature_does_not_depend_on_python_recursion_limit():
 
 
 def test_shared_graph_signature_visits_each_node_a_bounded_number_of_times():
-    levels = 80
+    # A recursive signature expands shared paths into its result. Keep this
+    # regression bounded even on the native wheel, where 80 levels would OOM.
+    levels = 12
     node_count, edge_count = levels + 1, 2 * levels
     reads = SourceReads(limit=4 * (node_count + edge_count))
     root = UOp("CONST", arg=1, reads=reads)

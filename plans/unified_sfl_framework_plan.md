@@ -49,7 +49,7 @@
 按你的选择 `.136 → 205`：
 
 1. 从 `.136` 取回 11 个已修改文件 + 未跟踪的 `splitfleet/common/address.py`、
-   `experiments/physical_cosplit_ucb/`、`experiments/real_device_splitfed.py`
+   早期设备实验入口（现已合并到 `experiments/physical_multitask.py`）
 2. 校验 205 的 `import splitfleet.server.app` 与 `client.grpc.connection` 通过
 3. 在 205 上提交，使其成为唯一基准；此后统一由 205 下发到边端
 4. 边端同步改用「排除 `.venv-real-device` / `data/` / `*.tar.gz`」的 rsync，
@@ -133,7 +133,7 @@ batch 预算、优化器与评估集 —— 沿用 `run.py` 既有的身份校�
 | 分割 | Oxford-IIIT Pet | ~800M | 需下发 |
 
 合计约 2GB，`.140` 剩余 11GB 可容纳。分区沿用既有 Dirichlet(α=0.5) 与
-`partition_manifest` 哈希机制，检测/分割按图像级划分。
+分区内容的稳定哈希机制，检测/分割按图像级划分。
 
 数据下发脚本需对每个数据集记录内容哈希，确保五台机器数据同一。
 

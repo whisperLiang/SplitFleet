@@ -137,6 +137,19 @@ def test_autosplit_strategy_generates_torchlens_metadata() -> None:
     json.dumps(config, sort_keys=True)
 
 
+def test_autosplit_config_rejects_placement_without_prepared_runtime(monkeypatch) -> None:
+    strategy = AutoSplitStrategy(model=TinyNet().eval(), sample_inputs=torch.randn(2, 4))
+    placement = strategy.get_or_create_placement_plan()
+    placement.metadata.pop("_runtime_handle")
+    monkeypatch.setattr(
+        strategy.autosplit_session, "prepare_runtime",
+        lambda *args, **kwargs: pytest.fail("unexpected second trace"),
+    )
+
+    with pytest.raises(RuntimeError, match="no prepared TorchLens runtime handle"):
+        strategy._autosplit_config(placement=placement)
+
+
 def test_autosplit_strategy_splitfed_defaults_to_per_client_tail() -> None:
     model = TinyNet().eval()
     sample_inputs = torch.randn(2, 4)
@@ -286,7 +299,9 @@ def test_cosplit_global_solver_assignment_is_shared_by_client_and_server_configs
     policy = CoSplitUCBPlacementPolicy(
         candidate_provider=StaticCandidateProvider(candidates),
         learners=learned,
-        config=CoSplitUCBConfig(max_explorations_per_round=0, min_residence_rounds=0),
+        config=CoSplitUCBConfig(
+            max_explorations_per_round=0, min_residence_rounds=0,
+        ),
     )
     model = TinyNet().eval()
     strategy = AutoSplitStrategy(

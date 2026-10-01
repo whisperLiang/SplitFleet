@@ -4,7 +4,7 @@ SplitFleet 将任务、深度学习后端、模型分割和联邦训练分开：
 
 ## 安装与版本
 
-项目使用 Python 3.11。`pyproject.toml` 和 `uv.lock` 指向本地修正版 `torchlens-2.34.1-1-py3-none-any.whl`，包版本仍为 2.34.1，wheel 构建编号为 1。原始 `torchlens-2.34.1-py3-none-any.whl` 保留为可校验的构建输入；源码补丁和重建方式见 [TorchLens 补丁说明](../patches/torchlens/README.md)。修复在依赖包中生效，无需运行时替换内部函数。
+项目使用 Python 3.11。`pyproject.toml` 和 `uv.lock` 指向仓库中的 `torchlens-2.34.1-py3-none-any.whl`，包版本为 2.34.1；锁文件记录 wheel 的 SHA-256。项目使用该 wheel 的原生 API，不维护 TorchLens 源码补丁或 wheel 构建脚本。候选目录通过 `analyze()` 获取切分计划与能力报告，仅在选中切点后通过 `at()` 构建执行段。运行时契约使用适配器 v6，旧适配器生成的契约需要重新生成。
 
 ```bash
 uv sync --extra dev --reinstall-package torchlens
@@ -62,7 +62,7 @@ model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2)).eval()
 backend = TorchLensSplitBackend()
 backend.trace(model, torch.randn(2, 4), boundary="50%", dynamic_batch=(1, 8))
 report = backend.split_points(diagnose=True).as_dict()
-candidates = backend.enumerate_candidates(kinds=("before", "after"))
+candidates = list(backend.iter_candidates(kinds=("before", "after")))
 handle = backend.repartition(candidates[0].boundary)
 x = torch.randn(3, 4)
 output = handle.backend.run_suffix(handle.backend.run_prefix(x))

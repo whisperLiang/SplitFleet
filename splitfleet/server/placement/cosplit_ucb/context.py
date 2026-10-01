@@ -15,10 +15,10 @@ def _number(values: Mapping[str, Any], key: str) -> tuple[float, float]:
         return 0.0, 1.0
     try:
         value = float(raw)
-    except (TypeError, ValueError):
-        return 0.0, 1.0
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"telemetry {key!r} must be a finite number") from exc
     if not np.isfinite(value):
-        return 0.0, 1.0
+        raise ValueError(f"telemetry {key!r} must be a finite number")
     return value, 0.0
 
 

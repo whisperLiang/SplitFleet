@@ -31,7 +31,11 @@ from splitfleet.server.client_selection import (
     RandomSelector,
 )
 from splitfleet.autosplit.planner import validate_stage_counts
+from splitfleet.autosplit.torchlens_backend import TorchLensRuntimeHandle
 from splitfleet.autosplit.torchlens_contract import runtime_contract_digest, stable_json
+from splitfleet.autosplit.state_ownership import (
+    OWNERSHIP_KEY, DIGEST_KEY, state_ownership, aggregate_owned,
+)
 from splitfleet.split_engine import graph_contract_for_runtime_handle
 from splitfleet.split_engine.contracts import ModelVersionContract
 from splitfleet.backends.utils import adapter_for
@@ -126,6 +130,7 @@ class AutoSplitStrategy(PlainSlStrategy):
         runtime_device: str = "cpu",
         placement_policy: Optional[RoundPlacementPolicy] = None,
         tied_weight_update_mode: str = "reject",
+        owned_state_exchange: bool = False,
         client_selection: str | None = "flower_default",
         client_selector: Optional[ClientSelector] = None,
         oort_config: Optional[OortSelectorConfig] = None,
@@ -199,6 +204,10 @@ class AutoSplitStrategy(PlainSlStrategy):
                 f"expected one of {TIED_WEIGHT_UPDATE_MODES}."
             )
         self.tied_weight_update_mode = normalized_tied_mode
+        self.owned_state_exchange = bool(owned_state_exchange)
+        if self.owned_state_exchange and self.replica_scope_policy.resolve() != ReplicaScope.PER_CLIENT:
+            raise ValueError("Owned state exchange requires independent per-client replicas")
+        self._round_ownership: dict[int, dict[str, dict]] = {}
         self._placement_plan = None
         self._placement_plans: dict[str, Any] = {}
         self._evaluation_placement_plans: dict[str, Any] = {}
@@ -269,28 +278,56 @@ class AutoSplitStrategy(PlainSlStrategy):
 
     def get_or_create_placement_plan(self, boundary: str | None = None, *, training: bool = True):
         requested_boundary = str(boundary or self.boundary)
+        if boundary is None and self.placement_policy is not None and requested_boundary.endswith("%"):
+            try:
+                fraction = float(requested_boundary[:-1]) / 100.0
+            except ValueError:
+                fraction = None
+            if fraction is not None:
+                catalog = self.placement_policy.candidate_provider.get_candidates(training=True)
+                requested_boundary = min(
+                    catalog,
+                    key=lambda item: (abs(item.graph_position_ratio - fraction), item.boundary),
+                ).boundary
+                self.boundary = requested_boundary
         placements = self._placement_plans if training else self._evaluation_placement_plans
         placement = placements.get(requested_boundary)
         if placement is None:
-            reference_model = self.backend_adapter.clone_model(self.model)
-            self.backend_adapter.set_training(reference_model, training)
-            placement = self.autosplit_session.plan(
-                reference_model,
-                self.sample_inputs,
-                sample_kwargs=self.sample_kwargs,
-                batch_axes=self.batch_axes,
-                worker_specs=self.worker_specs,
-                constraints=self.constraints,
-                objective=self.objective,
-                preferred_stage_count=self.partition_selection_policy.preferred_stage_count,
-                client_stage_count=self.client_stage_count,
-                model_name=self.model.__class__.__name__,
-                boundary=requested_boundary,
-                mode=self.mode,
-                trainable=True,
-                dynamic_batch=self.dynamic_batch,
-                trace_batch_mode=self.trace_batch_mode,
-            )
+            provider = getattr(self.placement_policy, "candidate_provider", None)
+            get_prepared_plan = getattr(provider, "get_placement_plan", None)
+            if get_prepared_plan is None:
+                reference_model = self.backend_adapter.clone_model(self.model)
+                self.backend_adapter.set_training(reference_model, training)
+                placement = self.autosplit_session.plan(
+                    reference_model,
+                    self.sample_inputs,
+                    sample_kwargs=self.sample_kwargs,
+                    batch_axes=self.batch_axes,
+                    worker_specs=self.worker_specs,
+                    constraints=self.constraints,
+                    objective=self.objective,
+                    preferred_stage_count=self.partition_selection_policy.preferred_stage_count,
+                    client_stage_count=self.client_stage_count,
+                    model_name=self.model.__class__.__name__,
+                    boundary=requested_boundary,
+                    mode=self.mode,
+                    trainable=True,
+                    dynamic_batch=self.dynamic_batch,
+                    trace_batch_mode=self.trace_batch_mode,
+                )
+            else:
+                placement = get_prepared_plan(
+                    requested_boundary,
+                    worker_specs=self.worker_specs,
+                    constraints=self.constraints,
+                    objective=self.objective,
+                    model_name=self.model.__class__.__name__,
+                    training=training,
+                )
+                if placement is None:
+                    raise RuntimeError(
+                        f"Candidate provider returned no prepared placement for {requested_boundary!r}."
+                    )
             placement.metadata["_training"] = bool(training)
             placements[requested_boundary] = placement
             if self._runtime_manager is not None:
@@ -372,6 +409,7 @@ class AutoSplitStrategy(PlainSlStrategy):
             self._round_initial_server_states,
             self._pending_client_updates,
             self._reassembled_client_states,
+            self._round_ownership,
         )
         for store in stores:
             for stale in [key for key in store if key <= int(through)]:
@@ -407,21 +445,26 @@ class AutoSplitStrategy(PlainSlStrategy):
         cache_key = (placement.plan_id, bool(training))
         base_config = self._autosplit_config_cache.get(cache_key)
         if base_config is None:
-            reference_model = self.backend_adapter.clone_model(self.model)
-            self.backend_adapter.set_training(reference_model, training)
-            reference_handle = self.autosplit_session.prepare_runtime(
-                reference_model,
-                self.sample_inputs,
-                sample_kwargs=self.sample_kwargs,
-                batch_axes=self.batch_axes,
-                boundary=placement.boundary,
-                mode=placement.mode,
-                trainable=True,
-                dynamic_batch=placement.dynamic_batch,
-                trace_batch_mode=placement.trace_batch_mode,
-            )
+            reference_handle = placement.metadata.get("_runtime_handle")
+            if not isinstance(reference_handle, TorchLensRuntimeHandle):
+                raise RuntimeError(
+                    f"Placement {placement.plan_id!r} has no prepared TorchLens runtime handle."
+                )
+            if (
+                reference_handle.plan.plan_id != placement.plan_id
+                or reference_handle.plan.boundary != placement.boundary
+                or reference_handle.plan.split_id != placement.split_id
+                or reference_handle.plan.graph_signature != placement.graph_signature
+                or reference_handle.plan.feature_abi_id != placement.feature_abi_id
+            ):
+                raise RuntimeError(
+                    f"Placement {placement.plan_id!r} does not match its prepared TorchLens runtime."
+                )
+            placement.metadata["_runtime_handle"] = reference_handle
+            if self._runtime_manager is not None:
+                self._runtime_manager.bind_runtime_handle(reference_handle, plan_id=placement.plan_id, make_default=False)
             contract = graph_contract_for_runtime_handle(reference_handle)
-            state_schema_hash = self.backend_adapter.state_manifest(reference_model).schema_hash
+            state_schema_hash = self.backend_adapter.state_manifest(self.model).schema_hash
             base_config = {
                 AUTOSPLIT_BACKEND_CONFIG_KEY: AUTOSPLIT_BACKEND_VALUE_TORCHLENS,
                 AUTOSPLIT_FRAMEWORK_BACKEND_CONFIG_KEY: self.backend_adapter.backend_name,
@@ -444,6 +487,8 @@ class AutoSplitStrategy(PlainSlStrategy):
                 AUTOSPLIT_GRAPH_CONTRACT_DIGEST_CONFIG_KEY: contract.digest,
                 "_state_schema_hash": state_schema_hash,
             }
+            if self.owned_state_exchange and training:
+                base_config[OWNERSHIP_KEY] = stable_json(state_ownership(reference_handle, state_schema_hash))
             self._autosplit_config_cache[cache_key] = base_config
         state_schema_hash = str(base_config["_state_schema_hash"])
         version_contract = ModelVersionContract(
@@ -463,10 +508,14 @@ class AutoSplitStrategy(PlainSlStrategy):
 
     def configure_fit(self, server_round, parameters, client_manager):
         self._discard_round_state(int(server_round) - 1)
-        self._round_initial_client_states[int(server_round)] = [
-            np.array(value, copy=True) for value in parameters_to_ndarrays(parameters)
+        initial = parameters_to_ndarrays(parameters)
+        self._round_initial_client_states[int(server_round)] = initial if self.owned_state_exchange else [
+            np.array(value, copy=True) for value in initial
         ]
         instructions = super().configure_fit(server_round, parameters, client_manager)
+        bind_clients = getattr(self.placement_policy, "bind_clients", None)
+        if bind_clients is not None:
+            bind_clients([client for client, _ in instructions], server_round)
         self._plan_round_placements(
             server_round,
             [client.cid for client, _ in instructions],
@@ -478,6 +527,10 @@ class AutoSplitStrategy(PlainSlStrategy):
             fit_ins.config.update(
                 self._autosplit_config(server_round, training=True, placement=placement)
             )
+            if self.owned_state_exchange:
+                import json
+                self._round_ownership.setdefault(int(server_round), {})[str(client.cid)] = json.loads(
+                    fit_ins.config[OWNERSHIP_KEY])
         self._round_fit_dispatch_start[int(server_round)] = time.perf_counter()
         return instructions
 
@@ -556,7 +609,9 @@ class AutoSplitStrategy(PlainSlStrategy):
         return instructions
 
     def configure_server_fit(self, server_round, parameters, cids):
-        self._round_initial_server_states[int(server_round)] = [
+        if self.owned_state_exchange:
+            parameters = self._round_initial_client_states[int(server_round)]
+        self._round_initial_server_states[int(server_round)] = parameters if self.owned_state_exchange else [
             np.array(value, copy=True) for value in parameters
         ]
         self._plan_round_placements(server_round, cids, training=True)
@@ -650,6 +705,11 @@ class AutoSplitStrategy(PlainSlStrategy):
             # `aggregate_server_fit` supplies the matching suffix halves.
             # `finalize_round` returns the reassembled model; returning it here
             # would mean publishing a half-stale one.
+            if self.owned_state_exchange:
+                for client, fit_res in results:
+                    manifest = self._round_ownership[int(server_round)][str(client.cid)]
+                    if fit_res.metrics.get(DIGEST_KEY) != manifest[DIGEST_KEY]:
+                        raise RuntimeError("Prefix state ownership digest mismatch")
             self._pending_client_updates[int(server_round)] = {
                 str(getattr(client, "cid")): (
                     parameters_to_ndarrays(fit_res.parameters),
@@ -851,6 +911,21 @@ class AutoSplitStrategy(PlainSlStrategy):
             if initial_client is None or initial_server is None:
                 raise RuntimeError("Round initial state is unavailable for logical model reassembly.")
             server_updates = {str(res.sid): res for res in results if res.sid is not None}
+            if self.owned_state_exchange:
+                manifests = self._round_ownership.pop(round_id)
+                owned_updates = []
+                for cid, (prefix, weight) in client_updates.items():
+                    suffix = server_updates.get(cid)
+                    if suffix is None:
+                        log(ERROR, "Dropping prefix update without matching suffix: %s", cid)
+                        continue
+                    manifest = manifests[cid]
+                    if suffix.config.get(DIGEST_KEY) != manifest[DIGEST_KEY]:
+                        raise RuntimeError("Suffix state ownership digest mismatch")
+                    owned_updates.append((manifest, prefix, suffix.parameters, weight))
+                aggregated = aggregate_owned(initial_client, owned_updates)
+                self._reassembled_client_states[round_id] = aggregated
+                return aggregated
             names = self._logical_state_name_list()
             tied_groups = self._tied_state_groups()
             logical_updates = []

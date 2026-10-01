@@ -12,8 +12,15 @@ from splitfleet.common.constants import (
     AUTOSPLIT_BACKEND_CONFIG_KEY,
     AUTOSPLIT_BACKEND_VALUE_TORCHLENS,
     AUTOSPLIT_BOUNDARY_CONFIG_KEY,
+    AUTOSPLIT_DYNAMIC_BATCH_CONFIG_KEY,
+    AUTOSPLIT_FEATURE_ABI_ID_CONFIG_KEY,
+    AUTOSPLIT_GRAPH_SIGNATURE_CONFIG_KEY,
+    AUTOSPLIT_GRAPH_CONTRACT_CONFIG_KEY,
+    AUTOSPLIT_GRAPH_CONTRACT_DIGEST_CONFIG_KEY,
     AUTOSPLIT_MODE_CONFIG_KEY,
     AUTOSPLIT_PLAN_ID_CONFIG_KEY,
+    AUTOSPLIT_SPLIT_ID_CONFIG_KEY,
+    AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY,
 )
 
 
@@ -154,6 +161,70 @@ def test_client_prepares_mode_specific_torchlens_runtimes(model_type, shape, bat
 
     assert train_handle is not eval_handle
     assert torch.allclose(split_eval, expected_eval, atol=1e-5, rtol=1e-5)
+
+
+def test_client_prewarm_runtime_is_adopted_by_first_round() -> None:
+    """A pre-captured graph must satisfy the negotiated round contract."""
+
+    client = AutoSplitSplitLearningClient(
+        model=BatchNormNet(),
+        train_data=[],
+        sample_inputs=torch.randn(3, 4),
+        max_cached_runtimes=1,
+    )
+    client.prewarm_runtime(boundary="after:fc1", dynamic_batch=(1, 8))
+    prewarmed = client._prewarmed_runtime
+    assert prewarmed is not None
+    config = {
+        AUTOSPLIT_BACKEND_CONFIG_KEY: AUTOSPLIT_BACKEND_VALUE_TORCHLENS,
+        AUTOSPLIT_PLAN_ID_CONFIG_KEY: "negotiated-plan",
+        AUTOSPLIT_BOUNDARY_CONFIG_KEY: prewarmed.plan.boundary,
+        AUTOSPLIT_SPLIT_ID_CONFIG_KEY: prewarmed.plan.split_id,
+        AUTOSPLIT_GRAPH_SIGNATURE_CONFIG_KEY: prewarmed.plan.graph_signature,
+        AUTOSPLIT_DYNAMIC_BATCH_CONFIG_KEY: prewarmed.plan.dynamic_batch,
+        AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY: prewarmed.plan.trace_batch_mode,
+        AUTOSPLIT_FEATURE_ABI_ID_CONFIG_KEY: prewarmed.plan.feature_abi_id,
+    }
+    adopted = client._prepare_round(client.get_parameters({}), config, training=True).handle
+    assert adopted is prewarmed
+    assert client._prewarmed_runtime is None
+    next_config = {**config, AUTOSPLIT_PLAN_ID_CONFIG_KEY: "next-plan"}
+    assert client._prepare_round(client.get_parameters({}), next_config, training=True).handle is adopted
+    assert len(client._runtime_cache) == 1
+
+
+@pytest.mark.parametrize("boundary", ["25%", "50%", "75%"])
+def test_percent_prewarm_matches_a_canonical_server_graph_contract(boundary) -> None:
+    from splitfleet.split_engine import graph_contract_for_runtime_handle
+
+    inputs = torch.randn(3, 4)
+    client = AutoSplitSplitLearningClient(
+        model=BranchNet(), train_data=[], sample_inputs=inputs, max_cached_runtimes=1,
+    )
+    client.prewarm_runtime(boundary=boundary, dynamic_batch=(1, 8))
+    warmed = client._prewarmed_runtime
+    server = AutoSplitSession().prepare_runtime(
+        copy.deepcopy(client.model), inputs, boundary=warmed.plan.boundary,
+        dynamic_batch=(1, 8), trainable=True,
+    )
+    expected = graph_contract_for_runtime_handle(server)
+    config = {
+        AUTOSPLIT_BACKEND_CONFIG_KEY: AUTOSPLIT_BACKEND_VALUE_TORCHLENS,
+        AUTOSPLIT_PLAN_ID_CONFIG_KEY: server.plan.plan_id,
+        AUTOSPLIT_BOUNDARY_CONFIG_KEY: server.plan.boundary,
+        AUTOSPLIT_SPLIT_ID_CONFIG_KEY: server.plan.split_id,
+        AUTOSPLIT_GRAPH_SIGNATURE_CONFIG_KEY: server.plan.graph_signature,
+        AUTOSPLIT_DYNAMIC_BATCH_CONFIG_KEY: server.plan.dynamic_batch,
+        AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY: server.plan.trace_batch_mode,
+        AUTOSPLIT_FEATURE_ABI_ID_CONFIG_KEY: server.plan.feature_abi_id,
+        AUTOSPLIT_GRAPH_CONTRACT_CONFIG_KEY: expected.to_json(),
+        AUTOSPLIT_GRAPH_CONTRACT_DIGEST_CONFIG_KEY: expected.digest,
+    }
+
+    adopted = client._prepare_round(client.get_parameters({}), config, training=True)
+
+    assert adopted.handle is warmed
+    assert adopted.contract.digest == expected.digest
 
 
 def test_client_rejects_missing_backend_instead_of_falling_back() -> None:

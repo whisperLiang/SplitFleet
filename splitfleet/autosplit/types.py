@@ -34,7 +34,6 @@ class PlacementConstraint:
 
     max_stages: int = 2
     max_frontier_size: int | None = None
-    max_candidates: int = 32
     max_payload_bytes: int = 32 * 1024 * 1024
     max_stage_memory_bytes: Optional[int] = None
     privacy_metric_lower_bound: float = 0.0

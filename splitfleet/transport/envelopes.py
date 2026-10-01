@@ -158,6 +158,8 @@ def _pack(kind: str, envelope: BoundaryEnvelope | GradientEnvelope, compression:
     if compression not in {"none", "lz4"}:
         raise ValueError(f"Unsupported compression {compression!r}")
     tensors = list(envelope.tensors)
+    if any(tensor.encoding != "raw-le" or tensor.layout != "contiguous" for tensor in tensors):
+        raise ValueError("Unsupported tensor layout or encoding")
     header = asdict(envelope)
     header.pop("tensors", None)
     header["checksum"] = ""

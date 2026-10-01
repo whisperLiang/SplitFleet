@@ -128,6 +128,19 @@ class AutoSplitSession:
         except KeyError as exc:
             raise RuntimeError(f"No TorchLens runtime handle is registered for plan {value!r}.") from exc
 
+    def discard_runtime_handles(self) -> None:
+        """Release session-owned handles before preparing a different split."""
+        self._runtime_handles.clear()
+
+    def repartition_runtime(
+        self, handle: TorchLensRuntimeHandle, boundary: str
+    ) -> TorchLensRuntimeHandle:
+        """Reuse a captured graph for another boundary of the same model."""
+        replacement = handle.backend.repartition(boundary)
+        self.discard_runtime_handles()
+        self._runtime_handles[replacement.plan.plan_id] = replacement
+        return replacement
+
     @staticmethod
     def _runtime_context(handle: TorchLensRuntimeHandle) -> str:
         plan = handle.plan

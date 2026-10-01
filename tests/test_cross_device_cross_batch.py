@@ -152,6 +152,27 @@ def test_device_prefix_adopts_the_broadcast_window_over_its_own_sample_batch() -
     assert prepared[0].handle.plan.feature_abi_id == fleet.config[AUTOSPLIT_FEATURE_ABI_ID_CONFIG_KEY]
 
 
+def test_bounded_client_runtime_cache_evicts_old_split_before_retrace() -> None:
+    fleet = _Fleet(dynamic_batch=(1, 64))
+    fleet.client.max_cached_runtimes = 1
+    parameters = _ndarrays(fleet.client_model)
+    fleet.client._prepare_round(parameters, fleet.config, training=True)
+    first_handle = next(iter(fleet.client._runtime_cache.values())).handle
+    first = first_handle.plan.plan_id
+
+    next_placement = fleet.strategy.get_or_create_placement_plan("75%")
+    next_config = fleet.strategy._autosplit_config(placement=next_placement)
+    fleet.client._prepare_round(parameters, next_config, training=True)
+
+    cached = list(fleet.client._runtime_cache.values())
+    assert len(cached) == 1
+    assert cached[0].handle.plan.plan_id != first
+    assert cached[0].handle.backend is first_handle.backend
+    assert set(fleet.client.autosplit_session._runtime_handles) == {
+        cached[0].handle.plan.plan_id
+    }
+
+
 def test_heterogeneous_batch_sizes_train_in_one_round() -> None:
     fleet = _Fleet(dynamic_batch=(1, 64), train_batches=(8, 3, 1))
     _, num_examples, metrics = fleet.fit()

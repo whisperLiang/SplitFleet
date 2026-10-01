@@ -1,6 +1,8 @@
 __pycache__
 data/*
 results/
+runs/
+logs/
 dcgm/*
 *.err
 *.out

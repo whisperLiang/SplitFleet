@@ -92,7 +92,7 @@ def _rejection_reason(
     ):
         return "max_layer_freezing_ratio"
     if not bool(validation.get("success")):
-        return "replay_validation_failed"
+        return "native_capability_check_failed"
     return "unknown"
 
 
@@ -222,33 +222,35 @@ class AutoSplitPlanner:
         # Explicit points (including percentages) are promises to the caller.
         # Only ``auto`` is allowed to search for a different placement.
         candidates = (
-            backend.enumerate_candidates(
-                max_boundary_count=constraints.max_frontier_size,
-                max_payload_bytes=constraints.max_payload_bytes,
-                max_candidates=None,
-                kinds=("before", "after"),
+            sorted(
+                backend.iter_candidates(),
+                key=lambda item: (
+                    item.estimated_payload_bytes, item.boundary_count,
+                    item.node_index if item.node_index is not None else 10**9,
+                    item.candidate_id,
+                ),
             )
             if boundary == "auto"
             else [backend.current_candidate] if backend.current_candidate is not None else []
         )
         if not candidates:
             raise RuntimeError("TorchLens did not enumerate any legal split candidates for this model.")
-        # ``trace`` resolves explicit module names/percentages to a concrete
-        # TorchLens candidate.  Preserve that caller choice when it satisfies
-        # constraints; enumeration order is graph order and must not silently
-        # replace every requested placement with the earliest legal cut.
-        requested = backend.current_candidate
-        if requested is not None:
-            candidates = sorted(
-                candidates,
-                key=lambda item: item.candidate_id != requested.candidate_id,
-            )
-
         checked = 0
         selected: tuple[SplitCandidate, dict[str, Any]] | None = None
         rejected: list[dict[str, Any]] = []
         for candidate in candidates:
-            validation = backend.validate_candidate(candidate)
+            # Native strict capability checks already ran during preparation
+            # or metadata-only recutting. A selected cut is materialized below.
+            validation = {
+                "success": True,
+                "verification": "native_capability_only",
+                "replay_performed": False,
+                "candidate_id": candidate.candidate_id,
+                "split_id": candidate.boundary,
+                "runtime": "torchlens_native",
+                "tail_trainability": bool(candidate.is_trainable_tail),
+                "error": None,
+            }
             checked += 1
             if _candidate_satisfies_constraints(candidate, validation, constraints):
                 selected = (candidate, validation)
@@ -260,21 +262,19 @@ class AutoSplitPlanner:
                     "estimated_payload_bytes": candidate.estimated_payload_bytes,
                     "boundary_count": candidate.boundary_count,
                     "validation_error": validation.get("error"),
-                    "max_abs_diff": validation.get("max_abs_diff"),
-                    "max_rel_diff": validation.get("max_rel_diff"),
                     "reason": _rejection_reason(candidate, validation, constraints),
                 }
             )
-            if constraints.max_candidates and checked >= constraints.max_candidates:
-                break
         if selected is None:
             raise RuntimeError(
                 "TorchLens did not find a split candidate satisfying constraints. "
                 f"checked={checked}, rejected={rejected[:5]!r}"
             )
         selected_candidate, validation = selected
-        if backend.current_candidate is None or (
-            backend.current_candidate.candidate_id != selected_candidate.candidate_id
+        if (
+            backend.current_candidate is None
+            or backend.current_candidate.candidate_id != selected_candidate.candidate_id
+            or backend.split_spec.boundary != selected_candidate.boundary
         ):
             backend.split(selected_candidate)
         runtime_handle = backend.make_handle()

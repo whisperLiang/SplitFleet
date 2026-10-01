@@ -30,7 +30,6 @@ class CoSplitUCBConfig:
     target_scale_ms: float = 1000.0
     server_concurrency: int = 1
     max_coordinate_passes: int = 3
-    max_candidates: int | None = None
     warm_start: bool = True
     state_path: str | None = None
     seed: int = 233
@@ -56,8 +55,6 @@ class CoSplitUCBConfig:
             raise ValueError("target_scale_ms must be positive")
         if self.server_concurrency < 1 or self.max_coordinate_passes < 0:
             raise ValueError("solver concurrency/passes are invalid")
-        if self.max_candidates is not None and self.max_candidates < 1:
-            raise ValueError("max_candidates must be positive or None")
 
 
 __all__ = ["CoSplitUCBConfig"]

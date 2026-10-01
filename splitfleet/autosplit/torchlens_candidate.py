@@ -92,27 +92,37 @@ def feature_layout_from_specs(specs: Mapping[str, Any]) -> dict[str, dict[str, A
     return layout
 
 
-def parameter_count_for_nodes(
-    runtime: Any,
-    node_names: Iterable[str],
-    *,
-    trainable_only: bool = False,
-) -> int:
-    selected = set(node_names)
-    seen: set[int] = set()
-    total = 0
-    for node in runtime.trace_graph.nodes:
-        if node.canonical_id not in selected:
-            continue
-        for parameter in node.param_refs:
-            if trainable_only and not parameter.is_trainable:
-                continue
-            value = parameter.handle
-            identity = id(value) if value is not None else hash((parameter.address, parameter.shape))
-            if identity not in seen:
-                seen.add(identity)
-                total += math.prod(value.shape if value is not None else parameter.shape)
-    return int(total)
+@dataclass
+class ParameterCountIndex:
+    """Reuse captured parameter identities and sizes across candidate cuts."""
+
+    by_node: dict[str, tuple[tuple[int, int, bool], ...]]
+    total_count: int
+
+    @classmethod
+    def from_runtime(cls, runtime: Any) -> "ParameterCountIndex":
+        by_node: dict[str, tuple[tuple[int, int, bool], ...]] = {}
+        all_parameters: dict[int, int] = {}
+        for node in runtime.trace_graph.nodes:
+            entries: list[tuple[int, int, bool]] = []
+            for parameter in node.param_refs:
+                value = parameter.handle
+                identity = id(value) if value is not None else hash((parameter.address, parameter.shape))
+                size = math.prod(value.shape if value is not None else parameter.shape)
+                entries.append((identity, size, bool(parameter.is_trainable)))
+                all_parameters.setdefault(identity, size)
+            by_node[node.canonical_id] = tuple(entries)
+        return cls(by_node=by_node, total_count=sum(all_parameters.values()))
+
+    def count(self, node_names: Iterable[str], *, trainable_only: bool = False) -> int:
+        seen: set[int] = set()
+        total = 0
+        for node_name in node_names:
+            for identity, size, trainable in self.by_node.get(node_name, ()):
+                if (not trainable_only or trainable) and identity not in seen:
+                    seen.add(identity)
+                    total += size
+        return total
 
 
 def candidate_from_plan(
@@ -122,6 +132,7 @@ def candidate_from_plan(
     *,
     node_index: int | None = None,
     graph_signature: str = "",
+    parameter_index: ParameterCountIndex | None = None,
 ) -> SplitCandidate:
     graph = runtime.trace_graph
     prefix_nodes = list(plan.prefix_node_ids)
@@ -129,18 +140,12 @@ def candidate_from_plan(
     boundary_labels = list(plan.boundary_node_ids)
     specs = plan.boundary_spec
     payload_bytes = payload_bytes_from_plan(runtime, plan)
-    all_nodes = [
-        node.canonical_id
-        for node in graph.nodes
-    ]
-    edge_params = parameter_count_for_nodes(runtime, prefix_nodes)
-    suffix_params = parameter_count_for_nodes(runtime, suffix_nodes)
-    trainable_suffix_params = parameter_count_for_nodes(
-        runtime,
-        suffix_nodes,
-        trainable_only=True,
-    )
-    total_params = parameter_count_for_nodes(runtime, all_nodes)
+    index = parameter_index or ParameterCountIndex.from_runtime(runtime)
+    edge_params = index.count(prefix_nodes)
+    suffix_params = index.count(suffix_nodes)
+    trainable_suffix_params = index.count(suffix_nodes, trainable_only=True)
+    trainable_prefix_params = index.count(prefix_nodes, trainable_only=True)
+    total_params = index.total_count
     freezing_ratio = float(edge_params) / float(total_params) if total_params else 0.0
     privacy_leakage = 1.0 / float(edge_params) if edge_params > 0 else float("inf")
     nodes = {node.canonical_id: node for node in graph.nodes}
@@ -158,6 +163,7 @@ def candidate_from_plan(
         "feature_layout": feature_layout_from_specs(specs),
         "prefix_node_count": len(prefix_nodes),
         "suffix_node_count": len(suffix_compute_nodes),
+        "trainable_prefix_parameter_count": trainable_prefix_params,
         "trainable_suffix_parameter_count": trainable_suffix_params,
         "torchlens_split_id": plan.split_id,
         "torchlens_split_label": split_label,

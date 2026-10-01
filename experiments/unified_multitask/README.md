@@ -10,9 +10,9 @@ and suffixes, with encoded/decoded activation and gradient envelopes.
 The runner is **sequential and in-process**. It verifies multi-task integration
 and learning curves on real datasets. Its elapsed time includes TorchLens
 capture on each client and local wire serialization; it does not measure a real
-LAN, separate edge device memory, or a physical heterogeneous fleet. Use
-`experiments/physical_cosplit_ucb` for multi-host system claims and
-`experiments/cosplit_ucb` for controlled resource sweeps.
+LAN, separate edge device memory, or a physical heterogeneous fleet. The
+[physical experiment guide](../README.md) covers the three-host, six-worker
+comparison using full local epochs and the same task adapters.
 
 ## Data layout
 
@@ -132,5 +132,5 @@ convergence or superiority. In a separate
 numerical comparator, the four benchmark models' two-batch SplitFed updates
 match full-local updates within `rtol=2e-4`, `atol=2e-6`; FedProx is confirmed
 to change a multi-batch update. These checks do not show four-task statistical
-superiority. Exact commands and limitations are recorded in
-[`docs/experiment_validation_report.md`](../../docs/experiment_validation_report.md).
+superiority. Exact commands and limitations are recorded locally in
+`results/reports/experiment_validation_report.md`.

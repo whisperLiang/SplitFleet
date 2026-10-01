@@ -1,6 +1,7 @@
 from typing import AsyncIterable
 import asyncio
 import time
+import traceback
 
 from splitfleet.proto import server_model_pb2_grpc
 from splitfleet.proto import server_model_pb2
@@ -82,7 +83,11 @@ class ServerModelServicer(server_model_pb2_grpc.ServerModelServicer):
         sid = request_group.sid
         server_model = self.server_model_manager.get_server_model(sid)
         method = getattr(server_model, method_name)
-        res = method(batches)
+        try:
+            res = method(batches)
+        except Exception:
+            traceback.print_exc()
+            raise
 
         for e, r in zip(events, res):
             e.set_result(r)

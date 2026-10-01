@@ -51,6 +51,14 @@ def test_gradient_envelope_detects_corruption() -> None:
         decode_gradients(bytes(payload))
 
 
+def test_removed_codec_is_rejected_by_raw_wire() -> None:
+    with pytest.raises(ValueError, match="Not a SplitFleet wire envelope"):
+        decode_boundary(b"SFS1" + b"\x00" * 16)
+    old_tensor = TensorEnvelope("x", (1,), "float32", b"", encoding="safetensors")
+    with pytest.raises(ValueError, match="Unsupported tensor layout or encoding"):
+        encode_boundary(BoundaryEnvelope(tensors=(old_tensor,)))
+
+
 @pytest.mark.parametrize(
     "source",
     [torch.tensor(7, dtype=torch.int64), torch.tensor(1.25, dtype=torch.float32),

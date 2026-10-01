@@ -129,9 +129,9 @@ SplitFed V1 的同步、双侧更新与轮末聚合由静态 SFL 组覆盖。V2/
 | 产物 | 路径 | 成功标准 |
 | --- | --- | --- |
 | 功能矩阵 | `results/unified_task_validation.json` | 机器可读、无 failed；unsupported 单列 |
-| 原始实验记录 | `results/cosplit_ucb/<run_id>/` | 通过严格 validator，无插补 |
-| 配对统计 | `results/cosplit_ucb/aggregated/paired_comparisons.csv` | 含 effect、CI、精确 p、Holm 与非劣性字段 |
-| 复现报告 | `docs/experiment_validation_report.md` | Material Passport + 11/11 fallacy scan |
+| 原始实验记录 | `results/unified_multitask/`、`results/physical_multitask/` | 通过严格 validator，无插补 |
+| 配对统计 | `results/unified_multitask/summary.json` | 含 effect、CI、精确 p、Holm 与非劣性字段 |
+| 复现报告 | `results/reports/` | 记录数据、模型、环境和源码身份及证据边界 |
 
 ## 可复现入口
 
@@ -141,14 +141,14 @@ uv run --no-sync python -m splitfleet.validation \
   --backends torch jax --all-nodes \
   --output results/unified_task_validation.json
 
-# CoSplit-UCB 在线 smoke 不要求完整离线 profiling
-uv run --no-sync python -m experiments.cosplit_ucb.run_suite \
-  --config experiments/cosplit_ucb/configs/smoke.yaml \
-  --run-prefix smoke --resume
+# 四任务机制 smoke；真实设备性能入口见 experiments/README.md
+uv run --no-sync python -m experiments.unified_multitask.run_matrix \
+  --tasks image_classification text_classification object_detection semantic_segmentation \
+  --source fixture --run-prefix smoke --output-root results/unified_multitask \
+  --rounds 1 --max-train-samples 24 --max-test-samples 12
 
-uv run --no-sync python -m experiments.cosplit_ucb.aggregate_results \
-  --results-root results/cosplit_ucb \
-  --output results/cosplit_ucb/aggregated
+uv run --no-sync python -m experiments.unified_multitask.summarize \
+  --results-root results/unified_multitask --output results/unified_multitask/summary.json
 ```
 
 ## 当前证据边界

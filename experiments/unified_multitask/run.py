@@ -21,10 +21,9 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from experiments.cosplit_ucb.config_utils import git_commit, stable_hash, tensor_state_hash
-from experiments.cosplit_ucb.logical_state import aggregate_named_states
-from experiments.cosplit_ucb.model_data import dirichlet_partition
-from experiments.cosplit_ucb.training_runtime import fedprox_penalty
+from experiments.common.identity import git_commit, stable_hash, tensor_state_hash
+from experiments.common.partition import dirichlet_partition
+from experiments.common.training import aggregate_named_states, fedprox_penalty
 from splitfleet.autosplit.torchlens_backend import prepare_torchlens_runtime
 from splitfleet.server.placement import (
     CoSplitUCBConfig,
@@ -86,6 +85,8 @@ def _train_client(
     learning_rate: float,
     proximal_mu: float,
     device: torch.device,
+    drop_last: bool = True,
+    optimizer_name: str = "sgd",
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
     model = workload.model_factory().to(device)
     model.load_state_dict(global_state, strict=True)
@@ -96,13 +97,16 @@ def _train_client(
         subset,
         batch_size=batch_size,
         shuffle=True,
-        drop_last=True,
+        drop_last=drop_last,
         collate_fn=workload.collate_fn,
         generator=torch.Generator().manual_seed(seed * 1_000_003 + round_id * 10_007 + int(client_id)),
     )
     if len(loader) == 0:
         raise ValueError(f"Client {client_id} has fewer than one full batch; reduce batch_size.")
-    optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
+    optimizer_class = {"sgd": torch.optim.SGD, "adam": torch.optim.Adam}.get(optimizer_name)
+    if optimizer_class is None:
+        raise ValueError(f"Unknown optimizer {optimizer_name!r}")
+    optimizer = optimizer_class(model.parameters(), lr=learning_rate)
     reference = {
         name: tensor.detach().to(device).clone()
         for name, tensor in global_state.items()
@@ -240,7 +244,9 @@ def _evaluate(workload: Workload, model: torch.nn.Module, *, batch_size: int, de
             outputs = _forward(model, call)
             if workload.task.name == "object_detection":
                 all_targets.extend(_move(targets, torch.device("cpu")))
-                all_predictions.extend(decode_detections(outputs))
+                # AP ranks detections by score; an absolute score cutoff can
+                # silently turn a trained detector into an empty prediction set.
+                all_predictions.extend(decode_detections(outputs, score_threshold=0.0))
             else:
                 if isinstance(outputs, dict):
                     output_key = "out" if workload.task.name == "semantic_segmentation" else "logits"
@@ -309,23 +315,16 @@ def run_benchmark(
             model=model,
             sample_inputs=sample_call,
             batch_axes={},
-            max_candidates=8,
         )
         policy = CoSplitUCBPlacementPolicy(
             candidate_provider=provider,
-            config=CoSplitUCBConfig(max_candidates=8, seed=seed),
+            config=CoSplitUCBConfig(seed=seed),
         )
         candidate_cuts = tuple(value.boundary for value in provider.get_candidates())
     destination = Path(output)
     destination.mkdir(parents=True, exist_ok=False)
     metadata = {
         "schema": "splitfleet.unified-benchmark.v1",
-        "material_passport": {
-            "origin_skill": "experiment-agent",
-            "origin_mode": "run",
-            "verification_status": "UNVERIFIED",
-            "version_label": "exp_result_v1",
-        },
         "scope": "controlled_in_process; physical network and device gains unmeasured",
         "task": workload.task.name,
         "source": workload.source,

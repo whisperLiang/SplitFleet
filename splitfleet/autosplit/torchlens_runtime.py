@@ -12,9 +12,9 @@ from torchlens import release_model
 from torchlens.split import SplitFeatures, SplitPoint, SplitRequest, SplitRuntime, after, before, percent, prepare
 from splitfleet.backends.utils import detect_torchlens_backend
 
-TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION = "splitfleet-torchlens-public-v4-build1"
+TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION = "splitfleet-torchlens-public-v6"
 REQUIRED_TORCHLENS_VERSION = "2.34.1"
-REQUIRED_TORCHLENS_BUILD = "SplitFleet local build 1 of TorchLens 2.34.1."
+
 
 def torchlens_runtime_version() -> str:
     return importlib.metadata.version("torchlens")
@@ -25,12 +25,6 @@ def require_torchlens_version() -> None:
     if version != REQUIRED_TORCHLENS_VERSION:
         raise RuntimeError(
             f"SplitFleet requires torchlens=={REQUIRED_TORCHLENS_VERSION}, but the active installation is {version!r}."
-        )
-    provenance = importlib.metadata.distribution("torchlens").read_text("SPLITFLEET_PATCHES")
-    if not provenance or provenance.splitlines()[0] != REQUIRED_TORCHLENS_BUILD:
-        raise RuntimeError(
-            "SplitFleet requires the patched TorchLens 2.34.1 build 1 wheel; "
-            "install the repository dependency with uv sync --reinstall-package torchlens."
         )
 
 

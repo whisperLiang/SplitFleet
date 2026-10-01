@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from typing import Any
 from threading import RLock
@@ -79,6 +80,9 @@ class AutoSplitTailServerModel(ServerModel):
         self._inflight_steps: set[tuple[int, str, str]] = set()
         self._step_lock = RLock()
         self._runtime_cache: dict[tuple[str, str, bool, str], TorchLensRuntimeHandle] = {}
+        self.runtime_prepare_sec = 0.0
+        self.boundary_deserialize_sec = 0.0
+        self.gradient_serialize_sec = 0.0
 
     def get_parameters(self):
         return self.backend_adapter.export_ndarrays(self.model)
@@ -95,11 +99,24 @@ class AutoSplitTailServerModel(ServerModel):
 
     def get_fit_result(self) -> ServerModelFitRes:
         average_loss = self.loss_total / max(self.num_examples, 1)
+        from splitfleet.autosplit.state_ownership import export_owned, DIGEST_KEY
+        ownership = getattr(self, "state_ownership", None)
+        started = time.perf_counter()
+        values = export_owned(self.model, ownership, "suffix") if ownership else self.get_parameters()
+        state_metrics = {"state_export_sec": time.perf_counter() - started,
+                         "state_tensor_count": len(values), "state_bytes": sum(v.nbytes for v in values)}
+        if ownership:
+            state_metrics[DIGEST_KEY] = ownership[DIGEST_KEY]
         return ServerModelFitRes(
-            parameters=self.get_parameters(),
+            parameters=values,
             config={
+                **state_metrics,
                 "num_examples": self.num_examples,
                 "avg_loss": average_loss,
+                "runtime_prepare_sec": self.runtime_prepare_sec,
+                "runtime_capture_reused": bool(self._require_runtime_handle().plan.metadata.get("_reused_capture")),
+                "boundary_deserialize_sec": self.boundary_deserialize_sec,
+                "gradient_serialize_sec": self.gradient_serialize_sec,
             },
         )
 
@@ -111,10 +128,12 @@ class AutoSplitTailServerModel(ServerModel):
         runtime_handle = self._require_runtime_handle()
         responses = []
         for batch in batches:
+            deserialize_started = time.perf_counter()
             wire_boundary = decode_boundary(batch.data["boundary"])
             self._validate_wire_identity(wire_boundary)
             step_key = (wire_boundary.round_id, wire_boundary.client_id, wire_boundary.step_id)
             boundary = envelope_to_boundary(wire_boundary, runtime_handle.runtime, self.device)
+            self.boundary_deserialize_sec += time.perf_counter() - deserialize_started
             targets = decode_bundle_wire(batch.data["targets"], self.device)
             examples = _request_num_examples(batch.data["metadata"])
             self._begin_step(step_key)
@@ -139,16 +158,21 @@ class AutoSplitTailServerModel(ServerModel):
             loss_value = self.backend_adapter.scalar_value(result["loss"])
             self.num_examples += examples
             self.loss_total += loss_value * examples
+            serialize_started = time.perf_counter()
             gradients = gradients_to_envelope(wire_boundary, result["boundary_grads"])
+            gradient_payload = encode_gradients(gradients)
+            self.gradient_serialize_sec += time.perf_counter() - serialize_started
             responses.append(
                 BatchData(
                     data={
-                        "gradients": encode_gradients(gradients),
+                        "gradients": gradient_payload,
                         "metadata": json.dumps(
                             {
                                 "loss": loss_value,
                                 "num_examples": examples,
                                 "server_service_ms": float(measurements["server_total_ms"]),
+                                "server_forward_ms": measurements.get("server_forward_ms"),
+                                "server_backward_ms": measurements.get("server_backward_ms"),
                             },
                             sort_keys=True,
                         ).encode("utf-8"),
@@ -193,6 +217,8 @@ class AutoSplitTailServerModel(ServerModel):
         self.sid = sid
         self.num_examples = 0
         self.loss_total = 0.0
+        self.boundary_deserialize_sec = 0.0
+        self.gradient_serialize_sec = 0.0
         self._processed_steps.clear()
         self._inflight_steps.clear()
         self.model_version = int(config.get(AUTOSPLIT_MODEL_VERSION_CONFIG_KEY, 0))
@@ -210,6 +236,7 @@ class AutoSplitTailServerModel(ServerModel):
                 raise RuntimeError("Suffix model state schema mismatch")
         self.backend_adapter.set_training(self.model, training)
         runtime_key = (self.plan_id, state_schema, bool(training), str(self.device))
+        prepare_started = time.perf_counter()
         self.runtime_handle = self._runtime_cache.get(runtime_key)
         if self.runtime_handle is None:
             plan_suffix = f"{sid or 'shared'}_{uuid.uuid4().hex[:8]}"
@@ -219,6 +246,9 @@ class AutoSplitTailServerModel(ServerModel):
                 plan_id=self.plan_id,
             )
             self._runtime_cache[runtime_key] = self.runtime_handle
+        self.runtime_prepare_sec = time.perf_counter() - prepare_started
+        from splitfleet.autosplit.state_ownership import read_ownership
+        self.state_ownership = read_ownership(config, self.runtime_handle, state_schema)
         # The contract hashes the whole model state, so it is resolved once per
         # round here rather than once per uploaded boundary.
         self.graph_contract = graph_contract_for_runtime_handle(self.runtime_handle)

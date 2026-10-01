@@ -33,6 +33,7 @@ def test_torchlens_boundary_payload_round_trips_without_pickle() -> None:
     x = torch.randn(3, 4)
 
     boundary = handle.backend.run_prefix(x)
+    assert not hasattr(handle.runtime, "_state_fingerprint")
     contract = graph_contract_for_runtime_handle(handle)
     envelope = boundary_to_envelope(
         boundary,
@@ -66,3 +67,27 @@ def test_torchlens_boundary_payload_round_trips_without_pickle() -> None:
         assert restored.tensors[label].dtype == tensor.dtype
     assert output1.shape == output2.shape
     assert torch.allclose(output1, output2, atol=1e-5, rtol=1e-4)
+
+
+def test_transport_training_runs_without_state_hashes() -> None:
+    model = ToyMlp().train()
+    handle = prepare_torchlens_runtime(
+        model, torch.randn(2, 4), boundary="after:linear_1_1", trainable=True,
+    )
+    assert not hasattr(handle.runtime, "_state_fingerprint")
+    boundary = handle.backend.run_prefix(torch.randn(2, 4), training=True)
+    assert "state_fingerprint" not in boundary.metadata
+    contract = graph_contract_for_runtime_handle(handle)
+    envelope = boundary_to_envelope(
+        boundary, round_id=1, client_id="client", step_id="step",
+        plan_id=handle.plan.plan_id, split_id=contract.split_id,
+        canonical_graph_hash=contract.canonical_graph_hash,
+        boundary_schema_hash=contract.boundary_schema_hash, model_version=1,
+    )
+    restored = envelope_to_boundary(envelope, handle.runtime, "cpu")
+    loss, gradients = handle.backend.train_suffix(
+        restored, torch.randn(2, 2), loss_fn=nn.MSELoss(),
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.01),
+    )
+    assert torch.isfinite(loss)
+    assert gradients

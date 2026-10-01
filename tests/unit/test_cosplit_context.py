@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from splitfleet.server.placement.cosplit_ucb import ContextEncoder, SplitCandidateDescriptor
 
@@ -47,3 +48,9 @@ def test_missing_telemetry_has_explicit_indicators() -> None:
     assert tuple(network[[7, 9, 11]]) == (1.0, 1.0, 1.0)
     assert tuple(server[[4, 6, 8, 11]]) == (1.0, 1.0, 1.0, 1.0)
     assert tuple(switch[[4, 6, 8]]) == (1.0, 1.0, 1.0)
+
+
+@pytest.mark.parametrize("value", ["invalid", float("nan"), float("inf")])
+def test_invalid_telemetry_is_rejected_instead_of_treated_as_missing(value) -> None:
+    with pytest.raises(ValueError, match="cpu_utilization.*finite number"):
+        ContextEncoder().edge_context(_candidate(), {"cpu_utilization": value})

@@ -41,9 +41,6 @@ def to_torchlens_boundary(payload: BoundaryPayload) -> ReplayBoundary:
     if not spec:
         raise ValueError("BoundaryPayload requires native TorchLens spec metadata.")
     metadata = dict(payload.metadata)
-    # A remote suffix owns an independently updated model replica. Graph,
-    # schema and model-version contracts are validated at the wire boundary.
-    metadata.pop("state_fingerprint", None)
     return ReplayBoundary(
         backend=metadata["backend"],
         tensors=dict(payload.tensors),

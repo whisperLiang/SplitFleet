@@ -167,3 +167,40 @@ __all__ = [
     "ImageClassifier", "TextClassifier", "GridDetector", "Segmenter",
     "detection_loss", "decode_detections",
 ]
+
+
+def build_model(
+    name: str,
+    *,
+    num_classes: int = 10,
+    normalization: str = "groupnorm",
+) -> torch.nn.Module:
+    from torchvision import models
+
+    normalized = name.lower().replace("-", "").replace("_", "")
+    builders = {
+        "resnet18": models.resnet18,
+        "resnet50": models.resnet50,
+        "resnet101": models.resnet101,
+        "wideresnet502": models.wide_resnet50_2,
+    }
+    if normalized not in builders:
+        raise ValueError(
+            "Supported ResNet models are resnet18, resnet50, "
+            "resnet101, and wide_resnet50_2."
+        )
+    norm = normalization.lower().replace("_", "")
+    if norm == "groupnorm":
+        # Match Flower's maintained CIFAR ResNet baseline.
+        norm_layer = lambda channels: torch.nn.GroupNorm(2, channels)
+    elif norm == "batchnorm":
+        norm_layer = torch.nn.BatchNorm2d
+    else:
+        raise ValueError("normalization must be 'groupnorm' or 'batchnorm'.")
+    # GroupNorm keeps the actual ResNet graph and trainable normalization,
+    # while making a genuine batch-size-one training execution well-defined.
+    return builders[normalized](
+        weights=None,
+        num_classes=num_classes,
+        norm_layer=norm_layer,
+    )

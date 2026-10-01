@@ -14,8 +14,7 @@ def test_wire_preserves_shape_binding_without_serializing_local_context():
         metadata={
             "backend": "torch", "runtime_batch_size": 2,
             "shape_program_hash": "shape-hash", "profile_hash": "profile-hash",
-            "batch_symbol": "B", "state_prefix_kind": "training",
-            "state_fingerprint": "client-local-state", "prefix_boundary_tensors": object(),
+            "batch_symbol": "B", "prefix_boundary_tensors": object(),
         },
     )
     envelope = boundary_to_envelope(
@@ -26,7 +25,7 @@ def test_wire_preserves_shape_binding_without_serializing_local_context():
     restored = decode_boundary(encode_boundary(envelope))
     assert restored.metadata == {
         "runtime_batch_size": 2, "shape_program_hash": "shape-hash",
-        "profile_hash": "profile-hash", "batch_symbol": "B", "state_prefix_kind": "training",
+        "profile_hash": "profile-hash", "batch_symbol": "B",
     }
 
 

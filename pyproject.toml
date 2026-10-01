@@ -20,11 +20,6 @@ dependencies = [
     "torchlens==2.34.1",
     "torch>=2.11.0",
     "numpy>=2.2.6",
-    "pandas>=2.2.0",
-    "tqdm>=4.66.0",
-    "ipython>=8.18.0",
-    "graphviz>=0.20.0",
-    "loguru>=0.7.0",
     "grpcio>=1.62.0",
     "protobuf>=4.25.0",
     "lz4>=4.3.0",
@@ -37,9 +32,6 @@ dev = [
 ]
 
 experiment = [
-    "matplotlib>=3.9.0",
-    "psutil>=6.0.0",
-    "pyyaml>=6.0.0",
     "torchvision>=0.26.0",
 ]
 
@@ -64,13 +56,13 @@ multibackend = [
 ]
 
 [tool.uv.sources]
-torchlens = { path = "./torchlens-2.34.1-1-py3-none-any.whl" }
+torchlens = { path = "./torchlens-2.34.1-py3-none-any.whl" }
 
 [tool.setuptools.packages.find]
 include = ["splitfleet*", "experiments*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests", "experiments/cosplit_ucb/tests", "experiments/unified_multitask"]
+testpaths = ["tests", "experiments/unified_multitask"]
 addopts = "-q"
 markers = [
     "integration: real-model or optional-dependency integration checks",

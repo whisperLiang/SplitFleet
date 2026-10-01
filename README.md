@@ -1,14 +1,17 @@
 # SplitFleet
 
-The CoSplit-UCB experiment package is documented in
-[`experiments/cosplit_ucb/README.md`](experiments/cosplit_ucb/README.md).
-
 SplitFleet is a unified split federated learning framework built on top of [Flower](https://flower.ai/) and TorchLens. It separates framework backends, operation-level model partitioning, task adapters, boundary transport, and federated aggregation.
 
 The unified task interface covers image classification, text classification, object detection, semantic segmentation, and instance segmentation. See the [Chinese architecture and validation guide](docs/unified_framework.md) for the execution contract and reproducible checks.
 Dataset-level integrations can be registered through `TaskSpec`/`TaskRegistry`, which bind a task adapter, model and dataset factories, metrics, and candidate cuts without coupling the split runtime to a dataset package. The preregistered comparison and statistical decision rules are in [`plans/unified_multitask_benchmark_protocol.md`](plans/unified_multitask_benchmark_protocol.md).
-The executable four-task FedAvg/FedProx/fixed-SplitFed/SplitFleet benchmark is documented in [`experiments/unified_multitask/README.md`](experiments/unified_multitask/README.md); its current validation and evidence limits are in [`docs/experiment_validation_report.md`](docs/experiment_validation_report.md).
-The autosplit runtime is backed by the repository-local `torchlens-2.34.1-1-py3-none-any.whl` via `uv.sources`, so SplitFleet focuses on Flower strategy integration, client/server transport, server-tail replicas, and aggregation policy. This local build fixes tinygrad's repeated traversal of shared graphs, fixed-shape replay, and container parameter binding; the unchanged upstream wheel, source patches, and [rebuild instructions](patches/torchlens/README.md) are retained for verification.
+The executable four-task FedAvg/FedProx/fixed-SplitFed/SplitFleet benchmark is documented in [`experiments/unified_multitask/README.md`](experiments/unified_multitask/README.md); its local validation report is in `results/reports/experiment_validation_report.md`.
+The [experiment guide](experiments/README.md) documents the current six-scheme physical comparison, device profiling, and local training performance benchmark.
+Physical experiment reports, comparison tables, and run records are kept locally in `results/reports/` and `results/physical_multitask/`; process logs are in `logs/`. These directories are ignored by Git.
+The autosplit runtime is backed by the repository-local `torchlens-2.34.1-py3-none-any.whl` via `uv.sources`. SplitFleet uses its native split APIs and maintains no local TorchLens patches or wheel builder. Candidate catalogs use `analyze()` for plans and capability reports; selected training cuts use `at()` to build executable segments. SplitFleet handles Flower strategy integration, client/server transport, server-tail replicas, and aggregation policy.
+
+Boundary features and gradients use the raw tensor envelope, with graph contracts,
+SHA-256 checks, and resource limits. The local safetensors comparison is in
+`results/reports/safetensors_end_to_end_20260927.md`.
 
 TorchLens-backed split replay and training can also be enabled for TensorFlow, JAX,
 Paddle, and tinygrad through the corresponding optional dependency groups
@@ -44,7 +47,7 @@ Currently supported:
 - a fleet-wide dynamic batch window negotiated by the strategy, permitting
   heterogeneous batch sizes when native TorchLens batch validation succeeds
 - SplitFed-style client and server aggregation
-- name-manifest reassembly of per-client prefix/suffix updates before FedAvg
+- ownership-based aggregation of per-client prefix/suffix updates in physical PyTorch SplitFleet runs
 - `BoundaryPayload` serialization through SplitFleet's typed wire envelopes
 
 Currently not supported:
@@ -106,11 +109,30 @@ Run the TorchLens split training demo:
 uv run --no-sync python examples/torchlens_split_training_demo.py
 ```
 
+Measure local split training with the installed wheel (requires the integration extra):
+
+```bash
+uv run --no-sync python -m experiments.benchmark_torchlens_training \
+  --label native-wheel --devices cpu cuda:0 \
+  --output results/torchlens_training/native-wheel.json
+```
+
+The benchmark records wheel and input hashes, checks loss, gradients and updated
+state against the complete model, and measures warmup separately from training.
+It uses synthetic inputs and excludes data loading and network transport. The
+local before/after comparison is in `results/reports/torchlens_training_performance_20261001.md`.
+
 Run the default test suite:
 
 ```bash
 uv run --no-sync pytest -q
 ```
+
+The native wheel currently fails 18 retained tinygrad regression checks for
+graph signatures, device rewrites, the removed buffer ownership helper and
+namedtuple state paths. Current cleanup validation is recorded in
+`results/reports/project_cleanup_20261001.md`; the earlier performance report
+records the original 17 failures before container-state checks were included.
 
 Run the real-model task matrix:
 
@@ -235,6 +257,16 @@ jointly assigns selected clients under bounded suffix-server concurrency, and
 Flower performs client selection and aggregation. `boundary="auto"` only means
 automatic boundary discovery; dynamic selection belongs to the policy.
 
+The physical multi-task runner searches every valid `before`/`after` operation
+boundary, including RF-DETR Nano, with no candidate-count limit. Training cuts
+must retain trainable parameters in both stages and pass native capability and
+state ownership checks. Selected cuts are materialized for training.
+The catalog shares one capture; execution handles are retained only for selected
+cuts. Results record catalog size and rejection diagnostics. Earlier RF-DETR
+timings used three preset cuts (25%, 50%, 75%) and describe that restricted catalog.
+The full RF-DETR catalog and serialized training verification are recorded locally
+in `results/reports/all_split_candidates_20260927.md`.
+
 ```python
 from splitfleet.server.placement import (
     CoSplitUCBPlacementPolicy,
@@ -304,8 +336,8 @@ mode are the two deltas summed. Shared buffers are not treated as tied.
 
 ## Runtime Invariants
 
-- Runtime validation must prove `torchlens.__version__ == "2.34.1"` from the installed package and require the repository's patched build 1. Runtime contracts identify this adapter build so earlier contracts must be regenerated.
-- Runtimes use TorchLens `prepare`; split-point discovery and repartition use the public `split_points` and `at` methods. Unsupported points remain visible in candidate diagnostics.
+- Runtime validation requires the installed `torchlens==2.34.1`. `uv.sources` and the wheel hash in `uv.lock` select the repository wheel. Runtime contracts identify adapter v6, so contracts from earlier adapters must be regenerated.
+- Runtimes use TorchLens `prepare`; split-point discovery, analysis, and repartition use the public `split_points`, `analyze`, and `at` methods. Unsupported points remain visible in candidate diagnostics.
 - `BoundaryPayload` serialization is self-contained: tensors, a stable `BoundarySpec`, and portable replay metadata survive cross-process transport. The optional native TorchLens object and local autograd state are not required on the receiving side.
 - Feature ABI identifiers are schema-only. They include labels, dtype, symbolic shape, layout, passthrough/preprocessing schema, trace mode, dynamic batch, model/runtime identifiers, and TorchLens version, but exclude sample tensor values, concrete sample batch values, target values, device, temporary runtime ids, and validation inputs.
 - Flower autosplit config is JSON-stable. Strategy, client, and server code exchange deterministic runtime contract JSON, contract digests, feature ABI ids, boundary labels, trace batch mode, dynamic batch, backend, and TorchLens version.
@@ -319,7 +351,7 @@ mode are the two deltas summed. Shared buffers are not treated as tied.
 
 ## Validation
 
-See the [validation record](docs/validation_results.md) for the tested environment,
+See the local `results/reports/validation_results.md` for the tested environment,
 reproduction commands, task matrix, and explicitly skipped checks.
 
 TorchLens 2.34.1 wheel and API checks:

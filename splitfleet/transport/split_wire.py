@@ -14,11 +14,10 @@ if TYPE_CHECKING:
     from splitfleet.autosplit.boundary import BoundaryPayload
 
 
-# Only portable replay information crosses the wire. Prefix autograd context
-# and the fingerprint of a process-local model replica must stay local.
+# Only portable replay information crosses the wire. Prefix autograd context stays local.
 REPLAY_METADATA_KEYS = (
     "runtime_batch_size", "shape_program_hash", "batch_symbol", "profile_hash",
-    "device_policy", "state_prefix_kind",
+    "device_policy",
 )
 
 

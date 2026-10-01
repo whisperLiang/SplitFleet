@@ -66,13 +66,7 @@ class DiscountedLinUCB:
         return value
 
     def _solve(self, rhs: np.ndarray) -> np.ndarray:
-        try:
-            return np.linalg.solve(self.A, rhs)
-        except np.linalg.LinAlgError:
-            # A discounted covariance should remain SPD. Jitter handles small
-            # numerical drift without replacing the estimator with an inverse.
-            jitter = max(self.ridge_lambda, 1.0) * 1e-10
-            return np.linalg.solve(self.A + jitter * np.eye(self.dimension), rhs)
+        return np.linalg.solve(self.A, rhs)
 
     def predict(self, context: np.ndarray) -> LinearPrediction:
         """Predict non-negative mean cost and confidence radius."""

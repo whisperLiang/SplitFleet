@@ -6,6 +6,7 @@ from typing import Optional
 
 from splitfleet.autosplit import TorchLensRuntimeHandle
 from splitfleet.autosplit.runtime import AutoSplitSession
+from splitfleet.autosplit.torchlens_clone import clone_runtime_handle
 from splitfleet.autosplit.torchlens_contract import (
     classify_contract_compatibility,
     runtime_contract_digest,
@@ -103,20 +104,32 @@ class StageRuntimeManager(ServerModelManager):
         cached = self._clone_runtime_cache.get(cache_key)
         if cached is not None:
             return cached
-        sample_inputs = base.plan.metadata.get("_example_inputs")
-        if sample_inputs is None:
-            raise RuntimeError("The active TorchLens runtime does not retain sample inputs.")
-        handle = self.autosplit_session.prepare_runtime(
-            model,
-            sample_inputs,
-            sample_kwargs=base.plan.metadata.get("_example_kwargs"),
-            batch_axes=base.runtime.request.features.batch_axes,
-            boundary=base.plan.boundary,
-            mode=base.plan.mode,
-            trainable=base.plan.trainable,
-            dynamic_batch=base.plan.dynamic_batch,
-            trace_batch_mode=base.plan.trace_batch_mode,
-        )
+        if base.backend.framework_backend == "torch":
+            handle = clone_runtime_handle(base, model)
+            if handle is None:
+                raise RuntimeError(
+                    "TorchLens runtime cannot bind this model replica to the captured graph."
+                )
+        else:
+            sample_inputs = base.plan.metadata.get("_example_inputs")
+            if sample_inputs is None:
+                raise RuntimeError("The active TorchLens runtime does not retain sample inputs.")
+            handle = self.autosplit_session.prepare_runtime(
+                model,
+                sample_inputs,
+                sample_kwargs=base.plan.metadata.get("_example_kwargs"),
+                batch_axes=base.runtime.request.features.batch_axes,
+                boundary=base.plan.boundary,
+                mode=base.plan.mode,
+                trainable=base.plan.trainable,
+                dynamic_batch=base.plan.dynamic_batch,
+                trace_batch_mode=base.plan.trace_batch_mode,
+            )
+        from splitfleet.split_engine import graph_contract_for_runtime_handle
+        from splitfleet.split_engine.contracts import validate_contract
+
+        if base.backend.framework_backend == "torch":
+            validate_contract(graph_contract_for_runtime_handle(base), graph_contract_for_runtime_handle(handle))
         compatibility = classify_contract_compatibility(
             base.plan.runtime_contract,
             handle.plan.runtime_contract,
@@ -129,7 +142,8 @@ class StageRuntimeManager(ServerModelManager):
         if suffix:
             original_plan_id = handle.plan.plan_id
             handle.plan.plan_id = f"{handle.plan.plan_id}_{suffix}"
-            self.autosplit_session._runtime_handles.pop(original_plan_id, None)
+            if self.autosplit_session._runtime_handles.get(original_plan_id) is handle:
+                self.autosplit_session._runtime_handles.pop(original_plan_id, None)
             self.autosplit_session._runtime_handles[handle.plan.plan_id] = handle
         self._clone_runtime_cache[cache_key] = handle
         return handle
