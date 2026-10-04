@@ -24,9 +24,8 @@ from torch.utils.data import DataLoader, Dataset, Subset
 
 from experiments.common.identity import stable_hash, tensor_state_hash
 from experiments.common.partition import dirichlet_partition
-from experiments.unified_multitask.data import VOC_CLASSES, Workload, _build_workload, load_workload
-from experiments.unified_multitask.models import GridDetector, ImageClassifier, Segmenter, TextClassifier
-from experiments.unified_multitask.run import METHODS, _batch, _evaluate, _train_client
+from experiments.unified_multitask.data import VOC_CLASSES, Workload, _build_workload
+from experiments.common.workload_training import METHODS, _batch, _evaluate, _train_client
 from splitfleet.client.app import start_client as split_start_client
 from splitfleet.client.autosplit_split_client import AutoSplitSplitLearningClient
 from splitfleet.common.constants import AUTOSPLIT_MODEL_VERSION_CONFIG_KEY
@@ -39,6 +38,28 @@ from splitfleet.server.strategy import AutoSplitStrategy
 
 TASKS = ("image_classification", "text_classification", "object_detection", "semantic_segmentation")
 FIXED_BOUNDARIES = ("25%", "50%", "75%")
+
+
+def _seed_training_stream(bundle, rank: int) -> None:
+    from experiments.unified_multitask.edge_models import EDGE_MODELS
+    if bundle.get("model_id") in EDGE_MODELS:
+        # Separate weight initialization from training randomness. Prefix and
+        # suffix on different devices must not reuse identically seeded streams.
+        torch.manual_seed(int(bundle["seed"]) * 1_000_003 + rank * 10_007 + 97)
+
+
+def _configure_primary_math(bundle) -> dict:
+    from experiments.unified_multitask.edge_models import EDGE_MODELS
+    if bundle.get("model_id") in EDGE_MODELS:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+    return {"matmul_tf32": torch.backends.cuda.matmul.allow_tf32,
+            "cudnn_tf32": torch.backends.cudnn.allow_tf32,
+            "cudnn_deterministic": torch.backends.cudnn.deterministic,
+            "cudnn_benchmark": torch.backends.cudnn.benchmark,
+            "strict_deterministic_algorithms": torch.are_deterministic_algorithms_enabled()}
 
 
 def scheme_name(method: str, fixed_boundary: str | None) -> str:
@@ -66,7 +87,7 @@ def _make_candidate_provider(*, model, sample_inputs, bundle):
         batch_axes=_batch_axes(bundle["task"]),
         dynamic_batch=(1, int(bundle["batch_size"])),
     )
-    if bundle.get("image_model") == "rfdetr_nano":
+    if bundle.get("model_id", bundle.get("image_model")) == "rfdetr_nano":
         from experiments.rfdetr_nano_physical import RFDETRCandidateProvider
 
         return RFDETRCandidateProvider(**common)
@@ -76,13 +97,38 @@ def _make_candidate_provider(*, model, sample_inputs, bundle):
     )
 
 
+def _resolve_fixed_cuts(*, model, sample_inputs, bundle) -> dict[str, str]:
+    """Select static graph fractions from admissible two-sided training cuts.
+
+    Resolve these on the frozen initial model before measuring any method.
+    Late percentage cuts can lie after the final parameter (e.g. output
+    slicing after prediction-only branches); raw graph percent is then not a legal SFL cut.
+    """
+    candidates = _make_candidate_provider(
+        model=model, sample_inputs=sample_inputs, bundle=bundle,
+    ).get_candidates(training=True)
+    if not candidates:
+        raise RuntimeError("No admissible two-sided training cut for the fixed baselines")
+    return {fraction: min(candidates, key=lambda candidate: (
+        abs(candidate.graph_position_ratio - float(fraction.rstrip('%')) / 100),
+        candidate.boundary,
+    )).boundary for fraction in FIXED_BOUNDARIES}
+
+
 def _wait_for_round_release(address: str, round_id: int, identity: str) -> None:
     host, port = address.rsplit(":", 1)
+    print(f"Round barrier entering: round={round_id} worker={identity}", flush=True)
     with socket.create_connection((host, int(port)), timeout=10) as connection:
         connection.settimeout(300)
         connection.sendall(json.dumps({"round_id": round_id, "id": identity}).encode() + b"\n")
-        if connection.recv(1) != b"1":
-            raise RuntimeError("six-worker round barrier did not release this client")
+        print(f"Round barrier ready: round={round_id} worker={identity}", flush=True)
+        try:
+            released = connection.recv(1)
+        except TimeoutError as exc:
+            raise TimeoutError(f"round {round_id} worker {identity} waited 300 seconds for barrier {address}") from exc
+        if released != b"1":
+            raise RuntimeError(f"round {round_id} barrier did not release worker {identity}")
+    print(f"Round barrier released: round={round_id} worker={identity}", flush=True)
 
 
 class ItemDataset(Dataset):
@@ -123,50 +169,49 @@ def _trace_item(value: Any, task: str) -> Any:
     return item
 
 
-def _model_factory(task: str, vocab_size: int, image_model: str = "small"):
-    if task == "image_classification":
-        if image_model == "resnet50":
-            from experiments.unified_multitask.models import build_model
-            return lambda: build_model("resnet50", normalization="groupnorm")
-        if image_model != "small":
-            raise ValueError(f"unknown image model {image_model!r}")
-        return lambda: ImageClassifier(10)
-    if task == "object_detection" and image_model == "rfdetr_nano":
-        from experiments.rfdetr_nano_physical import RFDETRNanoDetector
-        return RFDETRNanoDetector
-    if image_model != "small":
-        raise ValueError("resnet50 requires classification; rfdetr_nano requires detection")
-    if task == "text_classification":
-        return lambda: TextClassifier(vocab_size)
-    if task == "object_detection":
-        return lambda: GridDetector(len(VOC_CLASSES))
-    return lambda: Segmenter(3)
+def _model_factory(task: str, vocab_size: int, image_model: str, model_config: dict | None = None):
+    from experiments.unified_multitask.edge_models import EDGE_MODELS, make_edge_model
+
+    if image_model not in EDGE_MODELS or EDGE_MODELS[image_model]["task"] != task:
+        raise ValueError(f"Explicit full edge model required for {task}: {image_model!r}")
+    return lambda: make_edge_model(image_model, config=model_config)
 
 
 def prepare_bundle(*, task: str, data_root: str, output: Path, seed: int,
                    train_samples: int | None, test_samples: int | None,
                    batch_size: int, alpha: float = 0.5,
-                   image_model: str = "small",
-                   pretrain_weights: str | None = None) -> dict[str, Any]:
-    workload = load_workload(task, data_root=data_root, source="real",
-                             max_train_samples=train_samples, max_test_samples=test_samples,
-                             seed=seed,
-                             detection_image_size=384 if image_model == "rfdetr_nano" else 96)
-    if image_model != "small":
-        workload = replace(workload, model_factory=_model_factory(task, 0, image_model))
-    if image_model == "rfdetr_nano":
-        from experiments.rfdetr_nano_physical import RFDETRDetectionTask
-        workload = replace(workload, task=replace(workload.task,
-                                                  adapter_factory=RFDETRDetectionTask))
+                   image_model: str | None = None,
+                   pretrain_weights: str | None = None,
+                   model_name: str | None = None,
+                   tokenizer_path: str | None = None,
+                   worker_ids: list[str] | None = None) -> dict[str, Any]:
+    from experiments.unified_multitask.edge_models import (
+        EDGE_MODELS, file_sha256, load_edge_workload, make_edge_model, model_configuration,
+    )
+    if model_name is not None:
+        if image_model is not None:
+            raise ValueError("Use either --model or the legacy --image-model option")
+        image_model = model_name
+    if image_model not in EDGE_MODELS:
+        raise ValueError("Select an explicit full edge model; toy training models have been removed")
+    if not pretrain_weights:
+        raise ValueError("Edge models require an explicit audited pretrained checkpoint")
+    workload, model_metadata, configuration = load_edge_workload(
+        task, name=image_model, data_root=data_root, max_train_samples=train_samples,
+        max_test_samples=test_samples, tokenizer_path=tokenizer_path)
     torch.manual_seed(seed)
-    if image_model == "rfdetr_nano" and pretrain_weights:
-        from experiments.rfdetr_nano_physical import RFDETRNanoDetector
-        model = RFDETRNanoDetector(pretrain_weights=pretrain_weights)
-    else:
-        model = workload.model_factory()
-    vocab_size = model.embedding.num_embeddings if task == "text_classification" else 0
+    model = make_edge_model(image_model, config=configuration,
+                            pretrain_weights=pretrain_weights, tokenizer_path=tokenizer_path)
+    configuration = model_configuration(model, image_model)
+    workload = replace(workload, model_factory=_model_factory(task, 0, image_model, configuration))
+    model.train()
+    vocab_size = model.model.config.vocab_size \
+        if task == "text_classification" else 0
+    num_clients = len(worker_ids) if worker_ids is not None else 6
+    if num_clients < 1 or (worker_ids is not None and len(set(worker_ids)) != num_clients):
+        raise ValueError("Worker identities must be nonempty and unique")
     assignments = dirichlet_partition(
-        workload.partition_labels, 6, alpha=alpha, seed=seed,
+        workload.partition_labels, num_clients, alpha=alpha, seed=seed,
         min_partition_size=1,
     )
     flattened = [index for indices in assignments.values() for index in indices]
@@ -176,9 +221,17 @@ def prepare_bundle(*, task: str, data_root: str, output: Path, seed: int,
     common = {
         "schema": "splitfleet.physical-multitask-bundle.v2",
         "task": task, "source": "real", "seed": seed,
+        "num_clients": num_clients,
+        "worker_ids": worker_ids,
         "image_model": image_model,
+        "model_id": image_model,
+        "model_config": configuration,
+        "model_metadata": model_metadata,
+        "training_rng_policy": "independent logical-worker/coordinator streams; native dropout; no cross-device pathwise equivalence claim",
+        "num_parameters": sum(parameter.numel() for parameter in model.parameters()),
+        "trainable_parameters": sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad),
         "pretrain_checkpoint_sha256": (
-            hashlib.sha256(Path(pretrain_weights).read_bytes()).hexdigest()
+            file_sha256(pretrain_weights)
             if pretrain_weights else None
         ),
         "dirichlet_alpha": alpha,
@@ -193,6 +246,10 @@ def prepare_bundle(*, task: str, data_root: str, output: Path, seed: int,
         "edge_client_partition_sizes": {
             str(index): len(assignments[str(index * 2)]) + len(assignments[str(index * 2 + 1)])
             for index in range(3)
+        } if worker_ids is None else {
+            host: sum(len(assignments[str(index)]) for index, identity in enumerate(worker_ids)
+                      if identity.rsplit("-", 1)[0] == host)
+            for host in dict.fromkeys(identity.rsplit("-", 1)[0] for identity in worker_ids)
         },
         "train_size": len(workload.train_dataset),
         "test_size": len(workload.test_dataset),
@@ -209,6 +266,12 @@ def prepare_bundle(*, task: str, data_root: str, output: Path, seed: int,
     from experiments.unified_multitask.data import _dataset_pair_hash
     shape_example = _trace_item(workload.train_dataset[0], task)
     server_train = [shape_example for _ in range(batch_size)]
+    trace_loader = DataLoader(ItemDataset(server_train, task), batch_size=batch_size,
+                              collate_fn=workload.collate_fn)
+    trace_inputs, _, _ = _batch(workload, next(iter(trace_loader)), torch.device("cpu"))
+    common["fixed_cut_resolution"] = _resolve_fixed_cuts(
+        model=model, sample_inputs=trace_inputs, bundle=common,
+    )
     server_test = [workload.test_dataset[index] for index in range(len(workload.test_dataset))]
     server_payload = {**common, "role": "server", "train_items": server_train,
                       "test_items": server_test,
@@ -218,8 +281,9 @@ def prepare_bundle(*, task: str, data_root: str, output: Path, seed: int,
     partition_hashes = {}
     original_indices = (list(workload.train_dataset.indices)
                         if isinstance(workload.train_dataset, Subset)
-                        else list(range(len(workload.train_dataset))))
-    for client_index in range(6):
+                        else getattr(workload.train_dataset, "source_indices",
+                                     list(range(len(workload.train_dataset)))))
+    for client_index in range(num_clients):
         positions = assignments[str(client_index)]
         items = [workload.train_dataset[index] for index in positions]
         local_hash = _dataset_pair_hash(ItemDataset(items, task), ItemDataset([], task))
@@ -237,6 +301,10 @@ def prepare_bundle(*, task: str, data_root: str, output: Path, seed: int,
                                                "dirichlet_alpha", "edge_client_partition_sizes",
                                                "server_trace_source")}
     metadata["image_model"] = image_model
+    metadata.update(num_clients=num_clients, worker_ids=worker_ids)
+    for key in ("model_id", "model_config", "model_metadata", "num_parameters", "trainable_parameters"):
+        metadata[key] = common[key]
+    metadata["fixed_cut_resolution"] = common["fixed_cut_resolution"]
     metadata["pretrain_checkpoint_sha256"] = common["pretrain_checkpoint_sha256"]
     metadata["client_data_hashes"] = partition_hashes
     metadata["partition_label_counts"] = common["partition_label_counts"]
@@ -250,7 +318,7 @@ def load_bundle(path: str | Path) -> tuple[Workload, dict[str, Any]]:
     if bundle.get("schema") != "splitfleet.physical-multitask-bundle.v2":
         raise ValueError("unsupported physical bundle")
     factory = _model_factory(bundle["task"], int(bundle["vocab_size"]),
-                             bundle.get("image_model", "small"))
+                             bundle.get("model_id", bundle.get("image_model")), bundle.get("model_config"))
     from experiments.unified_multitask.data import _detection_collate
     workload = _build_workload(
         bundle["task"], factory, ItemDataset(bundle["train_items"], bundle["task"]),
@@ -318,6 +386,7 @@ class FullClient(FlowerNumPyClient):
         self.model = workload.model_factory()
         self.model.load_state_dict(bundle["initial_model_state"])
         self.names = list(self.model.state_dict())
+        _seed_training_stream(bundle, client_index)
 
     def get_parameters(self, config):
         return [value.detach().cpu().numpy() for value in self.model.state_dict().values()]
@@ -333,12 +402,13 @@ class FullClient(FlowerNumPyClient):
             batch_size=int(self.bundle["batch_size"]), max_batches=None,
             learning_rate=self.learning_rate, proximal_mu=0.01,
             device=torch.device(self.device), drop_last=False,
-            optimizer_name=self.optimizer_name,
+            optimizer_name=self.optimizer_name, model=self.model,
         )
         finished_ns = time.time_ns()
         self.model.load_state_dict(updated)
         metrics = {key: value for key, value in details.items() if value is not None}
-        metrics.update(logical_client_id=self.identity, device=self.device, pid=os.getpid(),
+        metrics.update(logical_client_id=self.identity, client_index=self.client_index,
+                       device=self.device, pid=os.getpid(),
                        fit_started_unix_ns=started_ns, fit_finished_unix_ns=finished_ns,
                        partition_hash=self.bundle["partition_hash"])
         return [updated[name].numpy() for name in self.names], int(details["num_examples"]), metrics
@@ -372,6 +442,7 @@ class SplitClient(AutoSplitSplitLearningClient):
     def get_properties(self, config):
         _ = config
         return {"logical_client_id": self.identity,
+                "batch_size": self.source.batch_size,
                 "device_type": str(self.device).split(":", 1)[0],
                 "num_batches": (len(self.source.workload.train_dataset)
                                 + self.source.batch_size - 1) // self.source.batch_size}
@@ -380,11 +451,19 @@ class SplitClient(AutoSplitSplitLearningClient):
 def _evaluate_physical(workload: Workload, model: torch.nn.Module, *,
                        device: torch.device) -> dict[str, float]:
     from experiments.rfdetr_nano_physical import RFDETRNanoDetector
-
     if isinstance(model, RFDETRNanoDetector):
         from experiments.rfdetr_nano_physical import evaluate
         return evaluate(workload, model, device=device)
     return _evaluate(workload, model, batch_size=8, device=device)
+
+
+def _ordered_fit_results(results):
+    """Use one arithmetic order across FL and SFL, independent of arrivals."""
+    indexed = [(int(res.metrics["client_index"]), (proxy, res)) for proxy, res in results]
+    indices = [index for index, _ in indexed]
+    if any(index < 0 for index in indices) or len(set(indices)) != len(indices):
+        raise ValueError("Fit updates require distinct nonnegative logical client indices")
+    return [result for _, result in sorted(indexed, key=lambda item: item[0])]
 
 
 class RecordingFedAvg(FedAvg):
@@ -404,6 +483,7 @@ class RecordingFedAvg(FedAvg):
         )
 
     def aggregate_fit(self, server_round, results, failures):
+        results = _ordered_fit_results(results)
         self.fit_records.extend({"round_id": int(server_round), "cid": str(proxy.cid),
                                  "num_examples": int(res.num_examples), "metrics": dict(res.metrics)}
                                 for proxy, res in results)
@@ -412,6 +492,11 @@ class RecordingFedAvg(FedAvg):
 
     def _evaluate_round(self, round_id, arrays, config):
         _ = config
+        # The split server evaluates only after each training round. Keep the
+        # native FL evaluation budget identical; Flower invokes round zero by
+        # default, which would otherwise add one full evaluation only for FL.
+        if round_id == 0:
+            return 0.0, {}
         self.model.load_state_dict({name: torch.from_numpy(value.copy())
                                     for name, value in zip(self.model.state_dict(), arrays, strict=True)})
         metrics = _evaluate_physical(self.workload, self.model, device=torch.device(self.device))
@@ -430,6 +515,7 @@ class RecordingSplit(AutoSplitStrategy):
         super().__init__(**kwargs)
 
     def aggregate_fit(self, server_round, results, failures):
+        results = _ordered_fit_results(results)
         self.fit_records.extend({"round_id": int(server_round), "cid": str(proxy.cid),
                                  "num_examples": int(res.num_examples), "metrics": dict(res.metrics)}
                                 for proxy, res in results)
@@ -453,19 +539,26 @@ class RecordingSplit(AutoSplitStrategy):
 
 
 def run_server(args: argparse.Namespace) -> None:
+    owned_exchange = args.method not in ("fedavg", "fedprox") and (
+        args.method == "splitfleet" or getattr(args, "split_state_exchange", "full") == "owned")
     workload, bundle = load_bundle(args.bundle)
+    math_policy = _configure_primary_math(bundle)
     if bundle["role"] != "server":
         raise ValueError("the server requires its evaluation bundle")
     torch.set_num_threads(1)
     torch.manual_seed(int(bundle["seed"]))
     model = workload.model_factory().to(args.device)
     model.load_state_dict(bundle["initial_model_state"])
+    _seed_training_stream(bundle, 999)
     if tensor_state_hash(model.state_dict()) != bundle["initial_model_hash"]:
         raise RuntimeError("server model initialization differs from the bundle")
+    num_clients = len(bundle["partition_sizes"])
     common = dict(fraction_fit=1.0, fraction_evaluate=0.0,
-                  min_fit_clients=6, min_evaluate_clients=0, min_available_clients=6)
+                  min_fit_clients=num_clients, min_evaluate_clients=0, min_available_clients=num_clients)
     optimizer_class = {"sgd": torch.optim.SGD, "adam": torch.optim.Adam}[args.optimizer]
     start = time.time()
+    start_monotonic_ns = time.monotonic_ns()
+    resolved_boundary = bundle.get("fixed_cut_resolution", {}).get(args.fixed_boundary, args.fixed_boundary)
     policy = None
     if args.method in ("fedavg", "fedprox"):
         strategy = RecordingFedAvg(workload=workload, model=model, device=args.device, **common)
@@ -479,7 +572,7 @@ def run_server(args: argparse.Namespace) -> None:
             provider = _make_candidate_provider(model=model, sample_inputs=sample, bundle=bundle)
             profile_path = os.environ.get("SPLITFLEET_DEVICE_PROFILES")
             from splitfleet.server.placement.cosplit_ucb.device_cost import DeviceCostPrior
-            if bundle.get("image_model") == "rfdetr_nano" and not profile_path:
+            if bundle.get("model_id", bundle.get("image_model")) == "rfdetr_nano" and not profile_path:
                 raise ValueError("RF-DETR SplitFleet requires SPLITFLEET_DEVICE_PROFILES")
             prior = DeviceCostPrior(profile_path) if profile_path else None
             policy = CoSplitUCBPlacementPolicy(
@@ -494,19 +587,19 @@ def run_server(args: argparse.Namespace) -> None:
         strategy = RecordingSplit(
             workload=workload, model=model, sample_inputs=sample,
             batch_axes=_batch_axes(bundle["task"]),
-            boundary=args.fixed_boundary, placement_policy=policy,
+            boundary=resolved_boundary, placement_policy=policy,
             aggregation_policy="splitfed",
             dynamic_batch=(1, int(bundle["batch_size"])),
             task=workload.task.make_adapter(),
             optimizer_fn=lambda module: optimizer_class(module.parameters(), lr=args.learning_rate),
             runtime_device=args.device, **common,
-            owned_state_exchange=args.method == "splitfleet",
+            owned_state_exchange=owned_exchange,
         )
         # Validate the complete catalog once; construct executable plans lazily
         # for the cuts actually selected for this round.
         if policy is not None:
             policy.candidate_provider.get_candidates(training=True)
-        boundaries = () if policy is not None else (args.fixed_boundary,)
+        boundaries = () if policy is not None else (resolved_boundary,)
         for boundary in boundaries:
             placement = strategy.get_or_create_placement_plan(boundary)
             strategy._autosplit_config(0, training=True, placement=placement)
@@ -515,17 +608,27 @@ def run_server(args: argparse.Namespace) -> None:
     result = {
         "schema": "splitfleet.physical-multitask-result.v2", "task": workload.task.name,
         "method": args.method, "source": "real", "seed": bundle["seed"],
-        "owned_state_exchange": args.method == "splitfleet",
+        "owned_state_exchange": owned_exchange,
+        "evaluation_policy": "after each training round; no initial evaluation",
+        "aggregation_order": "ascending logical client_index",
         "device_cost_profiles": os.environ.get("SPLITFLEET_DEVICE_PROFILES"),
         "min_residence_rounds": args.min_residence_rounds,
-        "image_model": bundle.get("image_model", "small"),
+        "image_model": bundle.get("image_model"),
+        "model_id": bundle.get("model_id", bundle.get("image_model")),
+        "math_policy": math_policy,
+        "model_metadata": bundle.get("model_metadata", {}),
+        "num_parameters": bundle.get("num_parameters"),
+        "trainable_parameters": bundle.get("trainable_parameters"),
         "pretrain_checkpoint_sha256": bundle.get("pretrain_checkpoint_sha256"),
-        "rounds": args.rounds, "expected_clients": 6,
+        "rounds": args.rounds, "expected_clients": num_clients,
+        "worker_ids": bundle.get("worker_ids"),
         "batch_size": bundle["batch_size"], "local_epochs": bundle["local_epochs"],
         "dirichlet_alpha": bundle["dirichlet_alpha"],
         "learning_rate": args.learning_rate,
         "optimizer": args.optimizer,
         "fixed_boundary": args.fixed_boundary if args.method == "splitfed_fixed" else None,
+        "resolved_fixed_boundary": resolved_boundary if args.method == "splitfed_fixed" else None,
+        "fixed_cut_resolution": bundle.get("fixed_cut_resolution"),
         "server_trace_source": bundle["server_trace_source"],
         "train_size": bundle["train_size"], "test_size": bundle["test_size"],
         "partition_sizes": bundle["partition_sizes"],
@@ -554,8 +657,9 @@ def run_server(args: argparse.Namespace) -> None:
             for candidate in policy.candidate_provider.get_candidates(training=True)
         ] if policy is not None else [],
         "history": str(history), "started_unix": start, "finished_unix": time.time(),
+        "server_duration_sec": (time.monotonic_ns() - start_monotonic_ns) / 1e9,
         "server_device": args.device,
-        "fit_barrier": "all_six_ready",
+        "fit_barrier": "all_configured_workers_ready",
     }
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -568,15 +672,13 @@ def run_server(args: argparse.Namespace) -> None:
 
 def run_client(args: argparse.Namespace) -> None:
     workload, bundle = load_bundle(args.bundle)
+    math_policy = _configure_primary_math(bundle)
+    resolved_boundary = bundle.get("fixed_cut_resolution", {}).get(args.fixed_boundary, args.fixed_boundary)
     if bundle["role"] != "client" or bundle["client_index"] != args.client_index:
         raise ValueError("client received the wrong private partition")
     torch.set_num_threads(1)
     torch.manual_seed(int(bundle["seed"]))
-    model = workload.model_factory().to(args.device)
-    model.load_state_dict(bundle["initial_model_state"])
     optimizer_class = {"sgd": torch.optim.SGD, "adam": torch.optim.Adam}[args.optimizer]
-    if tensor_state_hash(model.state_dict()) != bundle["initial_model_hash"]:
-        raise RuntimeError("client model initialization differs from the bundle")
     if args.method in ("fedavg", "fedprox"):
         client = FullClient(workload=workload, bundle=bundle, identity=args.client_id,
                             client_index=args.client_index, method=args.method,
@@ -584,6 +686,11 @@ def run_client(args: argparse.Namespace) -> None:
                             barrier=args.barrier, optimizer_name=args.optimizer)
         launch = flower_start_client
     else:
+        model = workload.model_factory().to(args.device)
+        model.load_state_dict(bundle["initial_model_state"])
+        if tensor_state_hash(model.state_dict()) != bundle["initial_model_hash"]:
+            raise RuntimeError("client model initialization differs from the bundle")
+        _seed_training_stream(bundle, args.client_index)
         source = RoundBatches(workload, seed=int(bundle["seed"]),
                               client_index=args.client_index,
                               batch_size=int(bundle["batch_size"]))
@@ -598,12 +705,12 @@ def run_client(args: argparse.Namespace) -> None:
             device=args.device,
             optimizer_fn=lambda module: optimizer_class(module.parameters(), lr=args.learning_rate),
             partial_batch_policy="error",
-            max_cached_runtimes=1 if bundle.get("image_model") == "rfdetr_nano" else None,
+            max_cached_runtimes=1,
         )
         # Prepare the first TorchLens graph while the server is booting.  The
         # server may choose another candidate; _ensure_round_runtime will
         # repartition this captured graph after the round config arrives.
-        prewarm_boundary = "50%" if args.method == "splitfleet" else args.fixed_boundary
+        prewarm_boundary = "50%" if args.method == "splitfleet" else resolved_boundary
         prewarm_started = time.perf_counter()
         client.prewarm_runtime(
             boundary=prewarm_boundary,
@@ -618,8 +725,12 @@ def run_client(args: argparse.Namespace) -> None:
                       "pid": os.getpid(), "host": socket.gethostname(),
                       "task": bundle["task"], "method": args.method,
                       "partition_hash": bundle["partition_hash"],
+                      "math_policy": math_policy,
                       "torch": torch.__version__, "python": platform.python_version()}), flush=True)
-    launch(server_address=args.server, client=client.to_client(), max_retries=60, max_wait_time=600)
+    transport_options = ({"reconnect_after_instruction": False}
+                         if launch is split_start_client else {})
+    launch(server_address=args.server, client=client.to_client(), max_retries=60,
+           max_wait_time=600, **transport_options)
     print(json.dumps({"event": "client_stop", "id": args.client_id}), flush=True)
 
 
@@ -635,8 +746,12 @@ def main() -> None:
     prepare.add_argument("--test-samples", type=int)
     prepare.add_argument("--batch-size", type=int, default=32)
     prepare.add_argument("--dirichlet-alpha", type=float, default=0.5)
-    prepare.add_argument("--image-model", choices=("small", "resnet50", "rfdetr_nano"), default="small")
+    from experiments.unified_multitask.edge_models import EDGE_MODELS
+    prepare.add_argument("--image-model", choices=tuple(EDGE_MODELS), default=None)
+    prepare.add_argument("--model", choices=tuple(EDGE_MODELS))
+    prepare.add_argument("--tokenizer-path")
     prepare.add_argument("--pretrain-weights")
+    prepare.add_argument("--worker-ids", nargs="+", help="Ordered physical identities; default is six CPU/GPU clients on three hosts")
     for role in ("server", "client"):
         item = sub.add_parser(role)
         item.add_argument("--bundle", type=Path, required=True)
@@ -645,6 +760,7 @@ def main() -> None:
         item.add_argument("--learning-rate", type=float, default=0.01)
         item.add_argument("--optimizer", choices=("sgd", "adam"), default="sgd")
         item.add_argument("--fixed-boundary", choices=("25%", "50%", "75%"), default="50%")
+        item.add_argument("--split-state-exchange", choices=("full", "owned"), default="full")
         item.add_argument("--min-residence-rounds", type=int, default=2,
                           help="CoSplit-UCB residence; values above the run length hold the initial cut")
         if role == "server":
@@ -665,7 +781,9 @@ def main() -> None:
                                         batch_size=args.batch_size,
                                         alpha=args.dirichlet_alpha,
                                         image_model=args.image_model,
-                                        pretrain_weights=args.pretrain_weights), indent=2))
+                                        pretrain_weights=args.pretrain_weights,
+                                        model_name=args.model, tokenizer_path=args.tokenizer_path,
+                                        worker_ids=args.worker_ids), indent=2))
     elif args.role == "server":
         run_server(args)
     else:

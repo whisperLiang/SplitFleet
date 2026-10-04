@@ -111,6 +111,37 @@ def test_bidi_runner_propagates_client_failures(rpc_server):
         start_client(server_address=address, client=BrokenClient().to_client(), max_retries=1)
 
 
+def test_primary_runner_does_not_replay_after_a_training_disconnect():
+    class InterruptedService(_FlowerService):
+        def Join(self, requests, context):
+            yield transport_pb2.ServerMessage(fit_ins=serde.fit_ins_to_proto(
+                FitIns(ndarrays_to_parameters([]), {CLIENT_ID_CONFIG_KEY: "client-7"})
+            ))
+            self.responses.append(next(requests))
+            context.abort(grpc.StatusCode.UNAVAILABLE, "injected connection loss")
+
+    class Client(NumPyClient):
+        updates = 0
+
+        def fit(self, parameters, config):
+            self.updates += 1
+            return parameters, 1, {}
+
+    service, client = InterruptedService(), Client()
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        server = grpc.server(executor)
+        transport_pb2_grpc.add_FlowerServiceServicer_to_server(service, server)
+        port = server.add_insecure_port("127.0.0.1:0")
+        server.start()
+        try:
+            with pytest.raises(RuntimeError, match="instruction replay is disabled"):
+                start_client(server_address=f"127.0.0.1:{port}", client=client.to_client(),
+                             max_retries=5, reconnect_after_instruction=False)
+            assert client.updates == len(service.responses) == 1
+        finally:
+            server.stop(0).wait()
+
+
 @pytest.mark.parametrize("transport", ["grpc-rere", "rest", None])
 def test_bidi_runner_rejects_unsupported_transports(transport):
     with pytest.raises(ValueError, match="Unsupported transport"):

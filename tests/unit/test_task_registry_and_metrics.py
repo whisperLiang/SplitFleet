@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from experiments.unified_multitask.models import decode_detections
+from experiments.rfdetr_nano_physical import decode_predictions
 
 from splitfleet.tasks import (
     TASK_SPECS,
@@ -137,13 +137,9 @@ def test_detection_map50_matches_ranked_predictions_and_penalizes_false_positive
 
 
 def test_detection_ap_can_rank_low_confidence_boxes_without_absolute_cutoff() -> None:
-    outputs = {
-        "objectness": torch.tensor([[[-4.0]]]),
-        "boxes": torch.zeros((1, 4, 1, 1)),
-        "classes": torch.zeros((1, 2, 1, 1)),
-    }
-    assert len(decode_detections(outputs)[0]["scores"]) == 0
-    retained = decode_detections(outputs, score_threshold=0.0)[0]
+    outputs = {"pred_logits": torch.full((1, 1, 91), -4.0),
+               "pred_boxes": torch.tensor([[[0.5, 0.5, 0.2, 0.2]]])}
+    retained = decode_predictions(outputs)[0]
     assert len(retained["scores"]) == 1
     assert 0.0 < retained["scores"][0] < 0.05
 

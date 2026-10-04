@@ -4,9 +4,11 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import hashlib
 from pathlib import Path
 import shlex
 import subprocess
+from experiments.common.physical_workers import physical_workers
 
 
 def run(args, *, log=None, timeout=600):
@@ -14,15 +16,16 @@ def run(args, *, log=None, timeout=600):
                           timeout=timeout)
 
 
-def profile_host(host, index, bundles, output, log_dir):
-    remote = f"/tmp/splitfleet_device_profile_{output.name}"
+def profile_host(host, workers, bundles, output, log_dir, task="object_detection"):
+    identity = hashlib.sha256(str(output.resolve()).encode()).hexdigest()[:12]
+    remote = f"/tmp/splitfleet_device_profile_{output.name}_{identity}"
     ssh = host["ssh"]
     run(["ssh", ssh, "mkdir -p " + shlex.quote(remote + "/bundles")])
     run(["rsync", "-az", "--exclude=__pycache__", "splitfleet", "experiments",
          f"{ssh}:{remote}/"], timeout=120)
-    for offset, kind, device in ((0, "cpu", "cpu"), (1, "gpu", "cuda:0")):
-        name = f"{host['id']}-{kind}"
-        bundle = bundles / f"object_detection.client_{index*2+offset}.pt"
+    for worker in workers:
+        name, device = worker["identity"], worker["device"]
+        bundle = bundles / f"{task}.client_{worker['index']}.pt"
         run(["scp", "-q", str(bundle), f"{ssh}:{remote}/bundles/{bundle.name}"], timeout=240)
         target = remote + "/" + name + ".json"
         command = ("cd " + shlex.quote(remote) + " && PYTHONPATH=" + shlex.quote(remote) + " "
@@ -37,25 +40,27 @@ def profile_host(host, index, bundles, output, log_dir):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--deployment", type=Path, default=Path("experiments/physical_multitask_205.deployment"))
+    parser.add_argument("--deployment", type=Path, required=True)
     parser.add_argument("--bundles", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--log-root", type=Path, default=Path("logs/device_split_profiles"))
+    parser.add_argument("--task", default="object_detection")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     log_dir = args.log_root / args.output.name
     log_dir.mkdir(parents=True, exist_ok=True)
     hosts = json.loads(args.deployment.read_text())["hosts"]
+    workers = physical_workers(hosts)
     with ThreadPoolExecutor(max_workers=3) as pool:
-        futures = {pool.submit(profile_host, host, index, args.bundles, args.output, log_dir): host["id"]
-                   for index, host in enumerate(hosts)}
+        futures = {pool.submit(profile_host, host, [w for w in workers if w["host"] == host],
+                              args.bundles, args.output, log_dir, args.task): host["id"]
+                   for host in hosts}
         for future in as_completed(futures):
             future.result()
     profiles = {"server": json.loads((args.output / "server.json").read_text())}
-    for host in hosts:
-        for kind in ("cpu", "gpu"):
-            name = f"{host['id']}-{kind}"
-            profiles[name] = json.loads((args.output / (name + ".json")).read_text())
+    for worker in workers:
+        name = worker["identity"]
+        profiles[name] = json.loads((args.output / (name + ".json")).read_text())
     graph = profiles["server"]["graph_signature"]
     if any(profile["graph_signature"] != graph for profile in profiles.values()):
         raise RuntimeError("Different physical hosts captured different graphs")

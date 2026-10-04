@@ -17,7 +17,10 @@ def _weighted_tensor(values: Sequence[torch.Tensor], weights: Sequence[int]) -> 
     reference = values[0]
     if reference.is_floating_point() or reference.is_complex():
         arrays = [value.detach().cpu().numpy() for value in values]
-        averaged = aggregate([(array, int(weight)) for array, weight in zip(arrays, weights)])
+        # Flower aggregates a list of model tensors. Keep a named entry as a
+        # one-tensor model so scalar parameters and empty leading axes retain
+        # their shape instead of being iterated as model layers.
+        averaged = aggregate([([array], int(weight)) for array, weight in zip(arrays, weights)])[0]
         return torch.from_numpy(np.asarray(averaged)).to(dtype=reference.dtype)
     total = float(sum(weights))
     accumulator = torch.zeros_like(reference, dtype=torch.float64)
@@ -45,6 +48,9 @@ def aggregate_named_states(
     for index, state in enumerate(client_states):
         if set(state) != expected:
             raise ValueError(f"Client state {index} does not match the full model schema.")
+        for name in keys:
+            if state[name].shape != client_states[0][name].shape or state[name].dtype != client_states[0][name].dtype:
+                raise ValueError(f"Client state {index} has an incompatible tensor schema for {name!r}.")
     return OrderedDict(
         (name, _weighted_tensor([state[name] for state in client_states], sample_counts))
         for name in keys

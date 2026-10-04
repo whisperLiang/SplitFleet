@@ -1,93 +1,42 @@
-# Experiment entry points
+# 四任务真机实验
 
-The physical runner compares FedAvg, FedProx, SplitFed at 25%, 50% and 75%,
-and SplitFleet on three Jetson hosts, each running one CPU and one GPU worker.
-Each worker trains its entire disjoint private partition for one local epoch
-per round. Dataset, partition and initial model hashes are shared across schemes.
-Runtime preparation errors stop the run, and incomplete rounds fail validation.
+本目录只保留这次完整边缘模型实验需要的训练、准入、profile、汇总与统计代码。正式比较包括 FedAvg、FedProx、固定25%/50%/75% SFL 和 SplitFleet；每个模型两种子、十轮，共48项作业。
 
-Install the experiment and real-model dependencies:
+| 任务 | 模型 | 数据集 | 客户端 | batch | Adam lr |
+|---|---|---|---:|---:|---:|
+| 图像分类 | ResNet-50 | CIFAR-10 | 6 CPU/GPU | 4 | 1e-4 |
+| 文本分类 | BERT-base | AG News | 3 GPU | 1 | 2e-5 |
+| 目标检测 | RF-DETR Nano | VOC2007 | 6 CPU/GPU | 1 | 1e-5 |
+| 语义分割 | DeepLabV3-ResNet50 | Oxford-IIIT Pet | 6 CPU/GPU | 2 | 1e-4 |
+
+每项作业使用240个训练样本、200个评估样本，完整本地epoch、全员参与、保留尾批，每轮训练后评估一次。固定与自适应SFL使用相同的状态所有权交换政策。
+
+本地文件：完整协议 `plans/four_task_study.md`，时间与质量结果 `paper/evidence/four_task_training_comparison_20261003.md`，论文 `paper/README.md`。这些文件不随代码仓库上传。
+
+安装依赖：
 
 ```bash
 uv sync --extra dev --extra experiment --extra integration
 ```
 
-## Physical training
+入口及职责：
 
-Review `physical_multitask_205.deployment` for host addresses, Python environments,
-coordinator device and barrier ports. Workers need passwordless SSH, synchronized
-clocks, CUDA and the original `torchlens-2.34.1-py3-none-any.whl` installed.
+| 入口 | 职责 |
+|---|---|
+| `physical_multitask.py` | 模型与数据包、FL/SFL客户端及服务器 |
+| `orchestrate_physical_multitask.py` | 六方案执行、远程源码核对、同步屏障 |
+| `edge_model_admission.py` | 原生训练、分割训练和数值/资源准入 |
+| `profile_split_execution.py` | 协调端切点成本profile |
+| `collect_device_split_profiles.py` | 各Orin客户端成本profile |
+| `run_edge_standard_study.py` | 准入、profile与逐模型训练队列 |
+| `www2027_study.py` | 冻结源码、配对种子执行与分析 |
+| `summarize_physical_multitask.py` | 完整性核对与物理作业汇总 |
+| `common/workload_training.py` | 共享批次处理、训练及任务评估 |
 
-Run a bounded real-data comparison for all four task families:
-
-```bash
-uv run --no-sync python -m experiments.orchestrate_physical_multitask \
-  --deployment experiments/physical_multitask_205.deployment \
-  --run-id four_tasks --train-samples 180 --test-samples 100 \
-  --batch-size 4 --rounds 3 --fixed-boundaries 25% 50% 75%
-
-uv run --no-sync python -m experiments.summarize_physical_multitask \
-  --run-root results/physical_multitask/four_tasks
-```
-
-Select tasks or methods with `--tasks` and `--methods`. The runner freezes input
-bundles, stages current code, validates all six workers, saves final models and
-removes its private staging directories. The summary distinguishes fixed cuts
-and rejects mixed runtime snapshots or training protocols. JSON and CSV outputs
-include total elapsed time, training spans per round and learning curves.
-
-## RF-DETR Nano and device profiles
-
-RF-DETR uses the pretrained Nano checkpoint and batch size one. Prepare frozen
-VOC07 bundles, profile the coordinator and six workers, then use those profiles
-for adaptive placement. Replace the checkpoint path with your local weights.
+核验保留实验，无须重新训练或改写原始结果：
 
 ```bash
-uv run --no-sync python -m experiments.physical_multitask prepare \
-  --task object_detection --image-model rfdetr_nano \
-  --pretrain-weights /path/to/rf-detr-nano.pth \
-  --train-samples 180 --test-samples 100 --batch-size 1 --dirichlet-alpha 10 \
-  --output results/rfdetr_bundles/object_detection.pt
-
-uv run --no-sync python -m experiments.profile_split_execution \
-  --bundle results/rfdetr_bundles/object_detection.pt --device cuda:0 \
-  --output results/rfdetr_profiles/server.json
-
-uv run --no-sync python -m experiments.collect_device_split_profiles \
-  --deployment experiments/physical_multitask_205.deployment \
-  --bundles results/rfdetr_bundles --output results/rfdetr_profiles
-
-uv run --no-sync python -m experiments.orchestrate_physical_multitask \
-  --deployment experiments/physical_multitask_205.deployment --run-id rfdetr_six \
-  --tasks object_detection --image-model rfdetr_nano \
-  --pretrain-weights /path/to/rf-detr-nano.pth \
-  --device-profiles results/rfdetr_profiles/device_profiles.json \
-  --train-samples 180 --test-samples 100 --batch-size 1 --dirichlet-alpha 10 \
-  --optimizer adam --learning-rate 0.00001 --rounds 3 \
-  --fixed-boundaries 25% 50% 75%
-
-uv run --no-sync python -m experiments.summarize_physical_multitask \
-  --run-root results/physical_multitask/rfdetr_six
+.venv/bin/python paper/evidence/verify_four_task_study.py
 ```
 
-Profiles measure operation costs using synthetic inputs on real devices. The
-training runner uses frozen real samples. The completed native-wheel comparison
-is recorded in `results/reports/real_device_training_time_20261001.md`.
-
-## Local checks
-
-Use [unified_multitask](unified_multitask/README.md) for sequential task integration,
-fixture checks and dataset learning curves. Its timing measures a single process.
-Shared partition, aggregation, identity and statistical helpers live in `common`.
-
-Measure local split training and compare outputs, losses, gradients and updated
-parameters against the full model:
-
-```bash
-uv run --no-sync python -m experiments.benchmark_torchlens_training \
-  --label native-wheel --devices cpu cuda:0 \
-  --output results/torchlens_training/native-wheel.json
-```
-
-Historical reports, logs and frozen source snapshots remain in ignored result
-directories. Historical runs use their recorded source snapshot for reproduction.
+复现原始作业须使用保留的冻结源码及输入计划；清理后的工作区源码具有新的身份，不能替代原实验的源码快照。原始部署、数据分区、检查点、profile及逐作业日志都保存在正式队列中，见完整协议。

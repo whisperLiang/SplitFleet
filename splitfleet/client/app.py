@@ -52,6 +52,7 @@ def start_client(
     transport: str = TRANSPORT_TYPE_GRPC_BIDI,
     max_retries: Optional[int] = None,
     max_wait_time: Optional[float] = None,
+    reconnect_after_instruction: bool = True,
 ) -> None:
     """Connect one SplitFleet client and process Flower bidi instructions."""
 
@@ -68,6 +69,7 @@ def start_client(
     event(EventType.START_CLIENT_ENTER)
     connection, address, connection_error_type = init_connection(transport, server_address)
     reconnect_window = _ReconnectWindow()
+    instruction_received = False
 
     while True:
         sleep_duration = 0
@@ -81,6 +83,7 @@ def start_client(
                 receive, send, server_model_stub = conn
                 while True:
                     message = receive()
+                    instruction_received = True
                     reconnect_window.record_success()
                     log(
                         INFO,
@@ -100,6 +103,13 @@ def start_client(
                     send(reply)
                     log(INFO, "Sent reply")
         except (StopIteration, connection_error_type) as exc:
+            code = exc.code() if hasattr(exc, "code") else type(exc).__name__
+            details = exc.details() if hasattr(exc, "details") else str(exc)
+            log(WARN, "Bidi connection ended: code=%s details=%s", code, details)
+            if instruction_received and not reconnect_after_instruction:
+                raise RuntimeError(
+                    "Training connection interrupted; instruction replay is disabled"
+                ) from exc
             attempts, elapsed = reconnect_window.record_failure()
             retry_limit_hit = max_retries is not None and attempts >= max_retries
             time_limit_hit = max_wait_time is not None and elapsed >= max_wait_time

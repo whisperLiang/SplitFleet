@@ -1,22 +1,17 @@
-"""Real and deterministic fixture datasets for the four-task benchmark."""
+"""Real dataset adapters and identity checks for full edge models."""
 
 from __future__ import annotations
 
-import csv
 import hashlib
-import re
-from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, Subset, TensorDataset
+from torch.utils.data import Dataset, Subset
 
 from splitfleet.tasks import MetricSpec, TASK_SPECS, TaskSpec, detection_map, macro_f1, mean_dice, mean_iou
-
-from .models import GridDetector, ImageClassifier, Segmenter, TextClassifier, detection_loss
 
 
 VOC_CLASSES = (
@@ -24,7 +19,6 @@ VOC_CLASSES = (
     "cow", "diningtable", "dog", "horse", "motorbike", "person", "pottedplant",
     "sheep", "sofa", "train", "tvmonitor",
 )
-TOKEN_PATTERN = re.compile(r"[a-z0-9]+(?:'[a-z]+)?")
 
 
 @dataclass(frozen=True)
@@ -37,53 +31,6 @@ class Workload:
     data_content_hash: str
     collate_fn: Callable[[list[Any]], Any] | None = None
     source: str = "fixture"
-
-
-class AGNewsDataset(Dataset):
-    """Read the canonical local AG News CSV layout with training-only vocabulary."""
-
-    def __init__(self, path: str | Path, vocabulary: dict[str, int], *, max_length: int = 64) -> None:
-        self.records: list[tuple[torch.Tensor, torch.Tensor, int]] = []
-        with Path(path).open("r", newline="", encoding="utf-8") as handle:
-            for row in csv.reader(handle):
-                if len(row) < 3:
-                    raise ValueError(f"AG News row in {path} needs label,title,description.")
-                label = int(row[0]) - 1
-                if not 0 <= label < 4:
-                    raise ValueError(f"AG News label must be in 1..4, got {row[0]!r}.")
-                tokens = TOKEN_PATTERN.findall((row[1] + " " + row[2]).lower())[:max_length]
-                ids = [vocabulary.get(token, 1) for token in tokens]
-                mask = [1] * len(ids)
-                ids.extend([0] * (max_length - len(ids)))
-                mask.extend([0] * (max_length - len(mask)))
-                self.records.append(
-                    (torch.tensor(ids, dtype=torch.long), torch.tensor(mask, dtype=torch.long), label)
-                )
-        if not self.records:
-            raise ValueError(f"AG News CSV is empty: {path}")
-
-    def __len__(self) -> int:
-        return len(self.records)
-
-    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        ids, mask, label = self.records[index]
-        return {"input_ids": ids, "attention_mask": mask, "labels": torch.tensor(label)}
-
-    @property
-    def targets(self) -> list[int]:
-        return [label for _ids, _mask, label in self.records]
-
-
-def _ag_news_vocabulary(path: Path, *, max_terms: int = 20_000) -> dict[str, int]:
-    counts: Counter[str] = Counter()
-    with path.open("r", newline="", encoding="utf-8") as handle:
-        for row in csv.reader(handle):
-            if len(row) < 3:
-                raise ValueError(f"AG News row in {path} needs label,title,description.")
-            counts.update(TOKEN_PATTERN.findall((row[1] + " " + row[2]).lower()))
-    return {token: index + 2 for index, (token, _count) in enumerate(
-        sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:max_terms]
-    )}
 
 
 class VOCBoxes(Dataset):
@@ -193,56 +140,6 @@ def _partition_labels(dataset: Dataset, task: str) -> tuple[int, ...]:
     return tuple(result)
 
 
-def _fixture(task: str, *, seed: int, train_size: int, test_size: int) -> Workload:
-    generator = torch.Generator().manual_seed(seed)
-    count = train_size + test_size
-    if task == "image_classification":
-        images = torch.randn(count, 3, 32, 32, generator=generator)
-        labels = torch.arange(count) % 10
-        all_data: Dataset = TensorDataset(images, labels)
-        model_factory = lambda: ImageClassifier(10)
-        collate = None
-    elif task == "text_classification":
-        ids = torch.randint(2, 100, (count, 12), generator=generator)
-        labels = torch.arange(count) % 4
-
-        class FixtureText(Dataset):
-            def __len__(self) -> int:
-                return count
-
-            def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-                return {"input_ids": ids[index], "attention_mask": torch.ones(12), "labels": labels[index]}
-
-        all_data = FixtureText()
-        model_factory = lambda: TextClassifier(100)
-        collate = None
-    elif task == "object_detection":
-        images = torch.randn(count, 3, 32, 32, generator=generator)
-
-        class FixtureDetection(Dataset):
-            def __len__(self) -> int:
-                return count
-
-            def __getitem__(self, index: int) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-                return images[index], {
-                    "boxes": torch.tensor([[0.2, 0.2, 0.6, 0.6]]),
-                    "labels": torch.tensor([index % 3]),
-                }
-
-        all_data = FixtureDetection()
-        model_factory = lambda: GridDetector(3)
-        collate = _detection_collate
-    else:
-        images = torch.randn(count, 3, 32, 32, generator=generator)
-        masks = torch.randint(0, 3, (count, 32, 32), generator=generator)
-        all_data = TensorDataset(images, masks)
-        model_factory = lambda: Segmenter(3)
-        collate = None
-    train = Subset(all_data, range(train_size))
-    test = Subset(all_data, range(train_size, count))
-    return _build_workload(task, model_factory, train, test, collate, source="fixture")
-
-
 def _build_workload(
     task: str,
     model_factory: Callable[[], torch.nn.Module],
@@ -255,7 +152,8 @@ def _build_workload(
     base = TASK_SPECS.get(task)
     if task == "object_detection":
         def adapter_factory():
-            return base.adapter_factory(model_loss=False, loss_fn=detection_loss)
+            from experiments.rfdetr_nano_physical import RFDETRDetectionTask
+            return RFDETRDetectionTask()
     else:
         adapter_factory = base.adapter_factory
     metrics = dict(base.metrics)
@@ -334,73 +232,5 @@ def _hash_value(digest: Any, value: Any) -> None:
         digest.update(repr(value).encode("utf-8"))
 
 
-def load_workload(
-    task: str,
-    *,
-    data_root: str | Path = "data",
-    source: str = "real",
-    download: bool = False,
-    max_train_samples: int | None = None,
-    max_test_samples: int | None = None,
-    seed: int = 2026,
-    detection_image_size: int = 96,
-) -> Workload:
-    """Load one task without implicit downloads or changing its evaluation set."""
 
-    task = TASK_SPECS.get(task).name
-    if task == "instance_segmentation":
-        raise ValueError("The four-task benchmark excludes instance segmentation; use the correctness matrix.")
-    if source == "fixture":
-        return _fixture(
-            task,
-            seed=seed,
-            train_size=max_train_samples or 8,
-            test_size=max_test_samples or 4,
-        )
-    if source != "real":
-        raise ValueError("source must be 'real' or 'fixture'.")
-    root = Path(data_root)
-    if task == "image_classification":
-        from torchvision import datasets, transforms
-
-        transform = transforms.ToTensor()
-        train = datasets.CIFAR10(str(root), train=True, download=download, transform=transform)
-        test = datasets.CIFAR10(str(root), train=False, download=download, transform=transform)
-        model_factory = lambda: ImageClassifier(10)
-        collate = None
-    elif task == "text_classification":
-        train_path = root / "ag_news_csv" / "train.csv"
-        test_path = root / "ag_news_csv" / "test.csv"
-        if not train_path.is_file() or not test_path.is_file():
-            raise FileNotFoundError(
-                "AG News needs data/ag_news_csv/train.csv and test.csv "
-                "(CSV columns: label 1..4, title, description)."
-            )
-        vocabulary = _ag_news_vocabulary(train_path)
-        train = AGNewsDataset(train_path, vocabulary)
-        test = AGNewsDataset(test_path, vocabulary)
-        model_factory = lambda: TextClassifier(len(vocabulary) + 2)
-        collate = None
-    elif task == "object_detection":
-        train = VOCBoxes(root, image_set="trainval", download=download,
-                         image_size=detection_image_size)
-        test = VOCBoxes(root, image_set="test", download=download,
-                        image_size=detection_image_size)
-        model_factory = lambda: GridDetector(len(VOC_CLASSES))
-        collate = _detection_collate
-    else:
-        train = PetMasks(root, split="trainval", download=download)
-        test = PetMasks(root, split="test", download=download)
-        model_factory = lambda: Segmenter(3)
-        collate = None
-    return _build_workload(
-        task,
-        model_factory,
-        _subset(train, max_train_samples),
-        _subset(test, max_test_samples),
-        collate,
-        source="real",
-    )
-
-
-__all__ = ["AGNewsDataset", "VOCBoxes", "PetMasks", "Workload", "load_workload"]
+__all__ = ["VOCBoxes", "PetMasks", "Workload"]

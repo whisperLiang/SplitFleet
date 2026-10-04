@@ -52,6 +52,31 @@ def test_owned_arrays_are_schema_checked():
         validate_owned([np.zeros(1, np.float32)], owned, "prefix", initial)
 
 
+def test_owned_scalar_and_integer_states_keep_their_model_schema():
+    initial = [np.array(1.0, dtype=np.float32), np.array(1, dtype=np.int64),
+               np.array([2, 3], dtype=np.int32)]
+    owned = manifest(["prefix", "suffix", "initial"])
+    result = aggregate_owned(initial, [
+        (owned, [np.array(1.0, dtype=np.float32)], [np.array(1, dtype=np.int64)], 1),
+        (owned, [np.array(5.0, dtype=np.float32)], [np.array(5, dtype=np.int64)], 3),
+    ])
+    assert result[0].shape == () and result[0].dtype == np.float32
+    assert result[0].item() == 4.0
+    assert result[1].shape == () and result[1].dtype == np.int64
+    assert result[1].item() == 4
+    np.testing.assert_array_equal(result[2], initial[2])
+    assert result[2].dtype == initial[2].dtype
+
+
+@pytest.mark.parametrize("weight", [-1, float("nan"), float("inf")])
+def test_owned_aggregation_rejects_invalid_client_weights(weight):
+    initial = [np.ones(1, np.float32)] * 3
+    owned = manifest(["prefix", "suffix", "initial"])
+    with pytest.raises(RuntimeError, match="positive weights"):
+        aggregate_owned(initial, [(owned, initial[:1], initial[:1], weight),
+                                  (owned, initial[:1], initial[:1], 3)])
+
+
 def test_strategy_reassembles_partial_uploads_without_full_state_comparisons(monkeypatch):
     model = torch.nn.Sequential(*(torch.nn.Linear(2, 2, bias=False) for _ in range(3)))
     strategy = AutoSplitStrategy(model=model, sample_inputs=torch.randn(1, 2),

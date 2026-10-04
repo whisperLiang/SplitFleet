@@ -83,6 +83,8 @@ def aggregate_owned(initial, updates):
         raise RuntimeError("No matching prefix/suffix update")
     decoded = [(validate_owned(p, m, "prefix", initial),
                 validate_owned(s, m, "suffix", initial), float(w)) for m, p, s, w in updates]
+    if any(not np.isfinite(w) or w <= 0 for _, _, w in decoded):
+        raise RuntimeError("State aggregation requires finite positive weights")
     total = sum(w for _, _, w in decoded)
     if total <= 0:
         raise RuntimeError("State aggregation requires positive weights")
@@ -90,12 +92,19 @@ def aggregate_owned(initial, updates):
     for index, base in enumerate(initial):
         first_p, first_s, weight = decoded[0]
         value = first_p.get(index, first_s.get(index, base))
-        accumulator = value * weight
+        # Multiplication can turn a zero-dimensional ndarray into a NumPy
+        # scalar, which cannot be an ufunc output. Preserve ndarray rank and
+        # the model schema; integer buffers use a floating accumulator.
+        working_dtype = base.dtype if base.dtype.kind in "fc" else np.float64
+        accumulator = np.array(value, dtype=working_dtype, copy=True)
+        np.multiply(accumulator, weight, out=accumulator)
         scratch = np.empty_like(accumulator) if len(decoded) > 1 else None
         for prefix, suffix, weight in decoded[1:]:
             value = prefix.get(index, suffix.get(index, base))
             np.multiply(value, weight, out=scratch)
             np.add(accumulator, scratch, out=accumulator)
         np.divide(accumulator, total, out=accumulator)
-        result.append(accumulator)
+        if base.dtype.kind not in "fc":
+            np.rint(accumulator, out=accumulator)
+        result.append(accumulator.astype(base.dtype, copy=False))
     return result

@@ -172,6 +172,7 @@ class _RoundTelemetry:
     _client_forward_samples_ms: list[float] = field(default_factory=list, repr=False)
     _client_backward_samples_ms: list[float] = field(default_factory=list, repr=False)
     _server_forward_samples_ms: list[float] = field(default_factory=list, repr=False)
+    _server_loss_samples_ms: list[float] = field(default_factory=list, repr=False)
     _server_backward_samples_ms: list[float] = field(default_factory=list, repr=False)
     _server_service_samples_ms: list[float] = field(default_factory=list, repr=False)
     _network_upload_samples_ms: list[float] = field(default_factory=list, repr=False)
@@ -215,6 +216,7 @@ class _RoundTelemetry:
             "client_forward",
             "client_backward",
             "server_forward",
+            "server_loss",
             "server_backward",
             "server_service",
             "network_upload",
@@ -753,6 +755,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
         metadata = json.loads(response.data["metadata"].decode("utf-8"))
         if telemetry is not None:
             telemetry.record_component("server_forward", metadata.get("server_forward_ms"))
+            telemetry.record_component("server_loss", metadata.get("server_loss_ms"))
             telemetry.record_component("server_backward", metadata.get("server_backward_ms"))
             telemetry.record_component("server_service", metadata.get("server_service_ms"))
             upload_ms, download_ms = _transport_phase_ms(

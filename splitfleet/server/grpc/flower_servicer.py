@@ -1,8 +1,10 @@
+import asyncio
 import uuid
-from typing import Callable, Iterator
+from typing import AsyncIterator, Callable
+from logging import WARNING
 
 import grpc
-from iterators import TimeoutIterator
+from flwr.common.logger import log
 
 from flwr.proto import transport_pb2_grpc  # pylint: disable=E0611
 from flwr.proto.transport_pb2 import (  # pylint: disable=E0611
@@ -12,15 +14,17 @@ from flwr.proto.transport_pb2 import (  # pylint: disable=E0611
 from flwr.server.client_manager import ClientManager
 from flwr.server.superlink.fleet.grpc_bidi.grpc_bridge import (
     GrpcBridge,
-    InsWrapper,
+    GrpcBridgeClosed,
     ResWrapper,
 )
 from flwr.server.superlink.fleet.grpc_bidi.grpc_client_proxy import GrpcClientProxy
 
+from splitfleet.server.grpc.async_grpc_bridge import AsyncGrpcBridge
 
-def default_bridge_factory() -> GrpcBridge:
-    """Return GrpcBridge instance."""
-    return GrpcBridge()
+
+def default_bridge_factory() -> AsyncGrpcBridge:
+    """Return a bridge supporting nonblocking async instruction delivery."""
+    return AsyncGrpcBridge()
 
 
 def default_grpc_client_proxy_factory(cid: str, bridge: GrpcBridge) -> GrpcClientProxy:
@@ -28,26 +32,18 @@ def default_grpc_client_proxy_factory(cid: str, bridge: GrpcBridge) -> GrpcClien
     return GrpcClientProxy(cid=cid, bridge=bridge)
 
 
-def register_client_proxy(
-    client_manager: ClientManager,
-    client_proxy: GrpcClientProxy,
-    context: grpc.ServicerContext,
-) -> bool:
-    """Try registering GrpcClientProxy with ClientManager."""
-    return client_manager.register(client_proxy)
-
-
 class FlowerServiceServicer(transport_pb2_grpc.FlowerServiceServicer):
-    """Had to copy-paste the whole class because of a bug in the `add_callback` function
-    when using asyncio
-    There's an open github issue for this bug:
-    https://github.com/grpc/grpc/issues/38346
+    """Bridge Flower's blocking proxies to the native asyncio gRPC service.
+
+    Cancellation closes the bridge and unregisters the proxy, including while
+    Join waits for its next instruction. A disconnected in-flight instruction
+    fails; it is never replayed against a potentially updated training state.
     """
 
     def __init__(
         self,
         client_manager: ClientManager,
-        grpc_bridge_factory: Callable[[], GrpcBridge] = default_bridge_factory,
+        grpc_bridge_factory: Callable[[], AsyncGrpcBridge] = default_bridge_factory,
         grpc_client_proxy_factory: Callable[
             [str, GrpcBridge], GrpcClientProxy
         ] = default_grpc_client_proxy_factory,
@@ -56,55 +52,47 @@ class FlowerServiceServicer(transport_pb2_grpc.FlowerServiceServicer):
         self.grpc_bridge_factory = grpc_bridge_factory
         self.client_proxy_factory = grpc_client_proxy_factory
 
-    def Join(  # pylint: disable=invalid-name
+    async def Join(  # pylint: disable=invalid-name
         self,
-        request_iterator: Iterator[ClientMessage],
-        context: grpc.ServicerContext,
-    ) -> Iterator[ServerMessage]:
+        request_iterator: AsyncIterator[ClientMessage],
+        context: grpc.aio.ServicerContext,
+    ) -> AsyncIterator[ServerMessage]:
         cid: str = uuid.uuid4().hex
         bridge = self.grpc_bridge_factory()
         client_proxy = self.client_proxy_factory(cid, bridge)
-        is_success = register_client_proxy(self.client_manager, client_proxy, context)
+        registered = self.client_manager.register(client_proxy)
 
-        if is_success:
-            # Get iterators
-            client_message_iterator = TimeoutIterator(
-                iterator=request_iterator, reset_on_next=True
-            )
-            ins_wrapper_iterator = bridge.ins_wrapper_iterator()
+        def close_bridge(_context=None) -> None:
+            bridge.close()
+            if registered:
+                self.client_manager.unregister(client_proxy)
 
-            # All messages will be pushed to client bridge directly
-            while True:
+        # Use the asyncio callback; the sync migration context's add_callback
+        # did not reliably run on cancellation (grpc/grpc#38346).
+        context.add_done_callback(close_bridge)
+        try:
+            if not registered:
+                return
+            async for ins_wrapper in bridge.ins_wrapper_async_iterator():
+                yield ins_wrapper.server_message
                 try:
-                    # Get ins_wrapper from bridge and yield server_message
-                    ins_wrapper: InsWrapper = next(ins_wrapper_iterator)
-                    yield ins_wrapper.server_message
-
-                    # Set current timeout, might be None
-                    if ins_wrapper.timeout is not None:
-                        client_message_iterator.set_timeout(ins_wrapper.timeout)
-
-                    # Wait for client message
-                    client_message = next(client_message_iterator)
-
-                    if client_message is client_message_iterator.get_sentinel():
-                        # Important: calling `context.abort` in gRPC always
-                        # raises an exception so that all code after the call to
-                        # `context.abort` will not run. If subsequent code should
-                        # be executed, the `rpc_termination_callback` can be used
-                        # (as shown in the `register_client` function).
-                        details = f"Timeout of {ins_wrapper.timeout}sec was exceeded."
-                        context.abort(
-                            code=grpc.StatusCode.DEADLINE_EXCEEDED,
-                            details=details,
-                        )
-                        return
-
-                    bridge.set_res_wrapper(
-                        res_wrapper=ResWrapper(client_message=client_message)
+                    client_message = await asyncio.wait_for(
+                        request_iterator.__anext__(), timeout=ins_wrapper.timeout
                     )
-                except Exception:
-                    break
-
-        client_proxy.bridge.close()
-        self.client_manager.unregister(client_proxy)
+                except asyncio.TimeoutError:
+                    await context.abort(
+                        code=grpc.StatusCode.DEADLINE_EXCEEDED,
+                        details=f"Timeout of {ins_wrapper.timeout}sec was exceeded.",
+                    )
+                    return
+                bridge.set_res_wrapper(ResWrapper(client_message=client_message))
+        except (StopAsyncIteration, GrpcBridgeClosed):
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log(WARNING, "Bidi Join ended for client %s: %s: %s",
+                cid, type(exc).__name__, exc)
+            raise
+        finally:
+            close_bridge()

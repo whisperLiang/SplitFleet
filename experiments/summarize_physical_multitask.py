@@ -20,11 +20,12 @@ PRIMARY = {
     "semantic_segmentation": "miou",
 }
 MODELS = {
-    "image_classification": "ImageClassifier",
-    "text_classification": "TextClassifier",
-    "object_detection": "GridDetector",
-    "semantic_segmentation": "Segmenter",
+    "resnet50_pretrained": "ResNet-50",
+    "bert_base": "BERT-base",
+    "rfdetr_nano": "RF-DETR Nano",
+    "deeplabv3_resnet50": "DeepLabV3-ResNet50",
 }
+
 DATASETS = {
     "image_classification": "CIFAR-10",
     "text_classification": "AG News",
@@ -37,25 +38,41 @@ RUNTIME_SOURCES = (
     "splitfleet/autosplit/runtime.py",
     "splitfleet/autosplit/torchlens_backend.py",
     "splitfleet/autosplit/torchlens_runtime.py",
+    "splitfleet/autosplit/state_ownership.py",
+    "splitfleet/runtime/torch_suffix_training.py",
     "splitfleet/client/autosplit_split_client.py",
     "experiments/common/identity.py",
     "experiments/common/partition.py",
     "experiments/common/training.py",
     "experiments/unified_multitask/data.py",
-    "experiments/unified_multitask/models.py",
-    "experiments/unified_multitask/run.py",
+    "experiments/unified_multitask/edge_models.py",
+    "experiments/common/workload_training.py",
     "splitfleet/server/placement/cosplit_ucb/candidate_provider.py",
     "splitfleet/server/placement/cosplit_ucb/config.py",
     "splitfleet/server/placement/cosplit_ucb/policy.py",
     "splitfleet/server/strategy/autosplit_strategy.py",
 )
+FROZEN_FOUR_TASK_SOURCES = {
+    "48080a378f1164c676a4535dc80db0cd0e828ee7f60ac2fba24dd9301eb3ddf4",
+    "ef387fc7f8a289bc870b30feaa410b84d586940054996a72c06cc497d3060fd9",
+}
 
 
 def _runtime_code_hash(folder: Path) -> str:
     source = json.loads((folder.parent / "source_hashes.json").read_text(encoding="utf-8"))
-    if any(path not in source for path in RUNTIME_SOURCES):
+    required = RUNTIME_SOURCES
+    identity = hashlib.sha256(json.dumps(source, sort_keys=True).encode()).hexdigest()
+    if identity in FROZEN_FOUR_TASK_SOURCES:
+        # The retained executions precede the shared-helper extraction. Hash
+        # their original module names without restoring removed entry points.
+        original_names = {
+            "experiments/common/workload_training.py": "experiments/unified_multitask/run.py",
+            "experiments/unified_multitask/edge_models.py": "experiments/unified_multitask/models.py",
+        }
+        required = tuple(original_names.get(path, path) for path in required)
+    if any(path not in source for path in required):
         raise ValueError(f"runtime source hash is missing for {folder}")
-    frozen = {path: source[path] for path in RUNTIME_SOURCES}
+    frozen = {path: source[path] for path in required}
     result = json.loads((folder / "result.json").read_text(encoding="utf-8"))
     if result.get("image_model") == "rfdetr_nano":
         path = "experiments/rfdetr_nano_physical.py"
@@ -65,7 +82,7 @@ def _runtime_code_hash(folder: Path) -> str:
     return hashlib.sha256(json.dumps(frozen, sort_keys=True).encode()).hexdigest()
 
 
-def summarize(root: Path) -> dict[str, Any]:
+def summarize(root: Path, *, write_outputs: bool = False) -> dict[str, Any]:
     rows = json.loads((root / "summary.json").read_text(encoding="utf-8"))
     results = {
         row["run_dir"]: json.loads((Path(row["run_dir"]) / "result.json").read_text(encoding="utf-8"))
@@ -91,6 +108,10 @@ def summarize(root: Path) -> dict[str, Any]:
         raise ValueError("comparison must use the same scheme set for every task")
     output_rows: list[dict[str, Any]] = []
     learning_rows: list[dict[str, Any]] = []
+    worker_counts = {int(result["expected_clients"]) for result in results.values()}
+    if len(worker_counts) != 1:
+        raise ValueError("methods must use the same configured worker count")
+    num_workers = next(iter(worker_counts))
     for task in tasks:
         task_rows = [by_key[task, scheme] for scheme in schemes]
         runtime_hashes = {_runtime_code_hash(Path(row["run_dir"])) for row in task_rows}
@@ -121,7 +142,8 @@ def summarize(root: Path) -> dict[str, Any]:
             report = json.loads((folder / "validation_report.json").read_text(encoding="utf-8"))
             result = results[row["run_dir"]]
             processes = json.loads((folder / "process_manifest.json").read_text(encoding="utf-8"))
-            if not report["valid"] or len(result["fit_records"]) != result["rounds"] * 6 or result["fit_failures"]:
+            if (not report["valid"] or report["workers"] != num_workers
+                    or len(result["fit_records"]) != result["rounds"] * num_workers or result["fit_failures"]):
                 raise ValueError(f"{task}/{method} failed completeness checks")
             if processes["server_exit_code"] != 0 or set(processes["worker_exit_codes"].values()) != {0}:
                 raise ValueError(f"{task}/{method} has a nonzero process exit")
@@ -133,7 +155,7 @@ def summarize(root: Path) -> dict[str, Any]:
                 fits = [fit for fit in result["fit_records"] if fit["round_id"] == round_id]
                 evaluations = [value for value in result["evaluation_records"]
                                if value["round_id"] == round_id]
-                if len(fits) != 6 or len(evaluations) != 1:
+                if len(fits) != num_workers or len(evaluations) != 1:
                     raise ValueError(f"{task}/{method} round {round_id} is incomplete")
                 examples = sum(fit["num_examples"] for fit in fits)
                 training_loss = sum(
@@ -156,9 +178,8 @@ def summarize(root: Path) -> dict[str, Any]:
                 })
             output_rows.append({
                 "task": task, "dataset": DATASETS[task],
-                "model": ("ResNet-50 GroupNorm" if result["image_model"] == "resnet50"
-                          else "RF-DETR Nano" if result["image_model"] == "rfdetr_nano"
-                          else MODELS[task]),
+                "model": MODELS.get(result.get("model_id", result.get("image_model")),
+                                    result.get("model_id", result.get("image_model"))),
                 "method": method, "scheme": scheme, "fixed_boundary": result["fixed_boundary"],
                 "primary_metric": PRIMARY[task],
                 "final_primary": primary,
@@ -175,16 +196,18 @@ def summarize(root: Path) -> dict[str, Any]:
                 "dirichlet_alpha": result["dirichlet_alpha"],
                 "final_model_hash": result["final_model_hash"],
                 "runtime_code_hash": runtime_code_hash,
-                "min_six_worker_overlap_sec": min(report["fit_interval_overlap_sec"].values()),
+                "min_worker_overlap_sec": min(report["fit_interval_overlap_sec"].values()),
                 "run_dir": str(folder),
             })
     summary = {
         "schema": "splitfleet.physical-multitask-comparison.v3",
         "scope": "single-seed, real-data physical training comparison",
-        "hosts": 3, "workers": 6, "task_count": len(tasks), "method_count": len(methods),
+        "hosts": 3, "workers": num_workers, "task_count": len(tasks), "method_count": len(methods),
         "scheme_count": len(schemes),
         "runs": output_rows, "learning_curves": learning_rows,
     }
+    if not write_outputs:
+        return summary
     (root / "comparison.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     with (root / "comparison.csv").open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(output_rows[0]))
@@ -201,7 +224,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-root", type=Path, required=True)
     args = parser.parse_args()
-    summary = summarize(args.run_root)
+    summary = summarize(args.run_root, write_outputs=True)
     print(json.dumps({"runs": len(summary["runs"]),
                       "output": str(args.run_root / "comparison.json")}, indent=2))
 

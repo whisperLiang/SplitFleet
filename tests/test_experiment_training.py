@@ -36,3 +36,21 @@ def test_aggregation_rejects_partial_states_and_invalid_sample_counts() -> None:
         aggregate_named_states([full, {"stem.weight": full["stem.weight"]}], [1, 1])
     with pytest.raises(ValueError, match="positive"):
         aggregate_named_states([full], [0])
+
+
+def test_aggregation_preserves_scalar_parameters_and_integer_buffers() -> None:
+    states = [
+        {"temperature": torch.tensor(value), "num_batches_tracked": torch.tensor(count)}
+        for value, count in ((1.0, 1), (5.0, 5))
+    ]
+    result = aggregate_named_states(states, [1, 3])
+    assert result["temperature"].shape == torch.Size([])
+    assert result["temperature"].item() == 4.0
+    assert result["num_batches_tracked"].dtype == torch.int64
+    assert result["num_batches_tracked"].item() == 4
+
+
+@pytest.mark.parametrize("incompatible", [torch.ones(1), torch.tensor(1.0, dtype=torch.float64)])
+def test_aggregation_rejects_shape_and_dtype_mismatch(incompatible) -> None:
+    with pytest.raises(ValueError, match="tensor schema"):
+        aggregate_named_states([{"scale": torch.tensor(1.0)}, {"scale": incompatible}], [1, 1])

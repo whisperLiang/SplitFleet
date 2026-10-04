@@ -28,8 +28,9 @@ def comparison_root(tmp_path):
             "partition_hash": "partitions", "initial_model_hash": "initial",
             "final_model_hash": scheme, "batch_size": 2, "local_epochs": 1,
             "optimizer": "sgd", "learning_rate": 0.01, "dirichlet_alpha": 0.5,
-            "train_size": 24, "test_size": 12, "image_model": "small",
+            "train_size": 24, "test_size": 12, "image_model": "resnet50_pretrained",
             "pretrain_checkpoint_sha256": None, "fit_failures": [],
+            "expected_clients": 6,
             "fit_records": [
                 {"round_id": 1, "num_examples": 4, "metrics": {
                     "task_loss" if method in ("fedavg", "fedprox") else "loss": 0.8,
@@ -41,7 +42,7 @@ def comparison_root(tmp_path):
         }
         (folder / "result.json").write_text(json.dumps(result))
         (folder / "validation_report.json").write_text(json.dumps({
-            "valid": True, "fit_interval_overlap_sec": {"1": 1.0},
+            "valid": True, "workers": 6, "fit_interval_overlap_sec": {"1": 1.0},
         }))
         (folder / "process_manifest.json").write_text(json.dumps({
             "server_exit_code": 0,

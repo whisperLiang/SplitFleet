@@ -5,14 +5,11 @@ SplitFleet is a unified split federated learning framework built on top of [Flow
 The unified task interface covers image classification, text classification, object detection, semantic segmentation, and instance segmentation.
 Architecture notes and study protocols are kept locally in `plans/` and excluded from Git.
 Dataset-level integrations can be registered through `TaskSpec`/`TaskRegistry`, which bind a task adapter, model and dataset factories, metrics, and candidate cuts without coupling the split runtime to a dataset package.
-The executable four-task FedAvg/FedProx/fixed-SplitFed/SplitFleet benchmark is documented in [`experiments/unified_multitask/README.md`](experiments/unified_multitask/README.md); its local validation report is in `results/reports/experiment_validation_report.md`.
-The [experiment guide](experiments/README.md) documents the current six-scheme physical comparison, device profiling, and local training performance benchmark.
-Physical experiment reports, comparison tables, and run records are kept locally in `results/reports/` and `results/physical_multitask/`; process logs are in `logs/`. These directories are ignored by Git.
+The completed four-task study compares FedAvg, FedProx, fixed SFL at 25/50/75% and SplitFleet on ResNet-50, BERT-base, RF-DETR Nano and DeepLabV3-ResNet50. Each model has two paired seeds and ten rounds: 48 audited jobs in total. BERT uses three GPU clients; the other models use six CPU/GPU clients on three Orin hosts.
+See the [experiment guide](experiments/README.md). The training comparison and manuscript guide are local files at `paper/evidence/four_task_training_comparison_20261003.md` and `paper/README.md`. Formal artifacts, admission records, profiles and frozen source snapshots are retained under `results/www2027_study_20261003/`.
 The autosplit runtime is backed by the repository-local `torchlens-2.34.1-py3-none-any.whl` via `uv.sources`. SplitFleet uses its native split APIs and maintains no local TorchLens patches or wheel builder. Candidate catalogs use `analyze()` for plans and capability reports; selected training cuts use `at()` to build executable segments. SplitFleet handles Flower strategy integration, client/server transport, server-tail replicas, and aggregation policy.
 
-Boundary features and gradients use the raw tensor envelope, with graph contracts,
-SHA-256 checks, and resource limits. The local safetensors comparison is in
-`results/reports/safetensors_end_to_end_20260927.md`.
+Boundary features and gradients use typed tensor envelopes, graph contracts, SHA-256 checks and resource limits.
 
 TorchLens-backed split replay and training can also be enabled for TensorFlow, JAX,
 Paddle, and tinygrad through the corresponding optional dependency groups
@@ -110,30 +107,11 @@ Run the TorchLens split training demo:
 uv run --no-sync python examples/torchlens_split_training_demo.py
 ```
 
-Measure local split training with the installed wheel (requires the integration extra):
-
-```bash
-uv run --no-sync python -m experiments.benchmark_torchlens_training \
-  --label native-wheel --devices cpu cuda:0 \
-  --output results/torchlens_training/native-wheel.json
-```
-
-The benchmark records wheel and input hashes, checks loss, gradients and updated
-state against the complete model, and measures warmup separately from training.
-It uses synthetic inputs and excludes data loading and network transport. The
-local before/after comparison is in `results/reports/torchlens_training_performance_20261001.md`.
-
 Run the default test suite:
 
 ```bash
-uv run --no-sync pytest -q
+uv run --no-sync pytest
 ```
-
-The native wheel currently fails 18 retained tinygrad regression checks for
-graph signatures, device rewrites, the removed buffer ownership helper and
-namedtuple state paths. Current cleanup validation is recorded in
-`results/reports/project_cleanup_20261001.md`; the earlier performance report
-records the original 17 failures before container-state checks were included.
 
 Run the real-model task matrix:
 
@@ -264,10 +242,8 @@ boundary, including RF-DETR Nano, with no candidate-count limit. Training cuts
 must retain trainable parameters in both stages and pass native capability and
 state ownership checks. Selected cuts are materialized for training.
 The catalog shares one capture; execution handles are retained only for selected
-cuts. Results record catalog size and rejection diagnostics. Earlier RF-DETR
-timings used three preset cuts (25%, 50%, 75%) and describe that restricted catalog.
-The full RF-DETR catalog and serialized training verification are recorded locally
-in `results/reports/all_split_candidates_20260927.md`.
+cuts. The retained four-task jobs record catalog sizes, selected boundaries and
+rejection diagnostics in their result files and profiles.
 
 ```python
 from splitfleet.server.placement import (
@@ -348,13 +324,16 @@ mode are the two deltas summed. Shared buffers are not treated as tied.
 - `backward_prefix` calls the pinned TorchLens runtime's training API directly.
 - Runtime preparation, optimizer construction and semantic split lookup failures propagate to the caller. Training does not continue with an unprepared runtime, missing optimizer implementation or guessed semantic boundary.
 - Under `ReplicaScope.PER_CLIENT`, the prefix and suffix halves of a round are aggregated by two different calls, so `aggregate_fit` returns `None` for the client-side model and `Strategy.finalize_round` returns the reassembled logical model. No call path can publish a model whose suffix half is a round stale: a caller that skips `finalize_round` keeps the previous global parameters.
-- Suffix timing measurements always contain `server_total_ms`. `server_forward_ms` and `server_backward_ms` are reported only by backends that execute the suffix phase by phase; no backend fabricates a phase split.
+- Suffix timing measurements always contain `server_total_ms`. PyTorch measures its complete suffix-service wall span, including boundary roots, task loss/matching, backward and optimizer work, and reports `server_loss_ms` through client telemetry. Phase timings are reported only by backends that measure them.
 - Per-round aggregation state is dropped when the next round is configured, so a round that never reaches `aggregate_server_fit` cannot retain a copy of the client and server models.
 
 ## Validation
 
-See the local `results/reports/validation_results.md` for the tested environment,
-reproduction commands, task matrix, and explicitly skipped checks.
+The local architecture guide, `plans/unified_framework.md`, describes validation scopes and reproduction commands. Verify the retained physical study without rewriting its results:
+
+```bash
+.venv/bin/python paper/evidence/verify_four_task_study.py
+```
 
 TorchLens 2.34.1 wheel and API checks:
 

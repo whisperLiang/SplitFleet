@@ -137,6 +137,9 @@ def test_torchlens_split_learning_client_and_tail_exchange_boundary_payloads() -
 
     assert num_examples == 3
     assert metrics["loss"] > 0
+    assert metrics["server_loss_samples"] == 1
+    assert metrics["server_loss_ms"] > 0
+    assert metrics["server_service_ms"] >= metrics["server_loss_ms"]
     assert server_result.config["num_examples"] == 3
     assert any(
         not np.allclose(before, after)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import inspect
+from contextlib import nullcontext
 from dataclasses import replace
 from typing import Any, Mapping
 
@@ -12,7 +13,7 @@ from torchlens import release_model
 from torchlens.split import SplitFeatures, SplitPoint, SplitRequest, SplitRuntime, after, before, percent, prepare
 from splitfleet.backends.utils import detect_torchlens_backend
 
-TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION = "splitfleet-torchlens-public-v6"
+TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION = "splitfleet-torchlens-v8-live-rng-selective-capture"
 REQUIRED_TORCHLENS_VERSION = "2.34.1"
 
 
@@ -141,7 +142,7 @@ def prepare_split_runtime(
     *,
     input_kwargs: dict[str, Any] | None = None,
 ) -> SplitRuntime:
-    """Prepare with the supported public API, without mutating TorchLens internals."""
+    """Prepare with pinned local capture/RNG extensions and strict contracts."""
     require_torchlens_version()
     backend = detect_torchlens_backend(model, (example_inputs, input_kwargs or {}))
     request = (
@@ -163,10 +164,20 @@ def prepare_split_runtime(
         for module in model.modules()
     ] if isinstance(model, torch.nn.Module) else []
     try:
-        return prepare(
-            model, inputs, request,
-            input_kwargs=input_kwargs,
-        )
+        # Capturing a stochastic model must not consume its training stream.
+        # Include only devices used by this model, avoiding another experiment's
+        # GPU and keeping CPU-only preparation free of CUDA initialization.
+        devices = sorted({value.device.index for value in (*model.parameters(), *model.buffers())
+                          if value.device.type == "cuda"}) if isinstance(model, torch.nn.Module) else []
+        guard = torch.random.fork_rng(devices=devices) if backend == "torch" else nullcontext()
+        with guard:
+            if backend == "torch" and request.trainable and request.features.retain_trace is None:
+                from splitfleet.autosplit.torch_training_capture import prepare_training_runtime
+                runtime = prepare_training_runtime(model, inputs, request, input_kwargs=input_kwargs)
+            else:
+                runtime = prepare(model, inputs, request, input_kwargs=input_kwargs)
+        from splitfleet.autosplit.torch_live_rng import enable_live_torch_rng
+        return enable_live_torch_rng(runtime)
     finally:
         if isinstance(model, torch.nn.Module):
             try:
@@ -181,7 +192,8 @@ def repartition_split_runtime(runtime: SplitRuntime, request: SplitRequest) -> S
     """Reuse capture, batch contract, placement and live state through ``at``."""
     if replace(request, point=runtime.request.point) != runtime.request:
         raise ValueError("Repartition may change only the split point; prepare a new runtime for other request changes.")
-    return runtime.at(request.point)
+    from splitfleet.autosplit.torch_live_rng import enable_live_torch_rng
+    return enable_live_torch_rng(runtime.at(request.point))
 
 
 def trace_signature(runtime: SplitRuntime) -> str:

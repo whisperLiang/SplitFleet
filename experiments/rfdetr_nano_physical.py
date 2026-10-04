@@ -1,4 +1,4 @@
-"""Small, real RF-DETR Nano VOC07 workload for the physical six-device runner."""
+"""Full pretrained RF-DETR Nano workload for the physical six-device runner."""
 
 from __future__ import annotations
 
@@ -58,6 +58,9 @@ class RFDETRDetectionTask(DetectionTask):
         self._criterion = None
         self._criterion_device = None
 
+    def model_config(self, device):
+        return _config(str(device))
+
     def prepare_batch(self, batch, *, training: bool = True):
         prepared = super().prepare_batch(batch, training=training)
         targets = []
@@ -78,7 +81,7 @@ class RFDETRDetectionTask(DetectionTask):
 
         device = outputs["pred_logits"].device
         if self._criterion is None or self._criterion_device != device:
-            config = _config(str(device))
+            config = self.model_config(device)
             train = TrainConfig(dataset_dir=".", output_dir=".", batch_size=1)
             self._criterion, _ = build_criterion_and_postprocessors(
                 build_namespace(config, train)

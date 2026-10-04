@@ -47,7 +47,7 @@ class DeviceCostPrior:
         props = self.clients.get(str(cid), {})
         return {"num_batches": int(props.get("num_batches", 1)),
                 "device_type": props.get("device_type", "cpu"),
-                "batch_size": 1}
+                "batch_size": int(props.get("batch_size", 1))}
 
     def estimate(self, cid, candidate, original: CandidateEstimate) -> CandidateEstimate:
         props = self.clients.get(str(cid))

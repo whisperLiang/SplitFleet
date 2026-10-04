@@ -172,6 +172,7 @@ class AutoSplitTailServerModel(ServerModel):
                                 "num_examples": examples,
                                 "server_service_ms": float(measurements["server_total_ms"]),
                                 "server_forward_ms": measurements.get("server_forward_ms"),
+                                "server_loss_ms": measurements.get("server_loss_ms"),
                                 "server_backward_ms": measurements.get("server_backward_ms"),
                             },
                             sort_keys=True,

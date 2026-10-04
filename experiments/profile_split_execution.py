@@ -8,7 +8,9 @@ from types import MethodType
 
 import numpy as np
 import torch
-from experiments.physical_multitask import load_bundle
+from torch.utils.data import DataLoader
+from experiments.physical_multitask import load_bundle, _trace_item, _batch_axes, ItemDataset, _configure_primary_math
+from experiments.common.workload_training import _batch
 from splitfleet.autosplit import AutoSplitSession
 from splitfleet.autosplit.state_ownership import state_ownership
 from splitfleet.backends.utils import adapter_for
@@ -17,30 +19,41 @@ from splitfleet.backends.utils import adapter_for
 def profile(bundle_path, device):
     started = time.perf_counter()
     workload, bundle = load_bundle(bundle_path)
+    math_policy = _configure_primary_math(bundle)
     torch.set_num_threads(1)
     torch.manual_seed(int(bundle["seed"]))
     model = workload.model_factory().to(device).train()
     model.load_state_dict(bundle["initial_model_state"])
-    sample = torch.full((1, 3, 384, 384), 0.5, device=device)
-    targets = [{"boxes": torch.tensor([[0.5, 0.5, 0.2, 0.2]], device=device),
-                "labels": torch.tensor([5], dtype=torch.long, device=device)}]
+    item = _trace_item(workload.train_dataset[0], bundle["task"])
+    if bundle["task"] == "object_detection":
+        item = (item[0], {"boxes": torch.tensor([[.2, .2, .6, .6]]),
+                         "labels": torch.tensor([0], dtype=torch.long)})
+    loader = DataLoader(ItemDataset([item] * bundle["batch_size"], bundle["task"]),
+                        batch_size=bundle["batch_size"], collate_fn=workload.collate_fn)
+    call, targets, _ = _batch(workload, next(iter(loader)), torch.device(device))
     session = AutoSplitSession(device=device)
-    handle = session.prepare_runtime(model, sample, boundary="50%", batch_axes={"/args/0": 0},
-                                     dynamic_batch=(1, 1), trainable=True)
+    handle = session.prepare_runtime(model, call, boundary=bundle["fixed_cut_resolution"]["50%"],
+                                     batch_axes=_batch_axes(bundle["task"]),
+                                     dynamic_batch=(1, bundle["batch_size"]), trainable=True)
     runtime = handle.runtime
-    ownership = state_ownership(handle, adapter_for(model, sample).state_manifest(model).schema_hash)
+    ownership = state_ownership(handle, adapter_for(model, call).state_manifest(model).schema_hash)
+    parameters = dict(model.named_parameters())
+    optimizers = {owner: torch.optim.Adam([parameters[name] for name, selected in
+        zip(ownership["names"], ownership["owners"]) if selected == owner and name in parameters
+        and parameters[name].requires_grad], lr=1e-5) for owner in ("prefix", "suffix")}
+    adapter = workload.task.make_adapter()
     def sync():
         if str(device).startswith("cuda"):
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(device)
     def step():
         model.zero_grad(set_to_none=True)
         sync(); begin = time.perf_counter()
-        boundary = handle.backend.run_prefix(sample, training=True)
+        boundary = handle.backend.run_prefix(*call.args, input_kwargs=dict(call.kwargs), training=True)
         sync(); forward = time.perf_counter()
         loss, gradients = handle.backend.train_suffix(boundary, targets,
-                            loss_fn=workload.task.make_adapter().loss, optimizer=None)
+                            loss_fn=adapter.loss, optimizer=optimizers["suffix"])
         sync(); tail = time.perf_counter()
-        handle.backend.backward_prefix(boundary, boundary_grads=gradients, optimizer=None)
+        handle.backend.backward_prefix(boundary, boundary_grads=gradients, optimizer=optimizers["prefix"])
         sync(); end = time.perf_counter()
         return ((forward-begin)*1000, (end-tail)*1000, (tail-forward)*1000, float(loss.detach()))
     step()
@@ -97,6 +110,10 @@ def profile(bundle_path, device):
         costs.append({"node": node.canonical_id, "forward_ms": forward.get(node.canonical_id, 0)*fscale*multiplier,
                       "backward_ms": backward.get(node.canonical_id, 0)*bscale*multiplier})
     return {"schema": "splitfleet.operation-costs.v1", "device": device,
+            "task": bundle["task"], "model_id": bundle.get("model_id", bundle.get("image_model")),
+            "batch_size": bundle["batch_size"], "optimizer": "adam", "learning_rate": 1e-5,
+            "suffix_loss_and_optimizer_included": True,
+            "math_policy": math_policy,
             "torch": torch.__version__, "graph_signature": handle.plan.graph_signature,
             "initial_model_hash": bundle["initial_model_hash"],
             "synthetic_inputs": True, "num_threads": 1,

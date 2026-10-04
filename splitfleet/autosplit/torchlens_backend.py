@@ -333,8 +333,9 @@ class TorchLensSplitBackend:
 
         Every backend reports ``server_total_ms``. Backends whose suffix step is
         executed phase by phase also report ``server_forward_ms`` and
-        ``server_backward_ms``; the others cannot separate the phases and do not
-        report a fabricated split.
+        ``server_backward_ms``. PyTorch additionally reports ``server_loss_ms``
+        and measures its complete suffix step as a wall span. Backends without
+        separate phases do not report a fabricated split.
         """
 
         if loss_fn is None:

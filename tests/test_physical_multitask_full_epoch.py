@@ -7,31 +7,85 @@ import pytest
 import torch
 
 from experiments.physical_multitask import (
-    FullClient, RoundBatches, _make_candidate_provider, load_bundle, prepare_bundle,
+    FullClient, RoundBatches, _make_candidate_provider, _resolve_fixed_cuts, load_bundle, prepare_bundle,
 )
 from experiments.orchestrate_physical_multitask import _run_one
 from experiments.rfdetr_nano_physical import RFDETRCandidateProvider
-from experiments.unified_multitask.data import load_workload
-from experiments.unified_multitask.models import ImageClassifier, TextClassifier
+from experiments.unified_multitask.data import _build_workload
 from splitfleet.server.placement.cosplit_ucb import TorchLensCandidateProvider
 from splitfleet.autosplit.types import PlacementConstraint, PlacementObjective
 from splitfleet.tasks import ModelInputs
 
 
+# These tensor-contract fixtures are confined to unit tests, with no training
+# experiment entrypoint, real-device benchmark, or saved performance population.
+class BatchContractFixture(torch.nn.Module):
+    def __init__(self, num_classes=10):
+        super().__init__()
+        self.input = torch.nn.Linear(3, 8)
+        self.output = torch.nn.Linear(8, num_classes)
+
+    def forward(self, images):
+        return self.output(torch.relu(self.input(images.mean(dim=(-2, -1)))))
+
+
+class TokenContractFixture(torch.nn.Module):
+    def __init__(self, vocab_size):
+        super().__init__()
+        self.embedding = torch.nn.Embedding(vocab_size, 4)
+        self.output = torch.nn.Linear(4, 4)
+
+    def forward(self, input_ids, attention_mask):
+        values = self.embedding(input_ids) * attention_mask[..., None]
+        return {"logits": self.output(values.mean(dim=1))}
+
+
+def test_native_fl_evaluates_only_after_training_rounds(monkeypatch):
+    import experiments.physical_multitask as physical
+
+    model = torch.nn.Linear(4, 2)
+    calls = []
+    def evaluate(workload, current_model, *, device):
+        calls.append(current_model)
+        return {"accuracy": .5}
+    monkeypatch.setattr(physical, "_evaluate_physical", evaluate)
+    strategy = physical.RecordingFedAvg(workload=object(), model=model, device="cpu")
+    arrays = [value.detach().numpy() for value in model.state_dict().values()]
+    assert strategy._evaluate_round(0, arrays, {}) == (0.0, {})
+    assert not calls and not strategy.evaluation_records
+    for round_id in [1, 2, 3]:
+        assert strategy._evaluate_round(round_id, arrays, {}) == (0.0, {"accuracy": .5})
+    assert len(calls) == 3
+    assert [row["round_id"] for row in strategy.evaluation_records] == [1, 2, 3]
+
+
+def patch_unit_workload(monkeypatch, *, train_size, test_size, seed, tmp_path):
+    from experiments.unified_multitask import edge_models
+    generator = torch.Generator().manual_seed(seed)
+    images = torch.randn(train_size + test_size, 3, 8, 8, generator=generator)
+    labels = torch.arange(train_size + test_size) % 10
+    workload = _build_workload("image_classification", BatchContractFixture,
+        torch.utils.data.TensorDataset(images[:train_size], labels[:train_size]),
+        torch.utils.data.TensorDataset(images[train_size:], labels[train_size:]), None, source="unit")
+    monkeypatch.setattr(edge_models, "load_edge_workload", lambda *args, **kwargs: (workload, {}, {}))
+    monkeypatch.setattr(edge_models, "make_edge_model", lambda *args, **kwargs: BatchContractFixture())
+    checkpoint = tmp_path / "unit_checkpoint.pth"
+    checkpoint.write_bytes(b"unit checkpoint routing")
+    return checkpoint
+
+
 def test_private_bundles_and_full_local_epoch(tmp_path, monkeypatch):
     import experiments.physical_multitask as physical
 
-    fixture = load_workload(
-        "image_classification", source="fixture", seed=19,
-        max_train_samples=61, max_test_samples=17,
-    )
-    monkeypatch.setattr(physical, "load_workload", lambda *args, **kwargs: fixture)
+    checkpoint = patch_unit_workload(monkeypatch, train_size=61, test_size=17,
+        seed=19, tmp_path=tmp_path)
     monkeypatch.setattr(physical, "_wait_for_round_release", lambda *args: None)
 
     server_path = tmp_path / "cifar.pt"
     manifest = prepare_bundle(
         task="image_classification", data_root="unused", output=server_path,
         seed=19, train_samples=61, test_samples=17, batch_size=8,
+        model_name="resnet50_pretrained", pretrain_weights=str(checkpoint),
     )
     server_workload, server_bundle = load_bundle(server_path)
     assert server_bundle["role"] == "server"
@@ -68,14 +122,12 @@ def test_private_bundles_and_full_local_epoch(tmp_path, monkeypatch):
 def test_failed_split_prewarm_stops_before_connecting_to_the_server(tmp_path, monkeypatch):
     import experiments.physical_multitask as physical
 
-    fixture = load_workload(
-        "image_classification", source="fixture", seed=19,
-        max_train_samples=24, max_test_samples=12,
-    )
-    monkeypatch.setattr(physical, "load_workload", lambda *args, **kwargs: fixture)
+    checkpoint = patch_unit_workload(monkeypatch, train_size=24, test_size=12,
+        seed=19, tmp_path=tmp_path)
     bundle_path = tmp_path / "image_classification.pt"
     prepare_bundle(task="image_classification", data_root="unused", output=bundle_path,
-                   seed=19, train_samples=24, test_samples=12, batch_size=2)
+                   seed=19, train_samples=24, test_samples=12, batch_size=2,
+                   model_name="resnet50_pretrained", pretrain_weights=str(checkpoint))
     attempts = []
 
     def failed_prewarm(self, **kwargs):
@@ -103,7 +155,7 @@ def test_text_candidate_window_covers_actual_training_batch():
              "attention_mask": torch.ones((128, 64), dtype=torch.long)},
     )
     provider = TorchLensCandidateProvider(
-        model=TextClassifier(100), sample_inputs=sample,
+        model=TokenContractFixture(100), sample_inputs=sample,
         batch_axes={"/kwargs/input_ids": 0, "/kwargs/attention_mask": 0},
         dynamic_batch=(1, 128),
     )
@@ -112,8 +164,8 @@ def test_text_candidate_window_covers_actual_training_batch():
 
 def test_physical_candidates_require_a_trainable_client_prefix():
     provider = _make_candidate_provider(
-        model=ImageClassifier(10), sample_inputs=torch.full((4, 3, 32, 32), 0.5),
-        bundle={"task": "image_classification", "batch_size": 4, "image_model": "small"},
+        model=BatchContractFixture(10), sample_inputs=torch.full((4, 3, 8, 8), 0.5),
+        bundle={"task": "image_classification", "batch_size": 4, "model_id": "numerical_fixture"},
     )
     candidates = provider.get_candidates(training=True)
     assert candidates
@@ -123,7 +175,23 @@ def test_physical_candidates_require_a_trainable_client_prefix():
     assert all(candidate.boundary != "before:conv2d_1_1:1" for candidate in candidates)
 
 
-@pytest.mark.parametrize("image_model", ["small", "rfdetr_nano"])
+def test_fixed_fractions_resolve_to_admissible_training_cuts():
+    model = BatchContractFixture(10)
+    inputs = ModelInputs((torch.full((2, 3, 8, 8), 0.5),), {})
+    bundle = {"task": "image_classification", "batch_size": 2, "model_id": "numerical_fixture"}
+    candidates = _make_candidate_provider(model=model, sample_inputs=inputs, bundle=bundle).get_candidates(training=True)
+    resolved = _resolve_fixed_cuts(model=model, sample_inputs=inputs, bundle=bundle)
+    assert set(resolved) == {"25%", "50%", "75%"}
+    for fraction, boundary in resolved.items():
+        chosen = next(candidate for candidate in candidates if candidate.boundary == boundary)
+        assert chosen.trainable and chosen.metadata["prefix_trainable_parameter_count"] > 0
+        target = float(fraction.rstrip('%')) / 100
+        assert abs(chosen.graph_position_ratio - target) == min(
+            abs(candidate.graph_position_ratio - target) for candidate in candidates
+        )
+
+
+@pytest.mark.parametrize("image_model", ["resnet50_pretrained", "rfdetr_nano"])
 def test_physical_runner_exposes_all_cuts_for_every_model(image_model):
     provider = _make_candidate_provider(
         model=torch.nn.Sequential(*[
