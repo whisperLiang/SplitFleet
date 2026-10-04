@@ -2,8 +2,9 @@
 
 SplitFleet is a unified split federated learning framework built on top of [Flower](https://flower.ai/) and TorchLens. It separates framework backends, operation-level model partitioning, task adapters, boundary transport, and federated aggregation.
 
-The unified task interface covers image classification, text classification, object detection, semantic segmentation, and instance segmentation. See the [Chinese architecture and validation guide](docs/unified_framework.md) for the execution contract and reproducible checks.
-Dataset-level integrations can be registered through `TaskSpec`/`TaskRegistry`, which bind a task adapter, model and dataset factories, metrics, and candidate cuts without coupling the split runtime to a dataset package. The preregistered comparison and statistical decision rules are in [`plans/unified_multitask_benchmark_protocol.md`](plans/unified_multitask_benchmark_protocol.md).
+The unified task interface covers image classification, text classification, object detection, semantic segmentation, and instance segmentation.
+Architecture notes and study protocols are kept locally in `plans/` and excluded from Git.
+Dataset-level integrations can be registered through `TaskSpec`/`TaskRegistry`, which bind a task adapter, model and dataset factories, metrics, and candidate cuts without coupling the split runtime to a dataset package.
 The executable four-task FedAvg/FedProx/fixed-SplitFed/SplitFleet benchmark is documented in [`experiments/unified_multitask/README.md`](experiments/unified_multitask/README.md); its local validation report is in `results/reports/experiment_validation_report.md`.
 The [experiment guide](experiments/README.md) documents the current six-scheme physical comparison, device profiling, and local training performance benchmark.
 Physical experiment reports, comparison tables, and run records are kept locally in `results/reports/` and `results/physical_multitask/`; process logs are in `logs/`. These directories are ignored by Git.
@@ -237,8 +238,9 @@ Pass `batch_axes={}` to capture the exact example shape without dynamic batch
 axes. Set it on both `AutoSplitStrategy` and `AutoSplitSplitLearningClient`, with
 matching sample shapes, and keep the data-loader batch shape fixed. This is the
 explicit training path used by the BatchNorm1d, DeepLab and Swin configurations
-whose native dynamic batch probes cannot validate replay. See the
-[fixed-shape example and native limitations](docs/unified_framework.md#细粒度分割).
+whose native dynamic batch probes cannot validate replay. Fixed-shape examples
+and native limitations are described in the local architecture guide,
+`plans/unified_framework.md`, under “细粒度分割”.
 Changing a fixed input shape requires a separate capture; widening
 `dynamic_batch` does not make that shape dynamic.
 

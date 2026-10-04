@@ -28,4 +28,6 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
-paper/
+/paper/
+/plans/
+/docs/
