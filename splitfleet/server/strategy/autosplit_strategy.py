@@ -38,7 +38,7 @@ from splitfleet.autosplit.state_ownership import (
 )
 from splitfleet.split_engine import graph_contract_for_runtime_handle
 from splitfleet.split_engine.contracts import ModelVersionContract
-from splitfleet.backends.utils import adapter_for
+from splitfleet.backends.utils import adapter_for, move_value
 from splitfleet.tasks import ModelInputs, TaskAdapter, TaskBatch
 from splitfleet.common.constants import (
     AUTOSPLIT_BACKEND_CONFIG_KEY,
@@ -64,6 +64,7 @@ from splitfleet.common.constants import (
     AUTOSPLIT_RUNTIME_CONTRACT_DIGEST_CONFIG_KEY,
     AUTOSPLIT_TORCHLENS_VERSION_CONFIG_KEY,
     AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY,
+    AUTOSPLIT_TRAINABLE_CONFIG_KEY,
     CLIENT_ID_CONFIG_KEY,
 )
 from splitfleet.server.placement import PlacementFeedback, RoundPlacementPolicy
@@ -148,6 +149,7 @@ class AutoSplitStrategy(PlainSlStrategy):
             sample_call = ModelInputs(sample_call.args, sample_kwargs)
         self.sample_inputs = sample_call.args
         self.sample_kwargs = dict(sample_call.kwargs)
+        self._calibration_batch = sample_inputs if isinstance(sample_inputs, TaskBatch) else None
         self.backend_adapter = adapter_for(model, sample_call.args if sample_call.args else sample_call.kwargs)
         self.batch_axes = batch_axes
         self.worker_specs = list(worker_specs or [WorkerSpec(worker_id="coordinator", device="cpu")])
@@ -482,6 +484,7 @@ class AutoSplitStrategy(PlainSlStrategy):
                 AUTOSPLIT_RUNTIME_CONTRACT_CONFIG_KEY: stable_json(placement.runtime_contract),
                 AUTOSPLIT_RUNTIME_CONTRACT_DIGEST_CONFIG_KEY: runtime_contract_digest(placement.runtime_contract),
                 AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY: placement.trace_batch_mode,
+                AUTOSPLIT_TRAINABLE_CONFIG_KEY: reference_handle.plan.trainable,
                 AUTOSPLIT_DYNAMIC_BATCH_CONFIG_KEY: stable_json(placement.dynamic_batch),
                 AUTOSPLIT_GRAPH_CONTRACT_CONFIG_KEY: contract.to_json().decode("utf-8"),
                 AUTOSPLIT_GRAPH_CONTRACT_DIGEST_CONFIG_KEY: contract.digest,
@@ -513,6 +516,16 @@ class AutoSplitStrategy(PlainSlStrategy):
             np.array(value, copy=True) for value in initial
         ]
         instructions = super().configure_fit(server_round, parameters, client_manager)
+        prepare_calibration = getattr(self.placement_policy, "prepare_calibration", None)
+        if (prepare_calibration is not None and self.backend_adapter.backend_name == "torch"
+                and hasattr(self.placement_policy.candidate_provider, "model")):
+            prepare_calibration(
+                ModelInputs(self.sample_inputs, self.sample_kwargs),
+                move_value(self._calibration_batch.targets, self.backend_adapter, self.runtime_device)
+                if self._calibration_batch is not None else None,
+                loss_fn=self.loss_fn, device=self.runtime_device,
+                parameters=initial,
+            )
         bind_clients = getattr(self.placement_policy, "bind_clients", None)
         if bind_clients is not None:
             bind_clients([client for client, _ in instructions], server_round)
@@ -595,6 +608,9 @@ class AutoSplitStrategy(PlainSlStrategy):
 
     def configure_evaluate(self, server_round, parameters, client_manager):
         instructions = super().configure_evaluate(server_round, parameters, client_manager)
+        bind_clients = getattr(self.placement_policy, "bind_evaluation_clients", None)
+        if bind_clients is not None:
+            bind_clients([client for client, _ in instructions], server_round)
         self._plan_round_placements(
             server_round,
             [client.cid for client, _ in instructions],

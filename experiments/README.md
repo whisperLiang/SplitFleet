@@ -1,42 +1,56 @@
-# 四任务真机实验
+# SplitFleet experiments
 
-本目录只保留这次完整边缘模型实验需要的训练、准入、profile、汇总与统计代码。正式比较包括 FedAvg、FedProx、固定25%/50%/75% SFL 和 SplitFleet；每个模型两种子、十轮，共48项作业。
+The physical runner uses CoSplit-UCB with current-device calibration by default. It initializes edge and server learners from three structural anchors (earliest admitted cut, the cut nearest 25%, and the latest admitted cut), then updates them from real training feedback. Calibration reuses the captured graph, performs no optimizer steps, and restores weights, buffers, gradients, module modes and random streams. Network costs start unknown.
 
-| 任务 | 模型 | 数据集 | 客户端 | batch | Adam lr |
-|---|---|---|---:|---:|---:|
-| 图像分类 | ResNet-50 | CIFAR-10 | 6 CPU/GPU | 4 | 1e-4 |
-| 文本分类 | BERT-base | AG News | 3 GPU | 1 | 2e-5 |
-| 目标检测 | RF-DETR Nano | VOC2007 | 6 CPU/GPU | 1 | 1e-5 |
-| 语义分割 | DeepLabV3-ResNet50 | Oxford-IIIT Pet | 6 CPU/GPU | 2 | 1e-4 |
+Exploration checks both predicted mean and confidence-upper round time against a 5% slowdown budget. Prediction and queue-simulation caches remain enabled. The active context schema is `cosplit_context_v1`: edge/server contexts have 12 features, network contexts 13, and switching contexts 9. There is one adaptive implementation and no initialization or offline-profile placement switch.
 
-每项作业使用240个训练样本、200个评估样本，完整本地epoch、全员参与、保留尾批，每轮训练后评估一次。固定与自适应SFL使用相同的状态所有权交换政策。
+## Training
 
-本地文件：完整协议 `plans/four_task_study.md`，时间与质量结果 `paper/evidence/four_task_training_comparison_20261003.md`，论文 `paper/README.md`。这些文件不随代码仓库上传。
-
-安装依赖：
+Install task dependencies:
 
 ```bash
 uv sync --extra dev --extra experiment --extra integration
 ```
 
-入口及职责：
-
-| 入口 | 职责 |
-|---|---|
-| `physical_multitask.py` | 模型与数据包、FL/SFL客户端及服务器 |
-| `orchestrate_physical_multitask.py` | 六方案执行、远程源码核对、同步屏障 |
-| `edge_model_admission.py` | 原生训练、分割训练和数值/资源准入 |
-| `profile_split_execution.py` | 协调端切点成本profile |
-| `collect_device_split_profiles.py` | 各Orin客户端成本profile |
-| `run_edge_standard_study.py` | 准入、profile与逐模型训练队列 |
-| `www2027_study.py` | 冻结源码、配对种子执行与分析 |
-| `summarize_physical_multitask.py` | 完整性核对与物理作业汇总 |
-| `common/workload_training.py` | 共享批次处理、训练及任务评估 |
-
-核验保留实验，无须重新训练或改写原始结果：
+Run RF-DETR Nano using a deployment file for the three physical hosts and a new output directory:
 
 ```bash
-.venv/bin/python paper/evidence/verify_four_task_study.py
+.venv/bin/python -m experiments.orchestrate_physical_multitask \
+  --deployment PATH_TO_DEPLOYMENT.json --run-id nano-default-v1 \
+  --model rfdetr_nano --pretrain-weights PATH_TO_CHECKPOINT.pth \
+  --tasks object_detection --methods splitfleet \
+  --data-root data --train-samples 240 --test-samples 200 \
+  --batch-size 1 --rounds 10 --optimizer adam --learning-rate 1e-5 \
+  --dirichlet-alpha 10 --split-state-exchange owned
 ```
 
-复现原始作业须使用保留的冻结源码及输入计划；清理后的工作区源码具有新的身份，不能替代原实验的源码快照。原始部署、数据分区、检查点、profile及逐作业日志都保存在正式队列中，见完整协议。
+For a matched comparison, use `--methods fedavg fedprox splitfed_fixed splitfleet`. Fixed SFL runs all three 25%/50%/75% cuts against the same data partition, initialization and training budget. Calibration applies to SplitFleet. Its time is included in the server's inclusive elapsed time.
+
+| Task | Model | Dataset | Typical worker set | Batch | Adam learning rate |
+|---|---|---|---|---:|---:|
+| Image classification | ResNet50 | CIFAR-10 | 6 CPU/GPU | 4 | 1e-4 |
+| Text classification | BERT-base | AG News | 3 GPU | 1 | 2e-5 |
+| Object detection | RF-DETR Nano | VOC2007 | 6 CPU/GPU | 1 | 1e-5 |
+| Semantic segmentation | DeepLabV3-ResNet50 | Oxford-IIIT Pet | 6 CPU/GPU | 2 | 1e-4 |
+
+The orchestrator freezes source, verifies remote copies, prepares private client partitions, synchronizes fit starts, and records failures. Each run uses a new directory; failed attempts are retained without automatic reruns or seed replacement. Full epochs retain final partial batches and evaluate after each training round.
+
+## Entry points
+
+| Module | Responsibility |
+|---|---|
+| `physical_multitask` | Prepare task bundles; run FL/SFL clients and servers |
+| `orchestrate_physical_multitask` | Execute a physical training matrix and validate its records |
+| `www2027_study` | Freeze source and plans; execute and analyze paired seed blocks |
+| `run_edge_standard_study` | Device admission and serial model training |
+| `edge_model_admission` | Full-model and native split numerical/resource checks |
+| `online_calibration_admission` | Execute calibration anchors on a target device and verify restoration |
+| `summarize_physical_multitask` | Validate and summarize completed physical runs |
+
+Calibration and exploration live in `splitfleet/server/placement/cosplit_ucb/`, shared by the native strategy and the physical runner. Core code does not import experiment modules.
+
+`baselines/` and `ablations/` retain the independent learner, bounded-cost oracle, cooperation, joint-solver, discounting and layer-candidate controls needed for research. `heterogeneity/` defines simulated bandwidth/load scenarios. These are experiment interfaces; only CoSplit-UCB is a production adaptive policy.
+
+`analysis/` retains general communication accounting, time-to-quality, partition coverage, backend validation and oracle-gap analysis. Simulated measurements are labeled as such; unit tests do not constitute physical performance evidence.
+
+Historical results, failed attempts, reports and frozen source remain unchanged in `results/` and `paper/evidence/`. Reproduce an older experiment with its frozen runtime and plan. The active tree removes the old profile generators and one-off implementations/comparison scripts for individual optimization stages.

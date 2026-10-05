@@ -93,6 +93,11 @@ class TorchLensCandidateProvider:
             trace_batch_mode=self.trace_batch_mode,
             model_name=self.model.__class__.__name__,
         )
+        if training:
+            # Broadcast the captured contract, including values inferred from
+            # the server sample, rather than letting each worker infer its own.
+            self.dynamic_batch = backend.dynamic_batch
+            self.trace_batch_mode = backend.trace_batch_mode
         self.framework_backend = str(backend.framework_backend)
         cross_stage_spans = ()
         if self.framework_backend == "torch":
@@ -152,6 +157,9 @@ class TorchLensCandidateProvider:
             if raw_count % 200 == 0:
                 LOGGER.info("TorchLens candidate check progress: supported=%d accepted=%d",
                             raw_count, len(descriptors))
+            if training and candidate.descriptor.get("capabilities", {}).get("training_supported") is False:
+                rejected[candidate.boundary] = "native_training_unsupported"
+                continue
             if training and not bool(candidate.is_trainable_tail):
                 rejected[candidate.boundary] = "suffix_not_trainable"
                 continue

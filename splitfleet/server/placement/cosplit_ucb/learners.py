@@ -52,10 +52,12 @@ class EdgeGroupLearner:
         self._groups: dict[str, dict[str, DiscountedLinUCB]] = {}
 
     def _models(self, profile: ExecutionProfileKey) -> dict[str, DiscountedLinUCB]:
-        return self._groups.setdefault(
-            profile.stable_id,
-            _pair(lambda: self._factory.make(self._factory.encoder.edge_dimension, self._factory.config.alpha_edge)),
-        )
+        key = profile.stable_id
+        if key not in self._groups:
+            self._groups[key] = _pair(
+                lambda: self._factory.make(self._factory.encoder.edge_dimension, self._factory.config.alpha_edge)
+            )
+        return self._groups[key]
 
     def advance_round(self, round_id: int) -> None:
         for models in self._groups.values():
@@ -107,13 +109,13 @@ class NetworkClientLearner:
         self._clients: dict[str, dict[str, DiscountedLinUCB]] = {}
 
     def _models(self, client_id: str) -> dict[str, DiscountedLinUCB]:
-        return self._clients.setdefault(
-            str(client_id),
-            {
+        key = str(client_id)
+        if key not in self._clients:
+            self._clients[key] = {
                 "upload": self._factory.make(self._factory.encoder.network_dimension, self._factory.config.alpha_network),
                 "download": self._factory.make(self._factory.encoder.network_dimension, self._factory.config.alpha_network),
-            },
-        )
+            }
+        return self._clients[key]
 
     def advance_round(self, round_id: int) -> None:
         for models in self._clients.values():
@@ -193,6 +195,15 @@ class CooperativeLearners:
         self.network = NetworkClientLearner(factory)
         self.server = GlobalServerLearner(factory)
         self.switch = SwitchLearner(factory)
+
+    @property
+    def has_observations(self) -> bool:
+        """Prediction-only model creation does not count as learned state."""
+        return bool(
+            self.server.model.num_updates or self.switch.model.num_updates
+            or any(model.num_updates for models in self.edge._groups.values() for model in models.values())
+            or any(model.num_updates for models in self.network._clients.values() for model in models.values())
+        )
 
     def advance_round(self, round_id: int) -> None:
         """Discount existing shared and client-specific observations once per round."""

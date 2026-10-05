@@ -83,7 +83,6 @@ def rebind_torch_runtime(runtime: SplitRuntime, model) -> SplitRuntime | None:
         not isinstance(model, torch.nn.Module)
         or not isinstance(runtime.model, torch.nn.Module)
         or runtime.trace_graph.backend != "torch"
-        or not runtime.request.trainable
         or runtime.request.use_live_param_sources is False
     ):
         return None

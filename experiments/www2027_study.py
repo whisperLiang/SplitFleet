@@ -82,9 +82,9 @@ def command_for(plan: dict, stage: dict, index: int, root: Path) -> tuple[list[s
     if plan.get("split_state_exchange"):
         command += ["--split-state-exchange", plan["split_state_exchange"]]
     if stage["image_model"] == "rfdetr_nano" and not stage.get("model_id"):
-        command += ["--pretrain-weights", plan["checkpoint"], "--device-profiles", plan["device_profiles"]]
+        command += ["--pretrain-weights", plan["checkpoint"]]
     if stage.get("model_id"):
-        command += ["--pretrain-weights", stage["checkpoint"], "--device-profiles", stage["device_profiles"]]
+        command += ["--pretrain-weights", stage["checkpoint"]]
         if stage.get("tokenizer_path"):
             command += ["--tokenizer-path", stage["tokenizer_path"]]
     return command, run_id
@@ -157,6 +157,13 @@ def analyze(plan: dict, root: Path) -> dict:
                         if (plan.get("aggregation_order")
                                 and result.get("aggregation_order") != plan["aggregation_order"]):
                             raise ValueError("aggregation order differs from the matched protocol")
+                        if result["method"] == "splitfleet":
+                            if result.get("online_cost_learning") is not True:
+                                raise ValueError("CoSplit-UCB online learning receipt is missing")
+                            actual_config = result.get("cosplit_config") or {}
+                            if any(actual_config.get(name) != value for name, value in
+                                   plan.get("cosplit_hyperparameters", {}).items()):
+                                raise ValueError("CoSplit-UCB parameters differ from the frozen plan")
                         worker_ids = stage.get("worker_ids", plan.get("worker_ids"))
                         if worker_ids and (
                                 result.get("worker_ids") != worker_ids or
@@ -265,7 +272,7 @@ def execute(plan: dict, root: Path, stages: list[str]) -> None:
     execution_plan = copy.deepcopy(plan)
     inputs = root / "inputs"
     inputs.mkdir()
-    for key in ("deployment", "device_profiles"):
+    for key in ("deployment",):
         if key not in plan:
             continue
         target = inputs / (key + ".json")
@@ -274,7 +281,6 @@ def execute(plan: dict, root: Path, stages: list[str]) -> None:
     from experiments.unified_multitask.edge_models import file_sha256
     if "checkpoint" in plan and file_sha256(plan["checkpoint"]) != plan["checkpoint_sha256"]:
         raise ValueError("Checkpoint no longer matches the frozen plan")
-    copied_profiles = {}
     copied_deployments = {}
     for stage in execution_plan["stages"]:
         if not stage.get("model_id") or stage["name"] not in stages:
@@ -288,11 +294,6 @@ def execute(plan: dict, root: Path, stages: list[str]) -> None:
                 shutil.copyfile(stage["deployment"], target)
                 copied_deployments[name] = str(target)
             stage["deployment"] = copied_deployments[name]
-        if name not in copied_profiles:
-            target = inputs / (name + ".device_profiles.json")
-            shutil.copyfile(stage["device_profiles"], target)
-            copied_profiles[name] = str(target)
-        stage["device_profiles"] = copied_profiles[name]
     ledger["runtime_source_identity"] = runtime_record["source_identity"]
     save_json(root / "executed_plan.json", execution_plan)
     save_json(ledger_path, ledger)

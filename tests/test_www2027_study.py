@@ -30,7 +30,8 @@ def write_block(root, seed, *, source="same", omit=None, barrier=True):
         result = {"seed": seed, "rounds": 10, "train_size": 240, "test_size": 200,
                   "optimizer": "adam", "learning_rate": 1e-4, "batch_size": 4, "image_model": "resnet50_pretrained",
                   "server_duration_sec": 5 if scheme == "splitfleet" else 10,
-                  "final_model_hash": "model", "method": method, "fixed_boundary": fixed}
+                  "final_model_hash": "model", "method": method, "fixed_boundary": fixed,
+                  "online_cost_learning": method == "splitfleet"}
         study.save_json(run / "result.json", result)
         study.save_json(run / "validation_report.json", {"barrier_verified": barrier})
         rows.append({"task": "image_classification", "run_dir": str(run),

@@ -29,10 +29,10 @@ from splitfleet.backends.utils import (
     zero_grad,
 )
 from splitfleet.runtime import PrefixContextStore
-from splitfleet.tasks import ModelInputs, TaskAdapter, TaskBatch, prepare_task_batch
+from splitfleet.tasks import ModelInputs, TaskAdapter, TaskBatch, infer_num_examples, prepare_task_batch
 from splitfleet.split_engine.contracts import GraphContract, ModelVersionContract, validate_contract
 from splitfleet.split_engine import graph_contract_for_runtime_handle
-from splitfleet.autosplit.torchlens_runtime import runtime_input_batch_size, torchlens_runtime_version
+from splitfleet.autosplit.torchlens_runtime import model_input_batch_size, runtime_input_batch_size, torchlens_runtime_version
 from splitfleet.transport import decode_gradients, encode_boundary, encode_bundle_wire
 from splitfleet.transport.split_wire import boundary_to_envelope, envelope_to_gradients
 from splitfleet.client.numpy_client import NumPyClient
@@ -55,7 +55,9 @@ from splitfleet.common.constants import (
     AUTOSPLIT_RUNTIME_CONTRACT_CONFIG_KEY,
     AUTOSPLIT_SPLIT_ID_CONFIG_KEY,
     AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY,
+    AUTOSPLIT_TRAINABLE_CONFIG_KEY,
     CLIENT_ID_CONFIG_KEY,
+    COSPLIT_CALIBRATION_PARAMETERS_CONFIG_KEY,
     TRANSPORT_CLIENT_SEND_NS_METADATA_KEY,
     TRANSPORT_SERVER_RECEIVE_NS_METADATA_KEY,
     TRANSPORT_SERVER_SEND_NS_METADATA_KEY,
@@ -272,6 +274,9 @@ class AutoSplitSplitLearningClient(NumPyClient):
         self.sample_kwargs = dict(sample_call.kwargs)
         self.batch_axes = batch_axes
         self.task = task
+        self._calibration_targets = sample_inputs.targets if isinstance(sample_inputs, TaskBatch) else None
+        self._sample_num_examples = sample_inputs.num_examples if isinstance(sample_inputs, TaskBatch) else None
+        self.online_calibration_receipt = None
         self.batch_adapter = batch_adapter
         self.optimizer_fn = optimizer_fn
         self.functional_update_fn = functional_update_fn
@@ -324,6 +329,82 @@ class AutoSplitSplitLearningClient(NumPyClient):
         if str(handle.runtime.request.boundary) != str(handle.plan.boundary):
             handle = self.autosplit_session.repartition_runtime(handle, handle.plan.boundary)
         self._prewarmed_runtime = handle
+
+    def calibrate_runtime(self, targets, *, boundaries) -> dict:
+        """Measure this client's captured model without performing optimizer steps."""
+        from splitfleet.server.placement.cosplit_ucb.calibration import calibrate_split
+
+        if self._prewarmed_runtime is None:
+            raise ValueError("Prepare the runtime before measuring calibration anchors")
+        if self.task is None:
+            raise ValueError("CoSplit-UCB calibration requires a task loss")
+        targets = move_value(targets, self.backend_adapter, self.device)
+        self.online_calibration_receipt = calibrate_split(
+            self.model, ModelInputs(self.sample_inputs, self.sample_kwargs), targets,
+            boundaries=boundaries,
+            make_handle=lambda cut: self.autosplit_session.repartition_runtime(self._prewarmed_runtime, cut),
+            loss_fn=self.task.loss, device=self.device,
+            source="client_private_sample_current_deployment",
+        )
+        return self.online_calibration_receipt
+
+    def get_properties(self, config):
+        cuts = config.get("cosplit_calibration_boundaries")
+        if cuts:
+            from flwr.common import parameters_to_ndarrays, serde
+            from flwr.proto.transport_pb2 import Parameters
+            from splitfleet.common.model_state import tensor_state_hash
+
+            payload = config.get(COSPLIT_CALIBRATION_PARAMETERS_CONFIG_KEY)
+            if payload is not None:
+                parameters = serde.parameters_from_proto(Parameters.FromString(payload))
+                self.backend_adapter.load_ndarrays(self.model, parameters_to_ndarrays(parameters))
+            dynamic_batch = normalize_batch_window(config.get(AUTOSPLIT_DYNAMIC_BATCH_CONFIG_KEY))
+            trace_batch_mode = config.get(AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY)
+            reusable = self._prewarmed_runtime
+            if (reusable is None or normalize_batch_window(reusable.plan.dynamic_batch) != dynamic_batch
+                    or (trace_batch_mode and reusable.plan.trace_batch_mode != trace_batch_mode)):
+                self._prewarmed_runtime = None
+                self._runtime_cache.clear()
+                self.autosplit_session.discard_runtime_handles()
+                self.prewarm_runtime(
+                    mode=config.get(AUTOSPLIT_MODE_CONFIG_KEY, "generated_eager"),
+                    dynamic_batch=dynamic_batch, trace_batch_mode=trace_batch_mode,
+                )
+                self.online_calibration_receipt = None
+            boundaries = json.loads(cuts)
+            receipt = self.online_calibration_receipt
+            current_hash = tensor_state_hash(self.model.state_dict())
+            if (receipt is None or receipt["model_hash_after"] != current_hash
+                    or {row["boundary"] for row in receipt["records"]} != set(boundaries)
+                    or any(row["graph_signature"] != self._prewarmed_runtime.plan.graph_signature
+                           for row in receipt["records"])):
+                if self._calibration_targets is None:
+                    raise ValueError("Provide a representative TaskBatch for CoSplit-UCB calibration")
+                self.calibrate_runtime(self._calibration_targets, boundaries=boundaries)
+        properties = {
+            "logical_client_id": f"{platform.node()}:{self.device}:{id(self)}",
+            "framework_backend": self.backend_adapter.backend_name,
+            "runtime_backend": "torchlens_native",
+            "device_type": str(self.device).split(":", 1)[0],
+            "accelerator": _accelerator_name(self.device),
+            "precision": _model_precision(self.model),
+        }
+        if self._prewarmed_runtime is not None:
+            batch_size = runtime_input_batch_size(
+                self._prewarmed_runtime.runtime, self.sample_inputs, self.sample_kwargs,
+            )
+        else:
+            batch_size = model_input_batch_size(
+                self.model, self.sample_inputs, self.sample_kwargs, batch_axes=self.batch_axes,
+            )
+        properties["batch_size"] = batch_size or self._sample_num_examples or infer_num_examples(
+            ModelInputs(self.sample_inputs, self.sample_kwargs))
+        if hasattr(self.train_data, "__len__"):
+            properties["num_batches"] = len(self.train_data)
+        if self.online_calibration_receipt is not None:
+            properties["online_calibration_receipt"] = json.dumps(self.online_calibration_receipt)
+        return properties
 
     def get_parameters(self, config):
         _ = config
@@ -560,11 +641,12 @@ class AutoSplitSplitLearningClient(NumPyClient):
         # runtime with a different feature ABI and reject every other batch size.
         dynamic_batch = normalize_batch_window(config.get(AUTOSPLIT_DYNAMIC_BATCH_CONFIG_KEY))
         trace_batch_mode = str(config.get(AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY, "")) or None
+        trainable = bool(config.get(AUTOSPLIT_TRAINABLE_CONFIG_KEY, True))
         cache_key = "|".join([
             self.backend_adapter.backend_name, torchlens_runtime_version(), self.model.__class__.__qualname__,
             state_schema, plan_id, split_id, graph_signature, feature_abi_id,
             str(self.device), module_mode,
-            describe_batch_window(dynamic_batch), str(trace_batch_mode or ""),
+            describe_batch_window(dynamic_batch), str(trace_batch_mode or ""), str(trainable),
         ])
         cached = self._runtime_cache.get(cache_key)
         if cached is not None:
@@ -578,6 +660,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
         can_repartition = (
             reusable is not None
             and reusable.plan.graph_signature == graph_signature
+            and reusable.plan.trainable == trainable
             and normalize_batch_window(reusable.plan.dynamic_batch) == dynamic_batch
             and str(reusable.plan.trace_batch_mode or "") == str(trace_batch_mode or "")
         )
@@ -632,7 +715,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
                 batch_axes=self.batch_axes,
                 boundary=boundary,
                 mode=str(config.get(AUTOSPLIT_MODE_CONFIG_KEY, "generated_eager")),
-                trainable=True,
+                trainable=trainable,
                 dynamic_batch=dynamic_batch,
                 trace_batch_mode=trace_batch_mode,
             )

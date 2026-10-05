@@ -23,7 +23,10 @@ class ExplorationDecision:
 
 
 class SafeExplorationController:
-    """Explore only assignments inside a conservative global slowdown budget."""
+    """Bound both predicted mean and UCB makespan when exploring.
+
+    These are model-based bounds, not guarantees on actual wall time.
+    """
 
     def __init__(
         self,
@@ -41,6 +44,7 @@ class SafeExplorationController:
         self._rng = np.random.default_rng(int(seed))
         self.last_probe_round: dict[str, int] = {}
         self.candidate_last_explored_round: dict[tuple[str, str], int] = {}
+        self.round_records: dict[int, dict[str, Any]] = {}
 
     def apply(
         self,
@@ -63,6 +67,11 @@ class SafeExplorationController:
             baseline, use_upper=True, batch_counts=batch_counts
         ).max_client_completion_ms
         safe_budget = (1.0 + self.epsilon) * baseline_upper
+        baseline_mean = solver.simulate(
+            baseline, batch_counts=batch_counts
+        ).max_client_completion_ms
+        mean_budget = (1.0 + self.epsilon) * baseline_mean
+        rejected_by_mean = 0
         alternatives: list[tuple[tuple[float, ...], str, CandidateEstimate, float, bool]] = []
         for client_id in sorted(baseline):
             if client_id in locked:
@@ -87,6 +96,16 @@ class SafeExplorationController:
                     >= self.forced_probe_interval
                 )
                 trial = {**baseline, client_id: option}
+                count = int((batch_counts or {}).get(client_id, 1))
+                standalone_mean = option.switch_mean_ms + count * (
+                    option.mean_total_without_queue_ms - option.switch_mean_ms
+                )
+                trial_mean = solver.simulate(
+                    trial, batch_counts=batch_counts
+                ).max_client_completion_ms
+                if standalone_mean > mean_budget + 1e-9 or trial_mean > mean_budget + 1e-9:
+                    rejected_by_mean += 1
+                    continue
                 upper = solver.simulate(
                     trial, use_upper=True, batch_counts=batch_counts
                 ).max_client_completion_ms
@@ -111,6 +130,12 @@ class SafeExplorationController:
             if client_id in used_clients:
                 continue
             trial = {**final, client_id: option}
+            final_mean = solver.simulate(
+                trial, batch_counts=batch_counts
+            ).max_client_completion_ms
+            if final_mean > mean_budget + 1e-9:
+                rejected_by_mean += 1
+                continue
             final_upper = solver.simulate(
                 trial, use_upper=True, batch_counts=batch_counts
             ).max_client_completion_ms
@@ -130,6 +155,14 @@ class SafeExplorationController:
                     predicted_upper_makespan_ms=final_upper,
                 )
             )
+        self.round_records[int(round_id)] = {
+            "baseline_mean_makespan_ms": baseline_mean,
+            "mean_budget_ms": mean_budget,
+            "final_mean_makespan_ms": solver.simulate(
+                final, batch_counts=batch_counts
+            ).max_client_completion_ms,
+            "rejected_by_mean_budget": rejected_by_mean,
+        }
         return final, decisions
 
     def record_observation(

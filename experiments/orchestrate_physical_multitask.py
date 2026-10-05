@@ -166,12 +166,24 @@ def validate_result(result: dict[str, Any], *, task: str, method: str, rounds: i
         for diagnostic in result.get("round_diagnostics", {}).values():
             if not set(diagnostic.get("assignment", {}).values()) <= allowed:
                 errors.append("adaptive assignment is absent from the audited candidate catalog")
-        if bundle.get("model_id", bundle.get("image_model")) == "rfdetr_nano" and catalog:
-            first = result.get("round_diagnostics", {}).get("1", {})
-            if not result.get("device_cost_profiles"):
-                errors.append("RF-DETR SplitFleet must use device profiles")
-            if len(first.get("assignment", {})) != num_workers:
-                errors.append("RF-DETR SplitFleet did not assign all configured workers")
+        if result.get("online_cost_learning") is not True:
+            errors.append("SplitFleet online cost learning receipt is missing")
+        initialization = result.get("cost_initialization_receipt") or {}
+        if initialization.get("source") != "current_deployment_no_update_split_calibration":
+            errors.append("current-deployment calibration receipt is missing")
+        if initialization.get("initial_model_hash") != bundle.get("initial_model_hash"):
+            errors.append("calibration initial model differs from the frozen bundle")
+        if initialization.get("prediction_override") is not False:
+            errors.append("calibration must seed learners without replacing predictions")
+        for round_id in range(1, rounds + 1):
+            diagnostic = result.get("round_diagnostics", {}).get(str(round_id), {})
+            counts = diagnostic.get("learner_update_counts", {})
+            if len(counts) != num_workers or any(
+                int(value.get("server_update_count", 0)) < 1
+                or int(value.get("group_update_count", 0)) < 1
+                for value in counts.values()
+            ):
+                errors.append(f"round {round_id}: online learner update receipt is missing")
     if result.get("fit_failures") or result.get("expected_clients") != num_workers:
         errors.append("all configured failure-free workers were not reported")
     all_fits = result.get("fit_records", [])
@@ -297,13 +309,10 @@ def _run_one(config: dict[str, Any], *, task: str, method: str, bundle_path: Pat
              fixed_boundary: str,
              split_state_exchange: str = "full",
              min_residence_rounds: int = 2,
-             device_profiles: str | None = None,
              log_dir: Path | None = None,
              local_source_root: Path | None = None) -> dict[str, Any]:
     server = config["server"]
     hosts = config["hosts"]
-    if method == "splitfleet" and bundle.get("model_id", bundle.get("image_model")) == "rfdetr_nano" and not device_profiles:
-        raise ValueError("RF-DETR SplitFleet requires device profiles")
     run_dir.mkdir(parents=True, exist_ok=False)
     if log_dir is None:
         log_dir = Path("logs/physical_multitask") / run_dir.parent.name / run_dir.name
@@ -319,14 +328,6 @@ def _run_one(config: dict[str, Any], *, task: str, method: str, bundle_path: Pat
                   "--fixed-boundary", fixed_boundary]
     server_cmd.extend(["--min-residence-rounds", str(min_residence_rounds)])
     server_cmd.extend(["--split-state-exchange", split_state_exchange])
-    if device_profiles:
-        profile_path = device_profiles
-        if remote_server:
-            profile_path = f"{remote_root}/device_profiles.json"
-            _ssh(server, "mkdir -p " + shlex.quote(remote_root))
-            subprocess.run(["scp", "-q", device_profiles,
-                            f"{server['ssh']}:{profile_path}"], check=True, timeout=120)
-        server_cmd = ["env", f"SPLITFLEET_DEVICE_PROFILES={profile_path}", *server_cmd]
     server_process: subprocess.Popen[Any] | None = None
     workers: list[tuple[str, subprocess.Popen[Any], Any]] = []
     failure: dict[str, str] | None = None
@@ -507,8 +508,7 @@ def run_matrix(config: dict[str, Any], *, run_id: str, output_root: Path,
                fixed_boundaries: tuple[str, ...] = FIXED_BOUNDARIES, image_model: str | None = None,
                pretrain_weights: str | None = None,
                model_name: str | None = None, tokenizer_path: str | None = None,
-               device_profiles: str | None = None,
-               split_state_exchange: str = "full",
+                     split_state_exchange: str = "full",
                log_root: Path = Path("logs/physical_multitask")) -> Path:
     if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
         raise ValueError("unsafe run ID")
@@ -603,7 +603,6 @@ def run_matrix(config: dict[str, Any], *, run_id: str, output_root: Path,
                             optimizer=optimizer, fixed_boundary=boundary or "50%",
                             split_state_exchange=split_state_exchange,
                             local_source_root=local_source_root,
-                            device_profiles=device_profiles if method == "splitfleet" else None,
                         )
                     except Exception as exc:
                         attempt.update(status="failed", finished_unix=time.time(),
@@ -647,7 +646,6 @@ def main() -> None:
     parser.add_argument("--model", choices=tuple(EDGE_MODELS))
     parser.add_argument("--tokenizer-path")
     parser.add_argument("--pretrain-weights")
-    parser.add_argument("--device-profiles", help="Measured device cost profiles for RF-DETR SplitFleet")
     parser.add_argument("--split-state-exchange", choices=("full", "owned"), default="full")
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--timeout", type=float, default=3600)
@@ -665,7 +663,6 @@ def main() -> None:
                      image_model=args.image_model,
                      pretrain_weights=args.pretrain_weights,
                      model_name=args.model, tokenizer_path=args.tokenizer_path,
-                     device_profiles=args.device_profiles,
                      split_state_exchange=args.split_state_exchange,
                      log_root=args.log_root))
 

@@ -1,4 +1,4 @@
-"""Run coordinator/device admission, profiling and serial four-task training.
+"""Run coordinator/device admission and serial four-task training.
 
 Every run uses a new output directory and preserves failed attempts.
 """
@@ -191,14 +191,6 @@ def run(args):
                             "status": "passed" if receipt.returncode == 0 else "failed",
                             "exit_code": receipt.returncode, "finished_unix": time.time()})
                         save()
-            profiles = Path(next(stage["device_profiles"] for stage in plan["stages"] if stage["model_id"] == name)).parent
-            profiles.mkdir(parents=True, exist_ok=False)
-            logged(name + "_server_profile", [sys.executable, "-m", "experiments.profile_split_execution",
-                "--bundle", str(bundle_root / (task + ".pt")), "--device", config["server"]["device"],
-                "--output", str(profiles / "server.json")])
-            logged(name + "_device_profiles", [sys.executable, "-m", "experiments.collect_device_split_profiles",
-                "--deployment", str(model_deployment), "--bundles", str(bundle_root), "--task", task,
-                "--output", str(profiles), "--log-root", str(root / "profile_logs")])
         status["status"] = "training"
         save()
         frozen_plan = root / "primary_plan.json"

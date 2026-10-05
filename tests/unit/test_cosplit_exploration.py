@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from splitfleet.server.placement.cosplit_ucb import CandidateEstimate, GlobalPlacementSolver, SafeExplorationController
 
 
@@ -173,3 +175,17 @@ def test_seed_and_rng_state_reproduce_equal_priority_exploration() -> None:
     assert {cid: value.boundary for cid, value in left.items()} == {
         cid: value.boundary for cid, value in right.items()
     }
+
+
+def test_multiple_probes_share_one_joint_mean_budget() -> None:
+    solver = GlobalPlacementSolver()
+    baseline = {cid: replace(_estimate(cid, "base", 0, 1000), server_service_mean_ms=50)
+                for cid in ("a", "b")}
+    estimates = {cid: [base, replace(base, boundary="probe", server_service_mean_ms=54)]
+                 for cid, base in baseline.items()}
+    controller = SafeExplorationController(max_explorations_per_round=2)
+    final, decisions = controller.apply(round_id=1, baseline=baseline, estimates=estimates, solver=solver)
+    assert len(decisions) == 1
+    assert solver.simulate(final).max_client_completion_ms == 104
+    assert controller.round_records[1]["mean_budget_ms"] == 105
+    assert controller.round_records[1]["rejected_by_mean_budget"] == 1

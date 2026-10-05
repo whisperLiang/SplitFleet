@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, replace
 import heapq
+from types import MappingProxyType
 from typing import Mapping, Sequence
 
 from .types import CandidateEstimate
@@ -38,11 +40,25 @@ def _component(value: float, uncertainty: float, use_upper: bool) -> float:
 class GlobalPlacementSolver:
     """Greedy plus coordinate search using full server-lane simulation."""
 
-    def __init__(self, *, server_concurrency: int = 1, max_coordinate_passes: int = 3) -> None:
-        if server_concurrency < 1 or max_coordinate_passes < 0:
+    def __init__(
+        self, *, server_concurrency: int = 1, max_coordinate_passes: int = 3,
+        simulation_cache_size: int = 8192,
+    ) -> None:
+        if server_concurrency < 1 or max_coordinate_passes < 0 or simulation_cache_size < 0:
             raise ValueError("invalid solver parameters")
         self.server_concurrency = int(server_concurrency)
         self.max_coordinate_passes = int(max_coordinate_passes)
+        self.simulation_cache_size = int(simulation_cache_size)
+        self._simulation_cache: OrderedDict[tuple, PlacementSimulation] = OrderedDict()
+        self.simulation_cache_hits = 0
+        self.simulation_cache_misses = 0
+
+    def clear_cache(self) -> None:
+        """Release simulations and reset per-plan diagnostic counters."""
+
+        self._simulation_cache.clear()
+        self.simulation_cache_hits = 0
+        self.simulation_cache_misses = 0
 
     def simulate(
         self,
@@ -58,70 +74,88 @@ class GlobalPlacementSolver:
         after its preceding boundary gradient and client backward step.
         """
 
-        lanes = [0.0] * self.server_concurrency
         counts = {str(cid): int((batch_counts or {}).get(cid, 1)) for cid in assignment}
         if any(count < 1 for count in counts.values()):
             raise ValueError("batch counts must be positive")
+        components = {
+            str(cid): tuple(_component(mean, radius, use_upper) for mean, radius in (
+                (estimate.switch_mean_ms, estimate.switch_uncertainty_ms),
+                (estimate.client_forward_mean_ms, estimate.client_forward_uncertainty_ms),
+                (estimate.network_upload_mean_ms, estimate.network_upload_uncertainty_ms),
+                (estimate.server_service_mean_ms, estimate.server_service_uncertainty_ms),
+                (estimate.network_download_mean_ms, estimate.network_download_uncertainty_ms),
+                (estimate.client_backward_mean_ms, estimate.client_backward_uncertainty_ms),
+            )) for cid, estimate in assignment.items()
+        }
+        if self.simulation_cache_size:
+            # Timings depend on component costs, not boundary names. Preserve
+            # all six components and their arithmetic order; do not combine
+            # forward/upload or backward/download and change rounding.
+            key = (self.server_concurrency, bool(use_upper), tuple(sorted(
+                (cid, counts[cid], values) for cid, values in components.items()
+            )))
+            cached = self._simulation_cache.get(key)
+            if cached is not None:
+                self._simulation_cache.move_to_end(key)
+                self.simulation_cache_hits += 1
+                if all(cached.timelines[cid].boundary == estimate.boundary for cid, estimate in assignment.items()):
+                    return cached
+                return PlacementSimulation(
+                    timelines=MappingProxyType({
+                        cid: replace(timeline, boundary=assignment[cid].boundary)
+                        for cid, timeline in cached.timelines.items()
+                    }),
+                    max_client_completion_ms=cached.max_client_completion_ms,
+                    sum_client_completion_ms=cached.sum_client_completion_ms,
+                )
+        self.simulation_cache_misses += 1
+        lanes = [0.0] * self.server_concurrency
         jobs: list[tuple[float, str, int, CandidateEstimate, float, float, float, float, float]] = []
         for client_id, estimate in assignment.items():
-            switch = _component(estimate.switch_mean_ms, estimate.switch_uncertainty_ms, use_upper)
-            forward = _component(
-                estimate.client_forward_mean_ms,
-                estimate.client_forward_uncertainty_ms,
-                use_upper,
-            )
-            upload = _component(
-                estimate.network_upload_mean_ms,
-                estimate.network_upload_uncertainty_ms,
-                use_upper,
-            )
-            service = _component(
-                estimate.server_service_mean_ms,
-                estimate.server_service_uncertainty_ms,
-                use_upper,
-            )
-            download = _component(
-                estimate.network_download_mean_ms,
-                estimate.network_download_uncertainty_ms,
-                use_upper,
-            )
-            backward = _component(
-                estimate.client_backward_mean_ms,
-                estimate.client_backward_uncertainty_ms,
-                use_upper,
-            )
+            switch, forward, upload, service, download, backward = components[str(client_id)]
             jobs.append((switch + forward + upload, str(client_id), 0, estimate, forward, upload, service, download, backward))
         heapq.heapify(jobs)
 
-        timelines: dict[str, ClientTimeline] = {}
+        # Keep scalar accumulators during scheduling; constructing an immutable
+        # timeline for every batch adds no information to the final result.
+        records: dict[str, list[float]] = {}
         while jobs:
             arrival, client_id, batch_index, estimate, forward, upload, service, download, backward = heapq.heappop(jobs)
-            lane_index = min(range(len(lanes)), key=lambda index: (lanes[index], index))
+            lane_index = (
+                0 if len(lanes) == 1
+                else min(range(len(lanes)), key=lambda index: (lanes[index], index))
+            )
             start = max(arrival, lanes[lane_index])
             finish = start + service
             lanes[lane_index] = finish
             completion = finish + download + backward
-            previous = timelines.get(client_id)
-            timelines[client_id] = ClientTimeline(
-                client_id=client_id,
-                boundary=estimate.boundary,
-                arrival_ms=arrival if previous is None else previous.arrival_ms,
-                server_start_ms=start if previous is None else previous.server_start_ms,
-                server_finish_ms=finish,
-                queue_ms=max(start - arrival, 0.0) + (previous.queue_ms if previous else 0.0),
-                completion_ms=completion,
-            )
+            previous = records.get(client_id)
+            if previous is None:
+                records[client_id] = [arrival, start, finish, max(start - arrival, 0.0) + 0.0, completion]
+            else:
+                previous[2] = finish
+                previous[3] = max(start - arrival, 0.0) + previous[3]
+                previous[4] = completion
             if batch_index + 1 < counts[client_id]:
                 heapq.heappush(
                     jobs,
                     (completion + forward + upload, client_id, batch_index + 1, estimate, forward, upload, service, download, backward),
                 )
+        timelines = {
+            cid: ClientTimeline(cid, assignment[cid].boundary, *values)
+            for cid, values in records.items()
+        }
         completions = [item.completion_ms for item in timelines.values()]
-        return PlacementSimulation(
-            timelines=timelines,
+        simulation = PlacementSimulation(
+            timelines=MappingProxyType(timelines),
             max_client_completion_ms=max(completions, default=0.0),
             sum_client_completion_ms=sum(completions),
         )
+        if self.simulation_cache_size:
+            self._simulation_cache[key] = simulation
+            if len(self._simulation_cache) > self.simulation_cache_size:
+                self._simulation_cache.popitem(last=False)
+        return simulation
 
     def solve(
         self,

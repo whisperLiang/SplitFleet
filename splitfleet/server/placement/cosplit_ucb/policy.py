@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Mapping, Sequence
 
 from .candidate_provider import CandidateProvider
@@ -40,7 +41,6 @@ class CoSplitUCBPlacementPolicy:
         config: CoSplitUCBConfig | None = None,
         telemetry_provider: RuntimeTelemetryProvider | Mapping[str, Any] | None = None,
         state_store: BanditStateStore | None = None,
-        device_cost_prior=None,
     ) -> None:
         self.config = config or CoSplitUCBConfig()
         self.candidate_provider = candidate_provider
@@ -59,8 +59,7 @@ class CoSplitUCBPlacementPolicy:
             forced_probe_interval=self.config.forced_probe_interval,
             seed=self.config.seed,
         )
-        self.telemetry_provider = telemetry_provider if telemetry_provider is not None else device_cost_prior
-        self.device_cost_prior = device_cost_prior
+        self.telemetry_provider = telemetry_provider
         self.state_store = state_store or (
             BanditStateStore(self.config.state_path) if self.config.state_path else None
         )
@@ -77,6 +76,7 @@ class CoSplitUCBPlacementPolicy:
         self._last_num_batches: dict[str, int] = {}
         self._round_batch_counts: dict[tuple[int, bool], dict[str, int]] = {}
         self._observed_actions: set[tuple[int, str, str]] = set()
+        self._state_restored = False
         self._pending_store_state = (
             self.state_store.load()
             if self.state_store is not None and self.config.warm_start
@@ -101,8 +101,9 @@ class CoSplitUCBPlacementPolicy:
                 catalog[0].graph_signature[:12] if catalog else "",
             )
             if self._pending_store_state is not None:
-                self.load_state_dict(self._pending_store_state)
+                state = self._pending_store_state
                 self._pending_store_state = None
+                self.load_state_dict(state)
         return tuple(
             sorted(
                 self._catalog_by_boundary.values(),
@@ -111,8 +112,77 @@ class CoSplitUCBPlacementPolicy:
         )
 
     def bind_clients(self, clients, round_id: int) -> None:
-        if self.device_cost_prior is not None:
-            self.device_cost_prior.bind_clients(clients, round_id)
+        bind = getattr(self.telemetry_provider, "bind_clients", None)
+        if bind is not None:
+            bind(clients, round_id)
+
+    def bind_evaluation_clients(self, clients, round_id: int) -> None:
+        from .calibration import ClientTelemetry
+
+        if self.telemetry_provider is None and hasattr(self.candidate_provider, "model"):
+            self._catalog()
+            self.telemetry_provider = ClientTelemetry(policy=self)
+        bind = getattr(self.telemetry_provider, "bind_evaluation_clients", None)
+        if bind is not None:
+            bind(clients, round_id)
+        else:
+            self.bind_clients(clients, round_id)
+
+    def prepare_calibration(self, inputs, targets, *, loss_fn, device, parameters=None) -> None:
+        """Initialize a fresh deployment from its captured graph and local sample.
+
+        Client measurements arrive through GetProperties before placement. They
+        seed the discounted learners once; predictions remain learner outputs.
+        """
+        from .calibration import ClientTelemetry, CalibratedTelemetry, calibrate_split, calibration_boundaries, provider_handle
+
+        previous = self.telemetry_provider
+        if previous is not None and not isinstance(previous, ClientTelemetry):
+            return
+        if (isinstance(previous, CalibratedTelemetry) and previous.initialized
+                and not self._state_restored):
+            return
+        if (self._state_restored and isinstance(previous, ClientTelemetry)
+                and not isinstance(previous, CalibratedTelemetry)):
+            return
+        from flwr.common import ndarrays_to_parameters, serde
+        from splitfleet.backends.utils import adapter_for
+        from splitfleet.common.model_state import tensor_state_hash
+
+        model = self.candidate_provider.model
+        adapter = adapter_for(model, inputs.args if inputs.args else inputs.kwargs)
+        if parameters is not None:
+            adapter.load_ndarrays(model, parameters)
+        catalog = self._catalog()
+        if self._state_restored:
+            telemetry = ClientTelemetry(policy=self)
+            if previous is not None:
+                telemetry.clients = previous.clients
+            self.telemetry_provider = telemetry
+            return
+        payload = serde.parameters_to_proto(ndarrays_to_parameters(
+            parameters if parameters is not None else adapter.export_ndarrays(model)
+        )).SerializeToString()
+        if (isinstance(previous, CalibratedTelemetry)
+                and previous.initial_model_hash == tensor_state_hash(model.state_dict())):
+            previous.parameters = payload
+            return
+        if targets is None:
+            raise ValueError("CoSplit-UCB requires representative inputs and targets in a TaskBatch for calibration")
+        receipt = calibrate_split(
+            model, inputs, targets,
+            boundaries=calibration_boundaries(catalog),
+            make_handle=lambda cut: provider_handle(self.candidate_provider, cut),
+            loss_fn=loss_fn, device=device,
+            source="server_shape_matched_current_deployment",
+        )
+        telemetry = CalibratedTelemetry(
+            initial_model_hash=receipt["model_hash_before"], server_receipt=receipt,
+            parameters=payload, policy=self,
+        )
+        if previous is not None:
+            telemetry.clients = previous.clients
+        self.telemetry_provider = telemetry
 
     def _client_telemetry(self, client_id: str) -> Mapping[str, Any]:
         provider = self.telemetry_provider
@@ -271,8 +341,6 @@ class CoSplitUCBPlacementPolicy:
                         feasible=feasibility.feasible,
                         infeasible_reason=feasibility.reason,
                     )
-                if self.device_cost_prior is not None and training:
-                    prediction = self.device_cost_prior.estimate(client_id, candidate, prediction)
                 client_estimates.append(prediction)
             if lock_previous and any(
                 value.feasible and value.boundary == previous_boundary for value in client_estimates
@@ -301,6 +369,10 @@ class CoSplitUCBPlacementPolicy:
         if not normalized_ids:
             self._round_assignments[key] = {}
             return {}
+        planning_started = time.perf_counter()
+        clear_cache = getattr(self.solver, "clear_cache", None)
+        if clear_cache is not None:
+            clear_cache()
         batch_counts: dict[str, int] = {}
         batch_counts_known = True
         for client_id in normalized_ids:
@@ -327,13 +399,17 @@ class CoSplitUCBPlacementPolicy:
             }
             if not allowed_boundaries.intersection(self._catalog_by_boundary):
                 raise ValueError("training and evaluation graphs share no valid split boundary")
+        estimate_started = time.perf_counter()
         estimates, residence_locked = self._estimate_round(
             round_id=int(round_id), client_ids=normalized_ids, training=bool(training),
             allowed_boundaries=allowed_boundaries,
         )
+        estimate_sec = time.perf_counter() - estimate_started
         LOGGER.info("[CoSplitUCB] round_context_ready round=%d clients=%d", round_id, len(normalized_ids))
+        solve_started = time.perf_counter()
         baseline = self.solver.solve(estimates, batch_counts=batch_counts)
         baseline_simulation = self.solver.simulate(baseline, batch_counts=batch_counts)
+        solve_sec = time.perf_counter() - solve_started
         LOGGER.info(
             "[CoSplitUCB] exploitation_assignment round=%d makespan_ms=%.3f",
             round_id,
@@ -341,6 +417,7 @@ class CoSplitUCBPlacementPolicy:
         )
         decisions: list[ExplorationDecision] = []
         final = baseline
+        exploration_started = time.perf_counter()
         if training and batch_counts_known:
             final, decisions = self.exploration_controller.apply(
                 round_id=int(round_id),
@@ -351,6 +428,7 @@ class CoSplitUCBPlacementPolicy:
                 residence_locked=residence_locked,
                 component_last_observation=self._last_component_observation,
             )
+        exploration_sec = time.perf_counter() - exploration_started
         assignment = {client_id: final[client_id].boundary for client_id in normalized_ids}
         if training:
             for client_id, boundary in assignment.items():
@@ -416,6 +494,15 @@ class CoSplitUCBPlacementPolicy:
                 }
                 for cid, values in estimates.items()
             },
+        }
+        diagnostic_store[int(round_id)]["planning_compute"] = {
+            "estimate_sec": estimate_sec,
+            "solve_sec": solve_sec,
+            "exploration_sec": exploration_sec,
+            "total_sec": time.perf_counter() - planning_started,
+            "simulation_cache_hits": getattr(self.solver, "simulation_cache_hits", 0),
+            "simulation_cache_misses": getattr(self.solver, "simulation_cache_misses", 0),
+            "simulation_cache_entries": len(getattr(self.solver, "_simulation_cache", {})),
         }
         if decisions:
             LOGGER.info("[CoSplitUCB] safe_exploration round=%d count=%d", round_id, len(decisions))
@@ -692,6 +779,11 @@ class CoSplitUCBPlacementPolicy:
             (int(row["round_id"]), str(row["client_id"]), str(row["boundary"]))
             for row in payload.get("observed_actions", [])
         }
+        self._state_restored = True
+        self._pending_store_state = None
+        self._round_assignments.clear()
+        self._round_contexts.clear()
+        self._round_batch_counts.clear()
 
 
 __all__ = ["CoSplitUCBPlacementPolicy"]

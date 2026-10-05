@@ -17,11 +17,13 @@ AUTOSPLIT_FEATURE_ABI_ID_CONFIG_KEY = "autosplit_feature_abi_id"
 AUTOSPLIT_RUNTIME_CONTRACT_CONFIG_KEY = "autosplit_runtime_contract"
 AUTOSPLIT_RUNTIME_CONTRACT_DIGEST_CONFIG_KEY = "autosplit_runtime_contract_digest"
 AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY = "autosplit_trace_batch_mode"
+AUTOSPLIT_TRAINABLE_CONFIG_KEY = "autosplit_trainable"
 AUTOSPLIT_DYNAMIC_BATCH_CONFIG_KEY = "autosplit_dynamic_batch"
 AUTOSPLIT_GRAPH_CONTRACT_CONFIG_KEY = "autosplit_graph_contract"
 AUTOSPLIT_GRAPH_CONTRACT_DIGEST_CONFIG_KEY = "autosplit_graph_contract_digest"
 AUTOSPLIT_MODEL_VERSION_CONFIG_KEY = "autosplit_model_version"
 AUTOSPLIT_MODEL_VERSION_CONTRACT_CONFIG_KEY = "autosplit_model_version_contract"
+COSPLIT_CALIBRATION_PARAMETERS_CONFIG_KEY = "cosplit_calibration_parameters"
 
 # Wall-clock transport stamps are carried as decimal nanoseconds in gRPC
 # metadata. One-way values are accepted only when both hosts' timestamps form

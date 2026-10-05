@@ -3,6 +3,8 @@ from __future__ import annotations
 import pytest
 import torch
 from torch import nn
+from dataclasses import replace
+from types import SimpleNamespace
 
 from splitfleet.autosplit.torchlens_backend import TorchLensSplitBackend
 from splitfleet.autosplit.torchlens_candidate import ParameterCountIndex
@@ -100,6 +102,33 @@ def test_selected_candidate_executes_runtime() -> None:
     backend.split(candidate)
     x = backend.trace_sample_input[0]
     torch.testing.assert_close(backend.run_suffix(backend.run_prefix(x)), backend.model(x))
+
+
+def test_replay_only_native_capability_cannot_enter_training_catalog(monkeypatch) -> None:
+    backend = _traced_backend()
+    refused = next(candidate.boundary for candidate in backend.iter_candidates() if candidate.is_trainable_tail)
+    runtime_type = type(backend.runtime)
+    original_analyze = runtime_type.analyze
+
+    def replay_only_report(runtime, point):
+        analysis = original_analyze(runtime, point)
+        boundary = f"{analysis.plan.boundary_kind}:{analysis.plan.target_node_id}"
+        if boundary == refused:
+            # An explicit replay-only report must remain replay-only even when
+            # suffix parameters exist. No executable runtime is fabricated.
+            analysis = replace(analysis, capability_report=SimpleNamespace(
+                unsupported_reasons=(), training=SimpleNamespace(supported=False)))
+        return analysis
+
+    monkeypatch.setattr(runtime_type, "analyze", replay_only_report)
+    candidate = next(value for value in backend.iter_candidates() if value.boundary == refused)
+    assert candidate.descriptor["capabilities"]["replay_supported"]
+    assert not candidate.descriptor["capabilities"]["training_supported"]
+    assert not candidate.is_trainable_tail
+    provider = TorchLensCandidateProvider(model=ToyNet().eval(), sample_inputs=torch.randn(2, 4))
+    catalog = provider.get_candidates(training=True)
+    assert refused not in {value.boundary for value in catalog}
+    assert provider.catalog_diagnostics[True]["rejected_candidates"][refused] == "native_training_unsupported"
 
 
 def test_auto_planner_uses_native_capability_without_numeric_replay(monkeypatch) -> None:

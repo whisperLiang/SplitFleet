@@ -1832,7 +1832,7 @@ dependencies = [
     { name = "typing-extensions" },
 ]
 wheels = [
-    { filename = "torchlens-2.34.1-py3-none-any.whl", hash = "sha256:da6ef203e3108bd38b1a7c37a6a929e3d4250418cba8cce3a4deeaa535de0400" },
+    { filename = "torchlens-2.34.1-py3-none-any.whl", hash = "sha256:ecac2e960690d682ec04f541a566c6fd4c99b817bb2603c06bd095de4683a6a7" },
 ]
 
 [package.metadata]

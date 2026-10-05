@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Any, Optional
 
 from splitfleet.autosplit.cache import PlanCacheStore
@@ -136,7 +137,10 @@ class AutoSplitSession:
         self, handle: TorchLensRuntimeHandle, boundary: str
     ) -> TorchLensRuntimeHandle:
         """Reuse a captured graph for another boundary of the same model."""
-        replacement = handle.backend.repartition(boundary)
+        # A retained prewarm/cached handle must keep its backend on the same
+        # cut as its runtime and plan. Repartition mutates facade bookkeeping.
+        backend = copy.copy(handle.backend)
+        replacement = backend.repartition(boundary)
         self.discard_runtime_handles()
         self._runtime_handles[replacement.plan.plan_id] = replacement
         return replacement

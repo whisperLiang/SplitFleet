@@ -59,7 +59,7 @@ def test_remote_server_outside_worker_hosts_receives_code_and_bundle(tmp_path, m
         tasks=["image_classification"], methods=list(orchestrator.METHODS), data_root="unused",
         seed=1, train_samples=1, test_samples=1, batch_size=1,
         rounds=1, timeout=1,
-        model_name=model_name, device_profiles="measured-costs.json",
+        model_name=model_name,
     )
 
     remote_root = "/tmp/splitfleet_physical_multitask_remote-server"
@@ -82,6 +82,5 @@ def test_remote_server_outside_worker_hosts_receives_code_and_bundle(tmp_path, m
     assert worker_ids[0] == ("edge-0-cpu" if layout == "legacy" else "edge-0-gpu")
     assert any(command[-1] == f"edge-1:{remote_root}/bundles/image_classification.client_{2 if layout == 'legacy' else 1}.pt"
                for command in commands)
-    assert [call["device_profiles"] for call in training_calls if call["method"] == "splitfleet"] == ["measured-costs.json"]
-    assert all(call["device_profiles"] is None for call in training_calls if call["method"] != "splitfleet")
+    assert all("device_profiles" not in call and "online_initialization" not in call for call in training_calls)
     assert {row["status"] for row in json.loads((tmp_path / "remote-server" / "attempts.json").read_text())} == {"completed"}

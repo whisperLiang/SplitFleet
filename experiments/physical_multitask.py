@@ -40,6 +40,18 @@ TASKS = ("image_classification", "text_classification", "object_detection", "sem
 FIXED_BOUNDARIES = ("25%", "50%", "75%")
 
 
+def _make_placement_policy(*, provider, bundle, args):
+    """Use the production CoSplit-UCB defaults for every adaptive run."""
+    return CoSplitUCBPlacementPolicy(
+        candidate_provider=provider,
+        config=CoSplitUCBConfig(
+            seed=int(bundle["seed"]), server_concurrency=1,
+            min_residence_rounds=args.min_residence_rounds,
+            state_path=str(Path(args.output).with_suffix(".bandit.json")),
+        ),
+    )
+
+
 def _seed_training_stream(bundle, rank: int) -> None:
     from experiments.unified_multitask.edge_models import EDGE_MODELS
     if bundle.get("model_id") in EDGE_MODELS:
@@ -97,7 +109,7 @@ def _make_candidate_provider(*, model, sample_inputs, bundle):
     )
 
 
-def _resolve_fixed_cuts(*, model, sample_inputs, bundle) -> dict[str, str]:
+def _resolve_training_cut_domains(*, model, sample_inputs, bundle):
     """Select static graph fractions from admissible two-sided training cuts.
 
     Resolve these on the frozen initial model before measuring any method.
@@ -109,10 +121,16 @@ def _resolve_fixed_cuts(*, model, sample_inputs, bundle) -> dict[str, str]:
     ).get_candidates(training=True)
     if not candidates:
         raise RuntimeError("No admissible two-sided training cut for the fixed baselines")
-    return {fraction: min(candidates, key=lambda candidate: (
+    fixed = {fraction: min(candidates, key=lambda candidate: (
         abs(candidate.graph_position_ratio - float(fraction.rstrip('%')) / 100),
         candidate.boundary,
     )).boundary for fraction in FIXED_BOUNDARIES}
+    from splitfleet.server.placement.cosplit_ucb.calibration import calibration_boundaries
+    return fixed, calibration_boundaries(candidates)
+
+
+def _resolve_fixed_cuts(*, model, sample_inputs, bundle) -> dict[str, str]:
+    return _resolve_training_cut_domains(model=model, sample_inputs=sample_inputs, bundle=bundle)[0]
 
 
 def _wait_for_round_release(address: str, round_id: int, identity: str) -> None:
@@ -269,7 +287,7 @@ def prepare_bundle(*, task: str, data_root: str, output: Path, seed: int,
     trace_loader = DataLoader(ItemDataset(server_train, task), batch_size=batch_size,
                               collate_fn=workload.collate_fn)
     trace_inputs, _, _ = _batch(workload, next(iter(trace_loader)), torch.device("cpu"))
-    common["fixed_cut_resolution"] = _resolve_fixed_cuts(
+    common["fixed_cut_resolution"], common["online_calibration_boundaries"] = _resolve_training_cut_domains(
         model=model, sample_inputs=trace_inputs, bundle=common,
     )
     server_test = [workload.test_dataset[index] for index in range(len(workload.test_dataset))]
@@ -305,6 +323,7 @@ def prepare_bundle(*, task: str, data_root: str, output: Path, seed: int,
     for key in ("model_id", "model_config", "model_metadata", "num_parameters", "trainable_parameters"):
         metadata[key] = common[key]
     metadata["fixed_cut_resolution"] = common["fixed_cut_resolution"]
+    metadata["online_calibration_boundaries"] = common["online_calibration_boundaries"]
     metadata["pretrain_checkpoint_sha256"] = common["pretrain_checkpoint_sha256"]
     metadata["client_data_hashes"] = partition_hashes
     metadata["partition_label_counts"] = common["partition_label_counts"]
@@ -440,12 +459,14 @@ class SplitClient(AutoSplitSplitLearningClient):
         return updated, examples, metrics
 
     def get_properties(self, config):
-        _ = config
-        return {"logical_client_id": self.identity,
-                "batch_size": self.source.batch_size,
-                "device_type": str(self.device).split(":", 1)[0],
-                "num_batches": (len(self.source.workload.train_dataset)
-                                + self.source.batch_size - 1) // self.source.batch_size}
+        properties = super().get_properties(config)
+        properties.update(
+            logical_client_id=self.identity,
+            batch_size=self.source.batch_size,
+            num_batches=(len(self.source.workload.train_dataset)
+                         + self.source.batch_size - 1) // self.source.batch_size,
+        )
+        return properties
 
 
 def _evaluate_physical(workload: Workload, model: torch.nn.Module, *,
@@ -472,6 +493,7 @@ class RecordingFedAvg(FedAvg):
         self.fit_records: list[dict[str, Any]] = []
         self.fit_failures: list[dict[str, Any]] = []
         self.evaluation_records: list[dict[str, Any]] = []
+        self.measurement_started_ns = time.monotonic_ns()
         super().__init__(
             initial_parameters=ndarrays_to_parameters(
                 [value.detach().cpu().numpy() for value in model.state_dict().values()]
@@ -501,7 +523,10 @@ class RecordingFedAvg(FedAvg):
                                     for name, value in zip(self.model.state_dict(), arrays, strict=True)})
         metrics = _evaluate_physical(self.workload, self.model, device=torch.device(self.device))
         if round_id > 0:
-            self.evaluation_records.append({"round_id": round_id, "metrics": metrics})
+            self.evaluation_records.append({
+                "round_id": round_id, "metrics": metrics,
+                "elapsed_sec": (time.monotonic_ns() - self.measurement_started_ns) / 1e9,
+            })
         return 0.0, metrics
 
 
@@ -512,6 +537,7 @@ class RecordingSplit(AutoSplitStrategy):
         self.fit_failures: list[dict[str, Any]] = []
         self.server_fit_records: list[dict[str, Any]] = []
         self.evaluation_records: list[dict[str, Any]] = []
+        self.measurement_started_ns = time.monotonic_ns()
         super().__init__(**kwargs)
 
     def aggregate_fit(self, server_round, results, failures):
@@ -534,7 +560,10 @@ class RecordingSplit(AutoSplitStrategy):
         self.backend_adapter.load_ndarrays(self.model, parameters_to_ndarrays(client_parameters))
         metrics = _evaluate_physical(self.workload, self.model,
                                      device=torch.device(self.runtime_device))
-        self.evaluation_records.append({"round_id": int(server_round), "metrics": metrics})
+        self.evaluation_records.append({
+            "round_id": int(server_round), "metrics": metrics,
+            "elapsed_sec": (time.monotonic_ns() - self.measurement_started_ns) / 1e9,
+        })
         return 0.0, metrics
 
 
@@ -562,27 +591,17 @@ def run_server(args: argparse.Namespace) -> None:
     policy = None
     if args.method in ("fedavg", "fedprox"):
         strategy = RecordingFedAvg(workload=workload, model=model, device=args.device, **common)
+        strategy.measurement_started_ns = start_monotonic_ns
         history = flower_start_server(server_address=args.bind,
                                       config=ServerConfig(num_rounds=args.rounds), strategy=strategy)
     else:
         loader = DataLoader(workload.train_dataset, batch_size=int(bundle["batch_size"]),
                             collate_fn=workload.collate_fn)
-        sample, _, _ = _batch(workload, next(iter(loader)), torch.device(args.device))
+        sample, calibration_targets, _ = _batch(workload, next(iter(loader)), torch.device(args.device))
         if args.method == "splitfleet":
             provider = _make_candidate_provider(model=model, sample_inputs=sample, bundle=bundle)
-            profile_path = os.environ.get("SPLITFLEET_DEVICE_PROFILES")
-            from splitfleet.server.placement.cosplit_ucb.device_cost import DeviceCostPrior
-            if bundle.get("model_id", bundle.get("image_model")) == "rfdetr_nano" and not profile_path:
-                raise ValueError("RF-DETR SplitFleet requires SPLITFLEET_DEVICE_PROFILES")
-            prior = DeviceCostPrior(profile_path) if profile_path else None
-            policy = CoSplitUCBPlacementPolicy(
-                candidate_provider=provider,
-                config=CoSplitUCBConfig(seed=int(bundle["seed"]),
-                                        server_concurrency=1,
-                                        safe_exploration_epsilon=0.0 if prior else 0.05,
-                                        min_residence_rounds=args.min_residence_rounds,
-                                        state_path=str(Path(args.output).with_suffix(".bandit.json"))),
-                device_cost_prior=prior,
+            policy = _make_placement_policy(
+                provider=provider, bundle=bundle, args=args,
             )
         strategy = RecordingSplit(
             workload=workload, model=model, sample_inputs=sample,
@@ -595,10 +614,15 @@ def run_server(args: argparse.Namespace) -> None:
             runtime_device=args.device, **common,
             owned_state_exchange=owned_exchange,
         )
+        strategy.measurement_started_ns = start_monotonic_ns
         # Validate the complete catalog once; construct executable plans lazily
         # for the cuts actually selected for this round.
         if policy is not None:
             policy.candidate_provider.get_candidates(training=True)
+            policy.prepare_calibration(
+                sample, calibration_targets, loss_fn=workload.task.make_adapter().loss,
+                device=args.device,
+            )
         boundaries = () if policy is not None else (resolved_boundary,)
         for boundary in boundaries:
             placement = strategy.get_or_create_placement_plan(boundary)
@@ -611,7 +635,15 @@ def run_server(args: argparse.Namespace) -> None:
         "owned_state_exchange": owned_exchange,
         "evaluation_policy": "after each training round; no initial evaluation",
         "aggregation_order": "ascending logical client_index",
-        "device_cost_profiles": os.environ.get("SPLITFLEET_DEVICE_PROFILES"),
+        "online_cost_learning": policy is not None,
+        "cost_initialization_receipt": getattr(policy.telemetry_provider, "receipt", None) if policy else None,
+        "mean_exploration_diagnostics": getattr(policy.exploration_controller, "round_records", {}) if policy else {},
+        "online_calibration_boundaries": bundle.get("online_calibration_boundaries"),
+        "cosplit_config": vars(policy.config) if policy is not None else None,
+        "online_worker_contexts": (
+            dict(policy.telemetry_provider.clients)
+            if policy is not None else None
+        ),
         "min_residence_rounds": args.min_residence_rounds,
         "image_model": bundle.get("image_model"),
         "model_id": bundle.get("model_id", bundle.get("image_model")),
@@ -696,7 +728,7 @@ def run_client(args: argparse.Namespace) -> None:
                               batch_size=int(bundle["batch_size"]))
         loader = DataLoader(workload.train_dataset, batch_size=int(bundle["batch_size"]),
                             collate_fn=workload.collate_fn)
-        sample, _, _ = _batch(workload, next(iter(loader)), torch.device(args.device))
+        sample, calibration_targets, _ = _batch(workload, next(iter(loader)), torch.device(args.device))
         client = SplitClient(
             identity=args.client_id, client_index=args.client_index, source=source,
             partition_hash=bundle["partition_hash"], barrier=args.barrier,
@@ -720,6 +752,10 @@ def run_client(args: argparse.Namespace) -> None:
                           "boundary": prewarm_boundary,
                           "resolved_boundary": client._prewarmed_runtime.plan.boundary,
                           "elapsed_sec": time.perf_counter() - prewarm_started}), flush=True)
+        if args.method == "splitfleet":
+            client.calibrate_runtime(calibration_targets, boundaries=bundle["online_calibration_boundaries"])
+            print(json.dumps({"event": "client_online_calibration", "id": args.client_id,
+                              "receipt": client.online_calibration_receipt}), flush=True)
         launch = split_start_client
     print(json.dumps({"event": "client_start", "id": args.client_id, "device": args.device,
                       "pid": os.getpid(), "host": socket.gethostname(),

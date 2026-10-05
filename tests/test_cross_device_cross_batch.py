@@ -167,7 +167,12 @@ def test_bounded_client_runtime_cache_evicts_old_split_before_retrace() -> None:
     cached = list(fleet.client._runtime_cache.values())
     assert len(cached) == 1
     assert cached[0].handle.plan.plan_id != first
-    assert cached[0].handle.backend is first_handle.backend
+    # Reuse the captured graph and live model while keeping retained handles
+    # coherent; sharing mutable backend bookkeeping changes the old cut.
+    assert cached[0].handle.backend is not first_handle.backend
+    assert cached[0].handle.runtime.trace_graph is first_handle.runtime.trace_graph
+    assert cached[0].handle.model is first_handle.model
+    assert first_handle.backend.runtime is first_handle.runtime
     assert set(fleet.client.autosplit_session._runtime_handles) == {
         cached[0].handle.plan.plan_id
     }

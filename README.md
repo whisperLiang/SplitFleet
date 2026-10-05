@@ -5,8 +5,11 @@ SplitFleet is a unified split federated learning framework built on top of [Flow
 The unified task interface covers image classification, text classification, object detection, semantic segmentation, and instance segmentation.
 Architecture notes and study protocols are kept locally in `plans/` and excluded from Git.
 Dataset-level integrations can be registered through `TaskSpec`/`TaskRegistry`, which bind a task adapter, model and dataset factories, metrics, and candidate cuts without coupling the split runtime to a dataset package.
-The completed four-task study compares FedAvg, FedProx, fixed SFL at 25/50/75% and SplitFleet on ResNet-50, BERT-base, RF-DETR Nano and DeepLabV3-ResNet50. Each model has two paired seeds and ten rounds: 48 audited jobs in total. BERT uses three GPU clients; the other models use six CPU/GPU clients on three Orin hosts.
-See the [experiment guide](experiments/README.md). The training comparison and manuscript guide are local files at `paper/evidence/four_task_training_comparison_20261003.md` and `paper/README.md`. Formal artifacts, admission records, profiles and frozen source snapshots are retained under `results/www2027_study_20261003/`.
+CoSplit-UCB is the default adaptive policy. Physical PyTorch runs initialize its discounted learners from three current-device split calibrations, bound exploration by predicted mean and confidence-upper round time (5% by default), and reuse prediction and scheduling caches. Calibration performs no optimizer steps and restores model state, gradients and random streams. Costs continue to come from online training feedback.
+Fresh calibration synchronizes Flower's current global weights and uses the server's captured batch contract. Evaluation binds worker metadata without calibrating. A compatible restored learner keeps its statistics and continues from online feedback without repeating initialization.
+
+The active code uses the original `cosplit_context_v1` context schema. Historical timing comparisons and frozen source snapshots remain under `paper/evidence/` and `results/`; use those snapshots to reproduce an old run. See the [experiment guide](experiments/README.md) for the current training entry points.
+
 The autosplit runtime is backed by the repository-local `torchlens-2.34.1-py3-none-any.whl` via `uv.sources`. SplitFleet uses its native split APIs and maintains no local TorchLens patches or wheel builder. Candidate catalogs use `analyze()` for plans and capability reports; selected training cuts use `at()` to build executable segments. SplitFleet handles Flower strategy integration, client/server transport, server-tail replicas, and aggregation policy.
 
 Boundary features and gradients use typed tensor envelopes, graph contracts, SHA-256 checks and resource limits.
@@ -243,26 +246,28 @@ must retain trainable parameters in both stages and pass native capability and
 state ownership checks. Selected cuts are materialized for training.
 The catalog shares one capture; execution handles are retained only for selected
 cuts. The retained four-task jobs record catalog sizes, selected boundaries and
-rejection diagnostics in their result files and profiles.
+rejection diagnostics in their result files.
 
 ```python
-from splitfleet.server.placement import (
-    CoSplitUCBPlacementPolicy,
-    TorchLensCandidateProvider,
-)
+from splitfleet.tasks import ImageClassificationTask, ModelInputs, TaskBatch
+from splitfleet.server.strategy import AutoSplitStrategy
+from splitfleet.server.placement import CoSplitUCBPlacementPolicy, TorchLensCandidateProvider
 
+# Use representative inputs and targets from the current deployment.
+sample = TaskBatch(ModelInputs.from_value(sample_inputs), sample_targets)
+task = ImageClassificationTask()
 placement = CoSplitUCBPlacementPolicy(
-    candidate_provider=TorchLensCandidateProvider(
-        model=model,
-        sample_inputs=sample_inputs,
-    ),
+    candidate_provider=TorchLensCandidateProvider(model=model, sample_inputs=sample.inputs),
 )
 strategy = AutoSplitStrategy(
     model=model,
-    sample_inputs=sample_inputs,
+    sample_inputs=sample,
+    task=task,
     placement_policy=placement,
     aggregation_policy="splitfed",
 )
+# On each worker, pass its own representative TaskBatch and task to
+# AutoSplitSplitLearningClient. Calibration runs before the first placement.
 ```
 
 CoSplit-UCB treats fine-grained split selection as a cooperative,
@@ -270,8 +275,8 @@ non-stationary contextual-bandit problem. It learns client, network, server and
 repartitioning costs from real split-training feedback, shares edge knowledge
 by execution profile, keeps link learners per client, and uses a shared server
 learner. A lane simulator derives queueing and minimizes synchronous round
-makespan. Slack-aware exploration is accepted only inside a conservative global
-slowdown budget. The default parameters are starting points, not claimed optima.
+makespan. Exploration must stay within both the predicted mean and confidence-upper
+round-time budgets. The default parameters are starting points, not claimed optima.
 
 The solver schedules each client's sequential training batches on shared server
 lanes; the switch cost is paid once per round. It uses the latest observed batch
@@ -314,7 +319,7 @@ mode are the two deltas summed. Shared buffers are not treated as tied.
 
 ## Runtime Invariants
 
-- Runtime validation requires the installed `torchlens==2.34.1`. `uv.sources` and the wheel hash in `uv.lock` select the repository wheel. Runtime contracts identify adapter v6, so contracts from earlier adapters must be regenerated.
+- Runtime validation requires the installed `torchlens==2.34.1`. `uv.sources` and the wheel hash in `uv.lock` select the repository wheel. Runtime contracts identify adapter v8, so contracts from earlier adapters must be regenerated.
 - Runtimes use TorchLens `prepare`; split-point discovery, analysis, and repartition use the public `split_points`, `analyze`, and `at` methods. Unsupported points remain visible in candidate diagnostics.
 - `BoundaryPayload` serialization is self-contained: tensors, a stable `BoundarySpec`, and portable replay metadata survive cross-process transport. The optional native TorchLens object and local autograd state are not required on the receiving side.
 - Feature ABI identifiers are schema-only. They include labels, dtype, symbolic shape, layout, passthrough/preprocessing schema, trace mode, dynamic batch, model/runtime identifiers, and TorchLens version, but exclude sample tensor values, concrete sample batch values, target values, device, temporary runtime ids, and validation inputs.

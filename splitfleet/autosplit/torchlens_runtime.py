@@ -74,7 +74,17 @@ def runtime_input_batch_size(runtime: Any, inputs: tuple[Any, ...], input_kwargs
     map represents fixed input shapes and intentionally has no batch dimension.
     """
     inputs, input_kwargs, _ = normalize_model_call(runtime.model, inputs, input_kwargs)
-    axes = runtime.batch_spec.axes
+    return _input_batch_size(inputs, input_kwargs, runtime.batch_spec.axes)
+
+
+def model_input_batch_size(model: Any, inputs: tuple[Any, ...], input_kwargs: Mapping[str, Any] | None = None,
+                           *, batch_axes: Mapping[str, int] | None = None) -> int | None:
+    """Read declared sample axes before a runtime has been prepared."""
+    inputs, input_kwargs, axes = normalize_model_call(model, inputs, input_kwargs, batch_axes)
+    return _input_batch_size(inputs, input_kwargs, axes)
+
+
+def _input_batch_size(inputs, input_kwargs, axes):
     if not axes:
         return None
     roots = {"args": inputs, "kwargs": input_kwargs or {}}
@@ -126,10 +136,12 @@ def make_split_spec(
     backend: str = "torch",
     batch_axes: dict[str, int] | None = None,
 ) -> SplitRequest:
+    # Evaluation replicas also need live state after each round's parameter load.
     return SplitRequest(
         point=_point(boundary),
         backend=str(backend),
-        features=SplitFeatures(replay=True, training=bool(trainable), batch_axes=batch_axes),
+        features=SplitFeatures(replay=True, training=bool(trainable), batch_axes=batch_axes,
+                              live_param_sources=True if backend == "torch" and not trainable else None),
         validation="strict",
         batch_symbol=batch_symbol,
     )

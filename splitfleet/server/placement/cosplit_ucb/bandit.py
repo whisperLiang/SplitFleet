@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -36,6 +37,7 @@ class DiscountedLinUCB:
         alpha: float = 1.0,
         target_scale: float = 1000.0,
         feature_schema_version: str,
+        prediction_cache_size: int = 2048,
     ) -> None:
         if dimension < 1:
             raise ValueError("dimension must be positive")
@@ -45,6 +47,8 @@ class DiscountedLinUCB:
             raise ValueError("invalid alpha/target scale")
         if not feature_schema_version:
             raise ValueError("feature_schema_version must not be empty")
+        if prediction_cache_size < 0:
+            raise ValueError("prediction_cache_size must be non-negative")
         self.dimension = int(dimension)
         self.ridge_lambda = float(ridge_lambda)
         self.discount_gamma = float(discount_gamma)
@@ -56,6 +60,15 @@ class DiscountedLinUCB:
         self.num_updates = 0
         self.last_update_round = -1
         self.last_discount_round = -1
+        self.prediction_cache_size = int(prediction_cache_size)
+        self._prediction_cache: OrderedDict[bytes, LinearPrediction] = OrderedDict()
+        self._cache_state = None
+        self._theta: np.ndarray | None = None
+
+    def _invalidate_prediction_cache(self) -> None:
+        self._prediction_cache.clear()
+        self._cache_state = None
+        self._theta = None
 
     def _vector(self, context: np.ndarray) -> np.ndarray:
         value = np.asarray(context, dtype=np.float64).reshape(-1)
@@ -72,13 +85,34 @@ class DiscountedLinUCB:
         """Predict non-negative mean cost and confidence radius."""
 
         x = self._vector(context)
-        theta = self._solve(self.b)
+        if self.prediction_cache_size:
+            # Include the public statistics and scaling parameters so direct
+            # edits cannot leave an apparently valid cached prediction behind.
+            state = (self.A.tobytes(), self.b.tobytes(), self.alpha, self.target_scale)
+            if state != self._cache_state:
+                self._invalidate_prediction_cache()
+                self._cache_state = state
+            key = x.tobytes()
+            cached = self._prediction_cache.get(key)
+            if cached is not None:
+                self._prediction_cache.move_to_end(key)
+                return cached
+            if self._theta is None:
+                self._theta = self._solve(self.b)
+            theta = self._theta
+        else:
+            theta = self._solve(self.b)
         mean_scaled = float(x @ theta)
         variance = max(float(x @ self._solve(x)), 0.0)
-        return LinearPrediction(
+        prediction = LinearPrediction(
             mean=max(mean_scaled * self.target_scale, 0.0),
             uncertainty=max(self.alpha * np.sqrt(variance) * self.target_scale, 0.0),
         )
+        if self.prediction_cache_size:
+            self._prediction_cache[key] = prediction
+            if len(self._prediction_cache) > self.prediction_cache_size:
+                self._prediction_cache.popitem(last=False)
+        return prediction
 
     def advance_round(self, round_id: int) -> None:
         """Age previous observations before making this round's predictions."""
@@ -97,6 +131,7 @@ class DiscountedLinUCB:
         self.A = gamma * self.A + (1.0 - gamma) * self.ridge_lambda * identity
         self.b = gamma * self.b
         self.last_discount_round = current
+        self._invalidate_prediction_cache()
 
     def update(self, context: np.ndarray, target: float, *, round_id: int) -> None:
         """Apply one observation after discounting any elapsed rounds."""
@@ -110,6 +145,7 @@ class DiscountedLinUCB:
         self.b = self.b + x * (y / self.target_scale)
         self.num_updates += 1
         self.last_update_round = int(round_id)
+        self._invalidate_prediction_cache()
 
     def state_dict(self) -> dict[str, Any]:
         """Return JSON-compatible sufficient statistics."""
@@ -150,13 +186,17 @@ class DiscountedLinUCB:
             np.linalg.cholesky(A)
         except np.linalg.LinAlgError as exc:
             raise ValueError("bandit covariance must be positive definite") from exc
+        num_updates = int(state.get("num_updates", 0))
+        last_update_round = int(state.get("last_update_round", -1))
+        last_discount_round = int(state.get("last_discount_round", last_update_round))
+        if last_discount_round < last_update_round:
+            raise ValueError("bandit discount round cannot precede last observation")
         self.A = A.copy()
         self.b = b.copy()
-        self.num_updates = int(state.get("num_updates", 0))
-        self.last_update_round = int(state.get("last_update_round", -1))
-        self.last_discount_round = int(state.get("last_discount_round", self.last_update_round))
-        if self.last_discount_round < self.last_update_round:
-            raise ValueError("bandit discount round cannot precede last observation")
+        self.num_updates = num_updates
+        self.last_update_round = last_update_round
+        self.last_discount_round = last_discount_round
+        self._invalidate_prediction_cache()
 
 
 __all__ = ["DiscountedLinUCB", "LinearPrediction"]

@@ -52,9 +52,12 @@ class TorchLensRuntimeHandle:
         self.plan.feature_abi_id = value
 
 
-def _make_plan_id(graph_signature: str, split_id: str, boundary: str, mode: str) -> str:
+def _make_plan_id(graph_signature: str, split_id: str, boundary: str, mode: str, *,
+                  trainable: bool, training: bool) -> str:
+    # Some graphs (e.g. Linear/ReLU) have identical operations in train/eval;
+    # their captures must still occupy different runtime registry entries.
     digest = hashlib.sha1(
-        "|".join([graph_signature, split_id, boundary, mode]).encode("utf-8")
+        "|".join([graph_signature, split_id, boundary, mode, str(trainable), str(training)]).encode("utf-8")
     ).hexdigest()
     return f"torchlens_{digest[:12]}"
 
@@ -261,6 +264,10 @@ class TorchLensSplitBackend:
                     graph_signature=analysis.graph_ir.graph_hash,
                     parameter_index=parameter_index,
                 ))
+                candidate = replace(
+                    candidate,
+                    is_trainable_tail=candidate.is_trainable_tail and diagnosed.training_supported,
+                )
                 candidate.descriptor["capabilities"] = diagnosed.as_dict()
                 self.split_spec, self.current_candidate = analysis.request, candidate
                 self._candidate_analysis = analysis
@@ -403,12 +410,16 @@ class TorchLensSplitBackend:
             trace_batch_size=self.trace_batch_size,
         )
         actual_split_id = str(candidate.boundary)
+        from splitfleet.backends.utils import model_training
+
         return SplitRuntimePlan(
             plan_id=_make_plan_id(
                 trace_signature(runtime),
                 actual_split_id,
                 candidate.boundary,
                 "generated_eager",
+                trainable=bool(split_spec.features.training),
+                training=model_training(self._ensure_model()),
             ),
             split_id=actual_split_id,
             graph_signature=trace_signature(runtime),

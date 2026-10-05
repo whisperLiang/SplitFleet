@@ -221,15 +221,3 @@ def test_rfdetr_provider_prepares_evaluation_cut_from_evaluation_catalog():
     assert handle.model.training is False
     assert handle.plan.trainable is False
     assert model.training is True
-
-
-def test_rfdetr_splitfleet_refuses_missing_device_profiles(tmp_path):
-    output = tmp_path / "run"
-    with pytest.raises(ValueError, match="requires device profiles"):
-        _run_one(
-            {"server": {}, "hosts": []}, task="object_detection", method="splitfleet",
-            bundle_path=tmp_path / "bundle.pt", bundle={"image_model": "rfdetr_nano"},
-            remote_root="/tmp/unused", run_dir=output, rounds=3, timeout=1,
-            learning_rate=1e-5, optimizer="adam", fixed_boundary="50%",
-        )
-    assert not output.exists()
