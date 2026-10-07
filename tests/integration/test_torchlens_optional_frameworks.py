@@ -169,3 +169,63 @@ def test_tinygrad_split_training_optional(request) -> None:
     inputs, targets = Tensor.randn(2, 4), Tensor.randn(2, 4)
     _exercise(Model(), inputs, targets, lambda output, target: ((output - target) ** 2).mean(), "tinygrad")
     _exercise_engine_protocol(Model(), inputs, targets, lambda output, target: ((output - target) ** 2).mean(), "tinygrad")
+
+
+@pytest.mark.parametrize("backend", ["tf", "jax", "paddle", "tinygrad"])
+def test_cosplit_payload_context_matches_optional_backend_capture(request, backend):
+    if _run_isolated(request, extra_env={"CUDA_VISIBLE_DEVICES": "", "DEV": "CPU", "DEBUG": "0"}):
+        return
+    from splitfleet.server.placement.cosplit_ucb import ContextEncoder, TorchLensCandidateProvider
+    from splitfleet.server.placement.cosplit_ucb.calibration import provider_handle
+
+    if backend == "tf":
+        tf = pytest.importorskip("tensorflow")
+        model = tf.keras.Sequential([
+            tf.keras.layers.Input((4,)), tf.keras.layers.Dense(8, activation="relu"), tf.keras.layers.Dense(2)])
+        inputs, batch_argument = (tf.ones((3, 4)),), 0
+    elif backend == "jax":
+        jnp = pytest.importorskip("jax.numpy")
+
+        def model(params, x):
+            return jnp.maximum(x @ params["first"], 0) @ params["last"]
+
+        inputs = ({"first": jnp.ones((4, 8)), "last": jnp.ones((8, 2))}, jnp.ones((3, 4)))
+        batch_argument = 1
+    elif backend == "paddle":
+        paddle = pytest.importorskip("paddle")
+        model = paddle.nn.Sequential(paddle.nn.Linear(4, 8), paddle.nn.ReLU(), paddle.nn.Linear(8, 2))
+        inputs, batch_argument = (paddle.ones((3, 4)),), 0
+    else:
+        pytest.importorskip("tinygrad")
+        from tinygrad import Tensor
+        from tinygrad.nn import Linear
+
+        class Model:
+            def __init__(self):
+                self.first, self.last = Linear(4, 8), Linear(8, 2)
+                for layer in (self.first, self.last):
+                    layer.weight.requires_grad = layer.bias.requires_grad = True
+
+            def __call__(self, x):
+                return self.last(self.first(x).relu())
+
+        model = Model()
+        inputs, batch_argument = (Tensor.ones(3, 4),), 0
+    provider = TorchLensCandidateProvider(model=model, sample_inputs=inputs,
+        batch_axes={f"/args/{batch_argument}": 0}, dynamic_batch=(1, 4))
+    catalog = provider.get_candidates(training=True)
+    selected = {catalog[index].boundary: catalog[index] for index in (0, len(catalog) // 2, -1)}
+    encoder = ContextEncoder()
+    for candidate in selected.values():
+        batch = candidate.metadata["payload_batch_size"]
+        call = list(inputs)
+        call[batch_argument] = call[batch_argument][:batch]
+        payload = provider_handle(provider, candidate.boundary).backend.run_prefix(*call)
+        actual = sum(np.asarray(value.numpy() if hasattr(value, "numpy") else value).nbytes
+                     for value in payload.tensors.values())
+        context = encoder.network_context(candidate, {"batch_size": batch}, direction="upload")
+        assert context[1] * 1048576 == actual == candidate.boundary_forward_bytes
+        assert context[2] == context[-1] == 0
+        other_batch = 1 if batch != 1 else 2
+        unknown = encoder.network_context(candidate, {"batch_size": other_batch}, direction="upload")
+        assert unknown[1] == 0 and unknown[2] == unknown[-1] == 1

@@ -62,14 +62,15 @@ def test_actual_split_calibration_restores_weights_buffers_gradients_modes_and_r
     def execute():
         return calibrate_split(model, inputs, targets, boundaries=cuts,
             make_handle=lambda cut: provider_handle(provider, cut), loss_fn=loss,
-            device="cpu", source="client_private_sample_current_deployment")
+            device="cpu", source="client_private_sample_current_deployment",
+            optimizer_fn=lambda module: torch.optim.SGD(module.parameters(), lr=.01))
 
     if fail:
         with pytest.raises(RuntimeError, match="deliberate calibration failure"):
             execute()
     else:
         receipt = execute()
-        assert receipt["optimizer_steps"] == 0
+        assert receipt["optimizer_steps"] == len(cuts) * 2
         assert receipt["model_hash_before"] == receipt["model_hash_after"] == initial_hash
         assert {row["boundary"] for row in receipt["records"]} == set(cuts)
         assert all(row["client_forward_ms"] > 0 and row["client_backward_ms"] > 0
@@ -86,14 +87,16 @@ def test_actual_split_calibration_restores_weights_buffers_gradients_modes_and_r
 
 
 def _receipt(catalog, *, server=False):
-    return dict(schema="splitfleet.online-calibration.v1", device="cpu",
+    return dict(schema="splitfleet.cosplit-calibration", device="cpu",
         source="server_shape_matched_current_deployment" if server else "client_private_sample_current_deployment",
         model_hash_before="initial", model_hash_after="initial", elapsed_sec=.5,
-        state_and_torch_rng_preserved=True, optimizer_steps=0,
+        state_and_torch_rng_preserved=True, optimizer_steps=len(catalog)*2,
+        persistent_optimizer_steps=0, warmup_batches=1,
         records=[dict(boundary=c.boundary, graph_signature=c.graph_signature,
             feature_abi_id=c.feature_abi_id, client_forward_ms=100*c.graph_position_ratio,
             client_backward_ms=200*c.graph_position_ratio,
-            local_tail_service_ms=50*(1-c.graph_position_ratio), measured_batches=1, optimizer_steps=0)
+            local_tail_service_ms=50*(1-c.graph_position_ratio), measured_batches=1, optimizer_steps=2,
+            optimizer_stage="suffix" if server else "prefix")
             for c in catalog])
 
 
@@ -108,7 +111,14 @@ def _bootstrap_policy(tmp_path, model_id="rfdetr_nano"):
     props = dict(logical_client_id="a", num_batches=3, batch_size=1,
         framework_backend="torch", runtime_backend="torchlens_native", device_type="cpu",
         accelerator="aarch64", precision="fp32", online_calibration_receipt=json.dumps(_receipt(catalog)))
-    worker = SimpleNamespace(cid="a", get_properties=lambda *a, **k: SimpleNamespace(properties=props))
+    def properties(ins, **kwargs):
+        config = ins.config
+        if "cosplit_probe_payload" in config:
+            reply = config.get("cosplit_probe_reply_bytes")
+            return SimpleNamespace(properties={"cosplit_probe_payload":
+                config["cosplit_probe_payload"] if reply is None else bytes(reply)})
+        return SimpleNamespace(properties=props)
+    worker = SimpleNamespace(cid="a", get_properties=properties)
     return policy, worker, props
 
 
@@ -118,7 +128,8 @@ def test_current_calibration_seeds_uncertain_learners_then_online_feedback_updat
     policy.bind_clients([worker], 1)
     assert "device_cost_prior" not in vars(policy)
     assert policy.learners.server.model.num_updates == 3
-    assert policy.learners.network.state_dict() == {}
+    assert policy.learners.network.update_count("a") == 4
+    assert policy.learners.network.exchange_update_count("a") == 6
     assert policy._last_boundary == policy._last_switch_round == {}
     assert policy.exploration_controller.last_probe_round == {}
     assert policy.exploration_controller.candidate_last_explored_round == {}
@@ -132,7 +143,7 @@ def test_current_calibration_seeds_uncertain_learners_then_online_feedback_updat
     policy.observe_round(round_id=1, feedback=[PlacementFeedback(
         round_id=1, client_id="a", boundary=assignment["a"], client_forward_ms=40,
         client_backward_ms=80, server_service_ms=10, network_upload_ms=5,
-        network_download_ms=5, num_batches=3, num_examples=3)])
+        network_download_ms=5, network_roundtrip_ms=10, num_batches=3, num_examples=3)])
     assert policy.learners.server.model.num_updates == 4
     assert not np.array_equal(initial_b, policy.learners.server.model.b)
     assert policy.learners.server.model.discount_gamma == .98
@@ -145,6 +156,8 @@ def test_current_calibration_seeds_uncertain_learners_then_online_feedback_updat
     (lambda r: r["records"][-1].update(feature_abi_id="wrong"), "ABI mismatch"),
     (lambda r: r["records"][-1].update(client_forward_ms=float("nan")), "finite"),
     (lambda r: r.update(source="historical_profile"), "current deployment"),
+    (lambda r: r.update(optimizer_steps=0), "optimizer scope"),
+    (lambda r: r["records"][-1].update(optimizer_steps=0), "sample scope"),
 ])
 def test_bad_receipt_is_rejected_before_any_cost_updates(tmp_path, change, match):
     policy, worker, props = _bootstrap_policy(tmp_path)
@@ -166,7 +179,7 @@ def test_calibration_refuses_a_preexisting_learner(tmp_path):
 
 def test_mean_budget_blocks_a_probe_admitted_by_a_loose_ucb_even_when_forced():
     base, expensive, cheap = (_estimate("a", name, mean, uncertainty) for name, mean, uncertainty
-                              in (("base", 100, 1000), ("expensive", 300, 800), ("cheap", 104, 500)))
+                              in (("base", 100, 1000), ("expensive", 300, 800), ("cheap", 104, 1)))
     arguments = dict(round_id=20, baseline={"a": base}, estimates={"a": [base, expensive]},
                      solver=GlobalPlacementSolver(), batch_counts={"a": 3})
     new, decisions = SafeExplorationController().apply(**arguments)
@@ -195,7 +208,8 @@ def test_server_calibration_restores_the_model_owned_by_the_captured_provider():
     gradients = {name: parameter.grad.clone() for name, parameter in captured.named_parameters()}
     receipt = calibrate_split(captured, inputs, targets, boundaries=cuts,
         make_handle=lambda cut: provider_handle(provider, cut), loss_fn=nn.functional.mse_loss,
-        device="cpu", source="server_shape_matched_current_deployment")
+        device="cpu", source="server_shape_matched_current_deployment",
+        optimizer_fn=lambda module: torch.optim.SGD(module.parameters(), lr=.01))
     assert receipt["model_hash_before"] == receipt["model_hash_after"] == initial
     assert tensor_state_hash(model.state_dict()) == initial
     assert {name: module.training for name, module in captured.named_modules()} == modes
@@ -261,7 +275,7 @@ def test_native_strategy_calibrates_before_placement_and_trains_without_experime
     assert tensor_state_hash(provider.model.state_dict()) == original
     assert client._prewarmed_runtime.plan.dynamic_batch == (1, 4)
     assert client._prewarmed_runtime.plan.trace_batch_mode == provider.trace_batch_mode == "batch_gt1"
-    assert client.online_calibration_receipt["optimizer_steps"] == 0
+    assert client.online_calibration_receipt["optimizer_steps"] == 2 * len(calibration_boundaries(provider.get_candidates(training=True)))
     assert torch.equal(cpu_rng, torch.get_rng_state())
     if cuda_rng is not None:
         assert torch.equal(cuda_rng, torch.cuda.get_rng_state(device))
@@ -302,7 +316,7 @@ def test_native_cosplit_does_not_silently_start_an_empty_learner_without_sample_
     assert policy.learners.server.model.num_updates == 0
 
 
-def _native_cohort(*, count=1, config=None, with_targets=True):
+def _native_cohort(*, count=1, config=None, with_targets=True, require_trainable_prefix=True):
     from flwr.common import serde
     from splitfleet.client.autosplit_split_client import AutoSplitSplitLearningClient
     from splitfleet.server.placement.cosplit_ucb import CoSplitUCBPlacementPolicy
@@ -315,7 +329,7 @@ def _native_cohort(*, count=1, config=None, with_targets=True):
     sample = TaskBatch(ModelInputs(args=(inputs,)), labels) if with_targets else inputs
     task = ImageClassificationTask()
     provider = TorchLensCandidateProvider(model=copy.deepcopy(model), sample_inputs=inputs,
-        batch_axes={"/args/0": 0}, dynamic_batch=(1, 4), require_trainable_prefix=True)
+        batch_axes={"/args/0": 0}, dynamic_batch=(1, 4), require_trainable_prefix=require_trainable_prefix)
     policy = CoSplitUCBPlacementPolicy(candidate_provider=provider, config=config)
     strategy = AutoSplitStrategy(model=model, sample_inputs=sample, task=task,
         batch_axes={"/args/0": 0}, dynamic_batch=(1, 4), placement_policy=policy,
@@ -345,6 +359,31 @@ def _native_cohort(*, count=1, config=None, with_targets=True):
         workers=workers, requests=requests, client_manager=manager, runtime_manager=runtime_manager,
         initial=[value.detach().numpy().copy() for value in model.state_dict().values()],
         inputs=ModelInputs(args=(inputs,)), targets=labels, task=task)
+
+
+def test_native_calibration_accepts_anchors_with_no_trainable_prefix():
+    from flwr.common import ndarrays_to_parameters
+
+    cohort = _native_cohort(require_trainable_prefix=False)
+    catalog = {candidate.boundary: candidate for candidate in cohort.provider.get_candidates(training=True)}
+    anchors = calibration_boundaries(catalog.values())
+    empty = {cut for cut in anchors if catalog[cut].metadata["optimizer_prefix_parameter_bytes"] == 0}
+    assert empty
+    client = cohort.clients["a"]
+    initial_hash = tensor_state_hash(cohort.strategy.model.state_dict())
+    rng = torch.get_rng_state().clone()
+    instructions = cohort.strategy.configure_fit(1, ndarrays_to_parameters(cohort.initial), cohort.client_manager)
+    receipt = client.online_calibration_receipt
+    assert receipt["optimizer_steps"] == 2 * (len(anchors) - len(empty))
+    assert {row["boundary"] for row in receipt["records"] if row["optimizer_steps"] == 0} == empty
+    assert all(row["optimizer_stage"] == "prefix" and row["measured_batches"] == 1
+               for row in receipt["records"])
+    assert tensor_state_hash(client.model.state_dict()) == initial_hash
+    assert tensor_state_hash(cohort.provider.model.state_dict()) == initial_hash
+    assert torch.equal(rng, torch.get_rng_state())
+    assert cohort.policy.learners.server.model.num_updates == len(anchors)
+    _execute_instruction(cohort, *instructions[0], training=True, round_id=1)
+    assert cohort.policy.learners.server.model.num_updates == len(anchors) + 1
 
 
 def _execute_instruction(cohort, worker, instruction, *, training, round_id):
@@ -436,7 +475,8 @@ def test_native_restore_preserves_learned_statistics_without_injecting_calibrati
     policy = restored.policy
     if restore == "explicit_after_calibration":
         policy.prepare_calibration(restored.inputs, restored.targets, loss_fn=restored.task.loss,
-                                   device="cpu", parameters=restored.initial)
+                                   device="cpu", parameters=restored.initial,
+                                   optimizer_fn=restored.strategy.optimizer_fn)
     if restore != "file":
         policy.load_state_dict(state)
 

@@ -48,3 +48,15 @@ def test_paired_ttq_summary_preserves_censored_and_excluded_population():
     assert result["complete_paired_n"] == 2 and result["reached_n"] == 1 and result["censored_n"] == 1
     rows[1].update(status="reached", time_sec=20)
     assert summarize_paired_ttq(rows)[0]["mean_ttq_sec"] == 15
+
+
+def test_tasks_with_the_same_quality_metric_keep_separate_paired_populations():
+    identity = dict(stage="joint", scheme="splitfleet", metric="accuracy", threshold=.8,
+                    valid=True, complete_paired_seed=True, seed=1, status="reached")
+    rows = [{**identity, "task": "image_classification", "time_sec": 10},
+            {**identity, "task": "text_classification", "time_sec": 20}]
+    reports = {row["task"]: row for row in summarize_paired_ttq(rows)}
+    assert set(reports) == {"image_classification", "text_classification"}
+    assert reports["image_classification"]["mean_ttq_sec"] == 10
+    assert reports["text_classification"]["mean_ttq_sec"] == 20
+    assert all(row["complete_paired_n"] == 1 for row in reports.values())

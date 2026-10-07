@@ -84,6 +84,7 @@ class CoSplitUCBPlacementPolicy:
         )
         self.round_diagnostics: dict[int, dict[str, Any]] = {}
         self.evaluation_diagnostics: dict[int, dict[str, Any]] = {}
+        self.state_download_bytes: int | None = None
 
     def _catalog(self) -> tuple[SplitCandidateDescriptor, ...]:
         if not self._catalog_by_boundary:
@@ -128,7 +129,7 @@ class CoSplitUCBPlacementPolicy:
         else:
             self.bind_clients(clients, round_id)
 
-    def prepare_calibration(self, inputs, targets, *, loss_fn, device, parameters=None) -> None:
+    def prepare_calibration(self, inputs, targets, *, loss_fn, device, parameters=None, optimizer_fn=None) -> None:
         """Initialize a fresh deployment from its captured graph and local sample.
 
         Client measurements arrive through GetProperties before placement. They
@@ -169,12 +170,15 @@ class CoSplitUCBPlacementPolicy:
             return
         if targets is None:
             raise ValueError("CoSplit-UCB requires representative inputs and targets in a TaskBatch for calibration")
+        if optimizer_fn is None:
+            raise ValueError("training cost calibration requires the training optimizer factory")
         receipt = calibrate_split(
             model, inputs, targets,
             boundaries=calibration_boundaries(catalog),
             make_handle=lambda cut: provider_handle(self.candidate_provider, cut),
             loss_fn=loss_fn, device=device,
             source="server_shape_matched_current_deployment",
+            optimizer_fn=optimizer_fn,
         )
         telemetry = CalibratedTelemetry(
             initial_model_hash=receipt["model_hash_before"], server_receipt=receipt,
@@ -250,11 +254,8 @@ class CoSplitUCBPlacementPolicy:
                 client_telemetry,
                 batch_size=client_telemetry.get("batch_size"),
             ),
-            upload=self.context_encoder.network_context(
+            network=self.context_encoder.network_context(
                 candidate, client_telemetry, direction="upload"
-            ),
-            download=self.context_encoder.network_context(
-                candidate, client_telemetry, direction="download"
             ),
             server=self.context_encoder.server_context(
                 candidate,
@@ -265,6 +266,10 @@ class CoSplitUCBPlacementPolicy:
                 candidate,
                 previous=previous,
                 telemetry=client_telemetry,
+            ),
+            exchange=self.context_encoder.exchange_context(
+                download_bytes=self.state_download_bytes,
+                upload_bytes=candidate.metadata.get("optimizer_prefix_parameter_bytes"),
             ),
         )
 
@@ -307,8 +312,7 @@ class CoSplitUCBPlacementPolicy:
                 )
                 for candidate in catalog
             }
-            # Residence is a stability guard, never a reason to remain on an
-            # OOM/ABI-invalid/otherwise hard-infeasible placement.
+            # Residence must never retain an OOM/ABI-invalid placement.
             lock_previous = bool(
                 residence_window_active
                 and previous_boundary is not None
@@ -453,9 +457,10 @@ class CoSplitUCBPlacementPolicy:
             "baseline_makespan_ms": baseline_simulation.max_client_completion_ms,
             "baseline_upper_makespan_ms": baseline_upper.max_client_completion_ms,
             "safe_budget_ms": (
-                (1.0 + self.config.safe_exploration_epsilon)
-                * baseline_upper.max_client_completion_ms
+                (1.0 + self.exploration_controller.epsilon)
+                * baseline_simulation.max_client_completion_ms
             ),
+            "upper_budget_basis": "baseline_mean",
             "predicted_final_makespan_ms": predicted.max_client_completion_ms,
             "predicted_client_completion_ms": {
                 cid: timeline.completion_ms for cid, timeline in predicted.timelines.items()
@@ -473,6 +478,8 @@ class CoSplitUCBPlacementPolicy:
                             "network_download": value.network_download_mean_ms,
                             "server_service": value.server_service_mean_ms,
                             "switch": value.switch_mean_ms,
+                            "network_roundtrip": value.network_roundtrip_mean_ms,
+                            "state_exchange": value.state_exchange_mean_ms,
                         },
                         "component_uncertainty_ms": {
                             "client_forward": value.client_forward_uncertainty_ms,
@@ -481,6 +488,8 @@ class CoSplitUCBPlacementPolicy:
                             "network_download": value.network_download_uncertainty_ms,
                             "server_service": value.server_service_uncertainty_ms,
                             "switch": value.switch_uncertainty_ms,
+                            "network_roundtrip": value.network_roundtrip_uncertainty_ms,
+                            "state_exchange": value.state_exchange_uncertainty_ms,
                         },
                         "lcb_ms": value.lcb_total_without_queue_ms,
                         "ucb_ms": value.ucb_total_without_queue_ms,
@@ -571,23 +580,27 @@ class CoSplitUCBPlacementPolicy:
             if value.execution_profile is not None:
                 profile = ExecutionProfileKey.from_value(value.execution_profile)
                 self._observed_profiles[value.client_id] = profile
+            # Weight the round median by actual batches; discount once per round.
+            planned_batches = self._round_batch_counts.get((int(round_id), True), {}).get(value.client_id, 1)
+            weights = {"sample_weight": max(1, min(int(value.num_batches or 1), int(planned_batches)))}
             self.learners.edge.update(
                 profile,
                 contexts.edge,
                 forward_ms=value.client_forward_ms,
                 backward_ms=value.client_backward_ms,
                 round_id=round_id,
+                **weights,
             )
             self.learners.network.update(
                 value.client_id,
-                contexts.upload,
-                contexts.download,
-                upload_ms=value.network_upload_ms,
-                download_ms=value.network_download_ms,
+                contexts.network,
+                value.network_roundtrip_ms,
                 round_id=round_id,
+                **weights,
             )
             if value.server_service_ms is not None:
-                self.learners.server.update(contexts.server, value.server_service_ms, round_id=round_id)
+                self.learners.server.update(contexts.server, value.server_service_ms, round_id=round_id, **weights)
+            self.learners.network.update_exchange(value.client_id, contexts.exchange, value.state_exchange_ms, round_id=round_id)
             if value.switch_ms is not None:
                 self.learners.switch.update(contexts.switch, value.switch_ms, round_id=round_id)
             self.feasibility_filter.observe_memory(
@@ -599,6 +612,7 @@ class CoSplitUCBPlacementPolicy:
             for component, measurement in (
                 ("network", value.network_upload_ms),
                 ("network", value.network_download_ms),
+                ("network", value.network_roundtrip_ms),
             ):
                 if measurement is not None:
                     self._last_component_observation[(value.client_id, component)] = int(round_id)
@@ -642,6 +656,7 @@ class CoSplitUCBPlacementPolicy:
                 "group_update_count": self.learners.edge.update_count(profile),
                 "network_update_count": self.learners.network.update_count(value.client_id),
                 "server_update_count": self.learners.server.model.num_updates,
+                "state_exchange_update_count": self.learners.network.exchange_update_count(value.client_id),
             }
             LOGGER.info(
                 "[CoSplitUCB] feedback round=%d client=%s boundary=%s batches=%d",
@@ -735,7 +750,7 @@ class CoSplitUCBPlacementPolicy:
             payload,
             graph_signature=graph_signature,
             backend=backend,
-            feature_schema_version=self.context_encoder.feature_schema_version,
+            feature_schema=self.context_encoder.feature_schema,
         )
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
@@ -747,7 +762,7 @@ class CoSplitUCBPlacementPolicy:
             state,
             graph_signature=catalog[0].graph_signature,
             backend=catalog[0].framework_backend,
-            feature_schema_version=self.context_encoder.feature_schema_version,
+            feature_schema=self.context_encoder.feature_schema,
         )
         self.learners.load_state_dict(payload["learners"])
         self.feasibility_filter.load_state_dict(payload.get("feasibility", {}))

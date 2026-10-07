@@ -123,6 +123,9 @@ def make_edge_model(name: str, *, config: dict | None = None,
             model.load_state_dict(torch.load(pretrain_weights, map_location="cpu", weights_only=True), strict=True)
         model.fc = nn.Linear(model.fc.in_features, 10)
     else:
+        from experiments.deeplab_interpolation import install_deeplab_interpolation
+
+        install_deeplab_interpolation()
         model = models.segmentation.deeplabv3_resnet50(
             weights=None, weights_backbone=None, num_classes=21, aux_loss=True,
         )

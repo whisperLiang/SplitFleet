@@ -36,7 +36,7 @@ class DiscountedLinUCB:
         discount_gamma: float = 0.98,
         alpha: float = 1.0,
         target_scale: float = 1000.0,
-        feature_schema_version: str,
+        feature_schema: str,
         prediction_cache_size: int = 2048,
     ) -> None:
         if dimension < 1:
@@ -45,8 +45,8 @@ class DiscountedLinUCB:
             raise ValueError("invalid ridge/discount parameters")
         if alpha < 0 or target_scale <= 0:
             raise ValueError("invalid alpha/target scale")
-        if not feature_schema_version:
-            raise ValueError("feature_schema_version must not be empty")
+        if not feature_schema:
+            raise ValueError("feature_schema must not be empty")
         if prediction_cache_size < 0:
             raise ValueError("prediction_cache_size must be non-negative")
         self.dimension = int(dimension)
@@ -54,7 +54,7 @@ class DiscountedLinUCB:
         self.discount_gamma = float(discount_gamma)
         self.alpha = float(alpha)
         self.target_scale = float(target_scale)
-        self.feature_schema_version = str(feature_schema_version)
+        self.feature_schema = str(feature_schema)
         self.A = self.ridge_lambda * np.eye(self.dimension, dtype=np.float64)
         self.b = np.zeros(self.dimension, dtype=np.float64)
         self.num_updates = 0
@@ -81,6 +81,9 @@ class DiscountedLinUCB:
     def _solve(self, rhs: np.ndarray) -> np.ndarray:
         return np.linalg.solve(self.A, rhs)
 
+    def _fit_theta(self) -> np.ndarray:
+        return self._solve(self.b)
+
     def predict(self, context: np.ndarray) -> LinearPrediction:
         """Predict non-negative mean cost and confidence radius."""
 
@@ -98,10 +101,10 @@ class DiscountedLinUCB:
                 self._prediction_cache.move_to_end(key)
                 return cached
             if self._theta is None:
-                self._theta = self._solve(self.b)
+                self._theta = self._fit_theta()
             theta = self._theta
         else:
-            theta = self._solve(self.b)
+            theta = self._fit_theta()
         mean_scaled = float(x @ theta)
         variance = max(float(x @ self._solve(x)), 0.0)
         prediction = LinearPrediction(
@@ -133,16 +136,19 @@ class DiscountedLinUCB:
         self.last_discount_round = current
         self._invalidate_prediction_cache()
 
-    def update(self, context: np.ndarray, target: float, *, round_id: int) -> None:
+    def update(self, context: np.ndarray, target: float, *, round_id: int, sample_weight: float = 1.0) -> None:
         """Apply one observation after discounting any elapsed rounds."""
 
         x = self._vector(context)
         y = float(target)
         if not np.isfinite(y) or y < 0:
             raise ValueError("cost target must be finite and non-negative")
+        weight = float(sample_weight)
+        if not np.isfinite(weight) or weight <= 0:
+            raise ValueError("sample_weight must be finite and positive")
         self.advance_round(round_id)
-        self.A = self.A + np.outer(x, x)
-        self.b = self.b + x * (y / self.target_scale)
+        self.A = self.A + weight * np.outer(x, x)
+        self.b = self.b + weight * x * (y / self.target_scale)
         self.num_updates += 1
         self.last_update_round = int(round_id)
         self._invalidate_prediction_cache()
@@ -156,7 +162,7 @@ class DiscountedLinUCB:
             "discount_gamma": self.discount_gamma,
             "alpha": self.alpha,
             "target_scale": self.target_scale,
-            "feature_schema_version": self.feature_schema_version,
+            "feature_schema": self.feature_schema,
             "A": self.A.tolist(),
             "b": self.b.tolist(),
             "num_updates": self.num_updates,
@@ -169,7 +175,7 @@ class DiscountedLinUCB:
 
         if int(state["dimension"]) != self.dimension:
             raise ValueError("bandit state dimension mismatch")
-        if str(state["feature_schema_version"]) != self.feature_schema_version:
+        if str(state["feature_schema"]) != self.feature_schema:
             raise ValueError("bandit feature schema mismatch")
         for name in ("ridge_lambda", "discount_gamma", "alpha", "target_scale"):
             if float(state[name]) != float(getattr(self, name)):
@@ -199,4 +205,72 @@ class DiscountedLinUCB:
         self._invalidate_prediction_cache()
 
 
-__all__ = ["DiscountedLinUCB", "LinearPrediction"]
+class MonotoneStateExchangeLinUCB(DiscountedLinUCB):
+    """Fit nonnegative round-transfer costs on nonnegative byte features.
+
+    Solve the constrained ridge objective rather than clipping an unconstrained
+    fit. At fixed download bytes, a larger parameter upload cannot predict a
+    cheaper transfer. The covariance still describes observation coverage;
+    its radius is a heuristic, not a calibrated confidence guarantee.
+    """
+
+    def _vector(self, context: np.ndarray) -> np.ndarray:
+        value = super()._vector(context)
+        if np.any(value < 0):
+            raise ValueError("state-exchange context must be non-negative")
+        return value
+
+    def _fit_theta(self) -> np.ndarray:
+        # Active-set NNLS on the positive-definite regularized Gram matrix.
+        # All observations and the ridge are already represented by A and b.
+        theta = np.zeros(self.dimension, dtype=np.float64)
+        passive = np.zeros(self.dimension, dtype=bool)
+        # Byte and constant features have different units. A single tolerance
+        # dominated by the download column can hide a needed intercept update.
+        tolerance = 1e-10 * np.maximum(1.0, np.abs(self.b))
+        gradient = self.b.copy()
+        steps = 0
+        limit = 10 * self.dimension * self.dimension
+        while np.any((~passive) & (gradient > tolerance)):
+            eligible = np.where((~passive) & (gradient > tolerance), gradient, -np.inf)
+            passive[int(np.argmax(eligible))] = True
+            while True:
+                steps += 1
+                if steps > limit:
+                    raise RuntimeError("nonnegative state-exchange fit did not converge")
+                trial = np.zeros_like(theta)
+                trial[passive] = np.linalg.solve(
+                    self.A[np.ix_(passive, passive)], self.b[passive]
+                )
+                if np.all(trial[passive] > 0):
+                    theta = trial
+                    break
+                blocking = passive & (trial <= 0)
+                denominator = theta[blocking] - trial[blocking]
+                ratios = np.divide(theta[blocking], denominator,
+                                   out=np.zeros_like(denominator), where=denominator > 0)
+                fraction = float(np.min(ratios))
+                theta += fraction * (trial - theta)
+                # Remove every coefficient that reaches the constraint, with
+                # the minimizing ratio identifying an exact boundary despite
+                # floating-point interpolation.
+                removed = np.flatnonzero(blocking)[ratios <= fraction]
+                theta[removed] = 0.0
+                passive[removed] = False
+            gradient = self.b - self.A @ theta
+        return theta
+
+    def state_dict(self) -> dict[str, Any]:
+        return {**super().state_dict(), "coefficient_constraint": "nonnegative"}
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        if state.get("coefficient_constraint") != "nonnegative":
+            raise ValueError("state-exchange coefficient constraint mismatch")
+        if np.any(np.asarray(state["A"], dtype=np.float64) < 0) or np.any(
+            np.asarray(state["b"], dtype=np.float64) < 0
+        ):
+            raise ValueError("state-exchange statistics must be non-negative")
+        super().load_state_dict(state)
+
+
+__all__ = ["DiscountedLinUCB", "LinearPrediction", "MonotoneStateExchangeLinUCB"]

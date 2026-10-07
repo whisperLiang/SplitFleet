@@ -1,4 +1,4 @@
-"""Versioned persistence for CoSplit-UCB sufficient statistics."""
+"""Validated persistence for CoSplit-UCB sufficient statistics."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Mapping
 
-from .types import ALGORITHM_VERSION, FEATURE_SCHEMA_VERSION
+from .types import ALGORITHM_NAME, FEATURE_SCHEMA
 
 
 class BanditStateStore:
@@ -23,11 +23,11 @@ class BanditStateStore:
         *,
         graph_signature: str,
         backend: str,
-        feature_schema_version: str = FEATURE_SCHEMA_VERSION,
+        feature_schema: str = FEATURE_SCHEMA,
     ) -> dict[str, Any]:
         return {
-            "algorithm_version": ALGORITHM_VERSION,
-            "feature_schema_version": str(feature_schema_version),
+            "algorithm": ALGORITHM_NAME,
+            "feature_schema": str(feature_schema),
             "graph_signature": str(graph_signature),
             "backend": str(backend),
             "state": dict(state),
@@ -39,11 +39,11 @@ class BanditStateStore:
         *,
         graph_signature: str,
         backend: str,
-        feature_schema_version: str = FEATURE_SCHEMA_VERSION,
+        feature_schema: str = FEATURE_SCHEMA,
     ) -> Mapping[str, Any]:
-        if value.get("algorithm_version") != ALGORITHM_VERSION:
-            raise ValueError("CoSplit-UCB algorithm version mismatch")
-        if value.get("feature_schema_version") != str(feature_schema_version):
+        if value.get("algorithm") != ALGORITHM_NAME:
+            raise ValueError("CoSplit-UCB algorithm mismatch")
+        if value.get("feature_schema") != str(feature_schema):
             raise ValueError("CoSplit-UCB feature schema mismatch")
         if str(value.get("graph_signature")) != str(graph_signature):
             raise ValueError("CoSplit-UCB graph signature mismatch")

@@ -1,16 +1,18 @@
 # SplitFleet
 
-SplitFleet is a unified split federated learning framework built on top of [Flower](https://flower.ai/) and TorchLens. It separates framework backends, operation-level model partitioning, task adapters, boundary transport, and federated aggregation.
+SplitFleet combines a unified split federated learning (SFL) abstraction, SFL-grade fine-grained partitioning, and CoSplit-UCB fleet-wide adaptive placement. Built on [Flower](https://flower.ai/), it separates backend, task, partition, aggregation, and placement contracts. Five backend adapters implement the same SFL execution contract.
 
 The unified task interface covers image classification, text classification, object detection, semantic segmentation, and instance segmentation.
 Architecture notes and study protocols are kept locally in `plans/` and excluded from Git.
 Dataset-level integrations can be registered through `TaskSpec`/`TaskRegistry`, which bind a task adapter, model and dataset factories, metrics, and candidate cuts without coupling the split runtime to a dataset package.
-CoSplit-UCB is the default adaptive policy. Physical PyTorch runs initialize its discounted learners from three current-device split calibrations, bound exploration by predicted mean and confidence-upper round time (5% by default), and reuse prediction and scheduling caches. Calibration performs no optimizer steps and restores model state, gradients and random streams. Costs continue to come from online training feedback.
+CoSplit-UCB is the default adaptive policy. Physical PyTorch runs calibrate four structural anchors with temporary stage-owned optimizers, restore model state and random streams, and learn from measured training feedback. Costs use actual optimizer-owned parameter bytes and batch payload sizes; state exchange is learned once per client round with nonnegative coefficients. Exploration limits both mean and confidence-upper round time to 105% of the baseline mean by default.
 Fresh calibration synchronizes Flower's current global weights and uses the server's captured batch contract. Evaluation binds worker metadata without calibrating. A compatible restored learner keeps its statistics and continues from online feedback without repeating initialization.
 
-The active code uses the original `cosplit_context_v1` context schema. Historical timing comparisons and frozen source snapshots remain under `paper/evidence/` and `results/`; use those snapshots to reproduce an old run. See the [experiment guide](experiments/README.md) for the current training entry points.
+There is one CoSplit-UCB implementation, with the `cosplit_context` feature schema and full candidate search from the first round. See the [algorithm guide](experiments/COSPLIT_UCB.md) and [physical experiment guide](experiments/README.md).
 
 The autosplit runtime is backed by the repository-local `torchlens-2.34.1-py3-none-any.whl` via `uv.sources`. SplitFleet uses its native split APIs and maintains no local TorchLens patches or wheel builder. Candidate catalogs use `analyze()` for plans and capability reports; selected training cuts use `at()` to build executable segments. SplitFleet handles Flower strategy integration, client/server transport, server-tail replicas, and aggregation policy.
+
+The local wheel's native split extensions are distinct from the execution-capture capabilities documented by [upstream TorchLens](https://github.com/johnmarktaylor91/torchlens). Graph capture alone does not establish a valid training partition. Catalog admission checks the captured graph, training support, state ownership and boundary ABI; numerical correctness requires execution checks. Canonical split identities and graph/schema hashes identify boundaries across compatible devices, while runtime operation positions are cost features.
 
 Boundary features and gradients use typed tensor envelopes, graph contracts, SHA-256 checks and resource limits.
 
@@ -86,6 +88,15 @@ uv sync --extra dev --extra integration --extra multibackend --reinstall-package
 
 ## Quick Start
 
+Run the same residual MLP with identical weights and inputs across all five backends:
+
+```bash
+uv run --no-sync python -m experiments.analysis.canonical_backend_correctness \
+  --output results/canonical_backend_correctness_new_run
+```
+
+This source-frozen check compares output, loss, all parameter gradients, one SGD update, and activation/gradient serialization at every enumerated boundary. Each run requires a new directory. Passed, unsupported and failed cuts remain separate; an installed backend is not proof that its cuts pass. The fixture does not establish dataset accuracy or a common ResNet18 across backends.
+
 Run the download-free task correctness matrix (image/text classification, detection,
 semantic and instance segmentation; PyTorch and JAX):
 
@@ -115,6 +126,18 @@ Run the default test suite:
 ```bash
 uv run --no-sync pytest
 ```
+
+Run the complete suite, including the gated exhaustive ResNet18 and heavy
+detection checks, with all backend and task dependencies installed:
+
+```bash
+SPLITFLEET_RUN_RESNET18_ALL_NODES=1 SPLITFLEET_RUN_HEAVY_REAL_MODELS=1 \
+SPLITFLEET_RESNET18_THREADS=1 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+MKL_NUM_THREADS=1 JAX_PLATFORMS=cpu TOKENIZERS_PARALLELISM=false \
+  uv run --no-sync pytest tests --tb=short -ra
+```
+
+The heavy switches execute the gated tests; they keep the default suite smaller.
 
 Run the real-model task matrix:
 
@@ -319,7 +342,7 @@ mode are the two deltas summed. Shared buffers are not treated as tied.
 
 ## Runtime Invariants
 
-- Runtime validation requires the installed `torchlens==2.34.1`. `uv.sources` and the wheel hash in `uv.lock` select the repository wheel. Runtime contracts identify adapter v8, so contracts from earlier adapters must be regenerated.
+- Runtime validation requires the installed `torchlens==2.34.1`. `uv.sources` and the wheel hash in `uv.lock` select the repository wheel. Runtime contracts record adapter identity; incompatible contracts must be regenerated.
 - Runtimes use TorchLens `prepare`; split-point discovery, analysis, and repartition use the public `split_points`, `analyze`, and `at` methods. Unsupported points remain visible in candidate diagnostics.
 - `BoundaryPayload` serialization is self-contained: tensors, a stable `BoundarySpec`, and portable replay metadata survive cross-process transport. The optional native TorchLens object and local autograd state are not required on the receiving side.
 - Feature ABI identifiers are schema-only. They include labels, dtype, symbolic shape, layout, passthrough/preprocessing schema, trace mode, dynamic batch, model/runtime identifiers, and TorchLens version, but exclude sample tensor values, concrete sample batch values, target values, device, temporary runtime ids, and validation inputs.
@@ -401,11 +424,13 @@ rg -i "[a]riadne" splitfleet tests examples README.md pyproject.toml uv.lock
 If you use the framework in research, the original SplitBud paper is still the best citation context for the project lineage:
 
 ```bibtex
-@article{Radovic-SplitBud,
-  author = {Radovic, Boris and Canini, Marco and Horvath, Samuel and Pejovic, Veljko and Vepakomma, Praneeth},
-  maintitle = {EuroSys},
-  booktitle = {EuroMLSys},
+@inproceedings{Radovic-SplitBud,
+  author = {Radovič, Boris and Canini, Marco and Horváth, Samuel and Pejović, Veljko and Vepakomma, Praneeth},
+  booktitle = {Proceedings of the 5th Workshop on Machine Learning and Systems (EuroMLSys '25)},
   title = {Towards a Unified Framework for Split Learning},
-  year = {2025}
+  year = {2025},
+  pages = {183--191},
+  doi = {10.1145/3721146.3721936},
+  url = {https://euromlsys.eu/pdf/euromlsys25-7.pdf}
 }
 ```

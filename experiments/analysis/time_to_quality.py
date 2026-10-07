@@ -46,10 +46,10 @@ def summarize_paired_ttq(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]
     """
     groups = defaultdict(list)
     for row in rows:
-        key = (row["stage"], row["scheme"], row["metric"], row["threshold"])
+        key = (row["stage"], row.get("task", ""), row["scheme"], row["metric"], row["threshold"])
         groups[key].append(row)
     summaries = []
-    for (stage, scheme, metric, threshold), values in sorted(groups.items()):
+    for (stage, task, scheme, metric, threshold), values in sorted(groups.items()):
         eligible = [row for row in values if row.get("valid") and row.get("complete_paired_seed")]
         if len({row["seed"] for row in eligible}) != len(eligible):
             raise ValueError("TTQ summary has duplicate paired seeds")
@@ -59,7 +59,7 @@ def summarize_paired_ttq(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]
         if any(row["time_sec"] is None or not math.isfinite(row["time_sec"]) or row["time_sec"] < 0
                for row in reached):
             raise ValueError("Reached thresholds require finite nonnegative times")
-        summaries.append({"stage": stage, "scheme": scheme, "metric": metric, "threshold": threshold,
+        summaries.append({"stage": stage, "task": task, "scheme": scheme, "metric": metric, "threshold": threshold,
             "complete_paired_n": len(eligible), "reached_n": len(reached),
             "censored_n": sum(row["status"] == "not_reached" for row in eligible),
             "unavailable_n": sum(row["status"] == "unavailable" for row in eligible),

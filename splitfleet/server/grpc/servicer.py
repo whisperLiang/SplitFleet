@@ -11,6 +11,7 @@ from splitfleet.common import BatchData, ControlCode
 from splitfleet.common.constants import (
     TRANSPORT_SERVER_RECEIVE_NS_METADATA_KEY,
     TRANSPORT_SERVER_SEND_NS_METADATA_KEY,
+    TRANSPORT_SERVER_ELAPSED_NS_METADATA_KEY,
 )
 from splitfleet.common.serde import (
     control_code_from_proto,
@@ -46,6 +47,7 @@ class ServerModelServicer(server_model_pb2_grpc.ServerModelServicer):
         request: server_model_pb2.BatchData
     ) -> BatchData:
         server_receive_ns = time.time_ns()
+        server_started_ns = time.perf_counter_ns()
         data = BatchData(
             data = from_grpc_format(request.data),
             control_code=control_code_from_proto(request.control_code),
@@ -76,6 +78,7 @@ class ServerModelServicer(server_model_pb2_grpc.ServerModelServicer):
         response.metadata[TRANSPORT_SERVER_SEND_NS_METADATA_KEY] = str(
             time.time_ns()
         )
+        response.metadata[TRANSPORT_SERVER_ELAPSED_NS_METADATA_KEY] = str(time.perf_counter_ns() - server_started_ns)
         return response
 
     def _trigger_computation(self, request_group: ClientRequestGroup, method_name: str):

@@ -63,15 +63,29 @@ def _seed_training_stream(bundle, rank: int) -> None:
 def _configure_primary_math(bundle) -> dict:
     from experiments.unified_multitask.edge_models import EDGE_MODELS
     if bundle.get("model_id") in EDGE_MODELS:
+        torch.set_float32_matmul_precision("highest")
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
+    if bundle.get("model_id") in ("rfdetr_nano", "deeplabv3_resnet50"):
+        # RF-DETR uses equivalent gather sampling; strict mode supplies its
+        # deterministic backward. DeepLab uses equivalent index-selection
+        # interpolation and the standard sparse CE's flattened spatial reduction.
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+        torch.use_deterministic_algorithms(True)
     return {"matmul_tf32": torch.backends.cuda.matmul.allow_tf32,
             "cudnn_tf32": torch.backends.cudnn.allow_tf32,
             "cudnn_deterministic": torch.backends.cudnn.deterministic,
             "cudnn_benchmark": torch.backends.cudnn.benchmark,
-            "strict_deterministic_algorithms": torch.are_deterministic_algorithms_enabled()}
+            "strict_deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+            "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+            "rfdetr_sampling": "gather_bilinear_zeros_align_corners_false"
+                if bundle.get("model_id") == "rfdetr_nano" else None,
+            "rfdetr_position_counts": "int64_cumsum_then_float32"
+                if bundle.get("model_id") == "rfdetr_nano" else None,
+            "deeplab_interpolation": "separable_bilinear_index_select_align_corners_false"
+                if bundle.get("model_id") == "deeplabv3_resnet50" else None}
 
 
 def scheme_name(method: str, fixed_boundary: str | None) -> str:
@@ -447,6 +461,7 @@ class SplitClient(AutoSplitSplitLearningClient):
         self.barrier = barrier
 
     def fit(self, parameters, config):
+        handler_started = time.perf_counter_ns()
         self.source.round_id = int(config[AUTOSPLIT_MODEL_VERSION_CONFIG_KEY])
         _wait_for_round_release(self.barrier, self.source.round_id, self.identity)
         started_ns = time.time_ns()
@@ -456,6 +471,9 @@ class SplitClient(AutoSplitSplitLearningClient):
                        device=str(self.device), pid=os.getpid(),
                        fit_started_unix_ns=started_ns, fit_finished_unix_ns=finished_ns,
                        partition_hash=self.partition_hash)
+        # Include this wrapper's readiness barrier; queue/batch timings are
+        # already inside the handler and must not become state-transfer costs.
+        metrics["client_fit_handler_ms"] = (time.perf_counter_ns() - handler_started) / 1e6
         return updated, examples, metrics
 
     def get_properties(self, config):
@@ -493,6 +511,7 @@ class RecordingFedAvg(FedAvg):
         self.fit_records: list[dict[str, Any]] = []
         self.fit_failures: list[dict[str, Any]] = []
         self.evaluation_records: list[dict[str, Any]] = []
+        self.state_download_records: list[dict[str, Any]] = []
         self.measurement_started_ns = time.monotonic_ns()
         super().__init__(
             initial_parameters=ndarrays_to_parameters(
@@ -504,10 +523,19 @@ class RecordingFedAvg(FedAvg):
             **kwargs,
         )
 
+    def configure_fit(self, server_round, parameters, client_manager):
+        instructions = super().configure_fit(server_round, parameters, client_manager)
+        self.state_download_records.extend({"round_id": int(server_round), "cid": str(proxy.cid),
+            "model_state_download_bytes": sum(len(value) for value in ins.parameters.tensors)}
+            for proxy, ins in instructions)
+        return instructions
+
     def aggregate_fit(self, server_round, results, failures):
         results = _ordered_fit_results(results)
         self.fit_records.extend({"round_id": int(server_round), "cid": str(proxy.cid),
-                                 "num_examples": int(res.num_examples), "metrics": dict(res.metrics)}
+                                 "num_examples": int(res.num_examples), "metrics": {
+                                     **dict(res.metrics),
+                                     "model_state_upload_bytes": sum(len(value) for value in res.parameters.tensors)}}
                                 for proxy, res in results)
         self.fit_failures.extend({"round_id": int(server_round), "reason": str(value)} for value in failures)
         return super().aggregate_fit(server_round, results, failures)
@@ -537,13 +565,23 @@ class RecordingSplit(AutoSplitStrategy):
         self.fit_failures: list[dict[str, Any]] = []
         self.server_fit_records: list[dict[str, Any]] = []
         self.evaluation_records: list[dict[str, Any]] = []
+        self.state_download_records: list[dict[str, Any]] = []
         self.measurement_started_ns = time.monotonic_ns()
         super().__init__(**kwargs)
+
+    def configure_fit(self, server_round, parameters, client_manager):
+        instructions = super().configure_fit(server_round, parameters, client_manager)
+        self.state_download_records.extend({"round_id": int(server_round), "cid": str(proxy.cid),
+            "model_state_download_bytes": sum(len(value) for value in ins.parameters.tensors)}
+            for proxy, ins in instructions)
+        return instructions
 
     def aggregate_fit(self, server_round, results, failures):
         results = _ordered_fit_results(results)
         self.fit_records.extend({"round_id": int(server_round), "cid": str(proxy.cid),
-                                 "num_examples": int(res.num_examples), "metrics": dict(res.metrics)}
+                                 "num_examples": int(res.num_examples), "metrics": {
+                                     **dict(res.metrics),
+                                     "model_state_upload_bytes": sum(len(value) for value in res.parameters.tensors)}}
                                 for proxy, res in results)
         self.fit_failures.extend({"round_id": int(server_round), "reason": str(value)} for value in failures)
         return super().aggregate_fit(server_round, results, failures)
@@ -622,6 +660,7 @@ def run_server(args: argparse.Namespace) -> None:
             policy.prepare_calibration(
                 sample, calibration_targets, loss_fn=workload.task.make_adapter().loss,
                 device=args.device,
+                optimizer_fn=strategy.optimizer_fn,
             )
         boundaries = () if policy is not None else (resolved_boundary,)
         for boundary in boundaries:
@@ -670,6 +709,8 @@ def run_server(args: argparse.Namespace) -> None:
         "initial_model_hash": bundle["initial_model_hash"],
         "final_model_hash": tensor_state_hash(strategy.model.state_dict()),
         "fit_records": strategy.fit_records, "fit_failures": strategy.fit_failures,
+        "state_download_records": strategy.state_download_records,
+        "communication_accounting": "training_client_application_buffers_v1",
         "server_fit_records": getattr(strategy, "server_fit_records", []),
         "evaluation_records": strategy.evaluation_records,
         "round_diagnostics": policy.round_diagnostics if args.method == "splitfleet" else {},
@@ -685,7 +726,11 @@ def run_server(args: argparse.Namespace) -> None:
              "boundary_forward_bytes": candidate.boundary_forward_bytes,
              "boundary_gradient_bytes": candidate.boundary_gradient_bytes,
              "prefix_trainable_parameter_count":
-                 candidate.metadata.get("prefix_trainable_parameter_count")}
+                 candidate.metadata.get("prefix_trainable_parameter_count"),
+             "optimizer_prefix_parameter_bytes": candidate.metadata.get("optimizer_prefix_parameter_bytes"),
+             "optimizer_suffix_parameter_bytes": candidate.metadata.get("optimizer_suffix_parameter_bytes"),
+             "payload_batch_size": candidate.metadata.get("payload_batch_size"),
+             "boundary_forward_bytes_by_batch_size": candidate.metadata.get("boundary_forward_bytes_by_batch_size")}
             for candidate in policy.candidate_provider.get_candidates(training=True)
         ] if policy is not None else [],
         "history": str(history), "started_unix": start, "finished_unix": time.time(),

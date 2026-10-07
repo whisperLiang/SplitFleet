@@ -77,7 +77,7 @@ def test_warm_start_restore_preserves_predictions_uncertainty_and_assignment(tmp
             )
         ],
     )
-    assert json.loads(path.read_text())["algorithm_version"] == "cosplit_ucb_v1"
+    assert json.loads(path.read_text())["algorithm"] == "cosplit_ucb"
 
     restored = _policy(BanditStateStore(path))
     expected = original.plan_round(round_id=2, client_ids=["a"], training=False)
@@ -106,9 +106,9 @@ def test_failure_feasibility_is_persisted_immediately(tmp_path) -> None:
     ]
 
 
-def test_state_uses_injected_context_feature_schema_version() -> None:
+def test_state_uses_injected_context_feature_schema() -> None:
     class NextEncoder(ContextEncoder):
-        feature_schema_version = "cosplit_context_v2_test"
+        feature_schema = "custom-context"
 
     policy = CoSplitUCBPlacementPolicy(
         candidate_provider=_provider(),
@@ -116,6 +116,6 @@ def test_state_uses_injected_context_feature_schema_version() -> None:
     )
     policy.plan_round(round_id=1, client_ids=["a"], training=True)
     state = policy.state_dict()
-    assert state["feature_schema_version"] == "cosplit_context_v2_test"
+    assert state["feature_schema"] == "custom-context"
     with pytest.raises(ValueError, match="feature schema"):
         _policy().load_state_dict(state)

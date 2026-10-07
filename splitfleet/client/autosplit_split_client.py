@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import json
+import math
 import platform
 import time
 import uuid
@@ -60,6 +61,7 @@ from splitfleet.common.constants import (
     COSPLIT_CALIBRATION_PARAMETERS_CONFIG_KEY,
     TRANSPORT_CLIENT_SEND_NS_METADATA_KEY,
     TRANSPORT_SERVER_RECEIVE_NS_METADATA_KEY,
+    TRANSPORT_SERVER_ELAPSED_NS_METADATA_KEY,
     TRANSPORT_SERVER_SEND_NS_METADATA_KEY,
 )
 
@@ -142,6 +144,22 @@ def _transport_phase_ms(
     )
 
 
+def _transport_roundtrip_ms(metadata, *, rpc_elapsed_ms):
+    """Combined transport overhead from local spans, independent of clock offset.
+
+    The server span includes its queue and processing. No upload/download split
+    is inferred, and impossible durations stay missing rather than becoming zero.
+    """
+    try:
+        server_ms = int(metadata[TRANSPORT_SERVER_ELAPSED_NS_METADATA_KEY]) / 1_000_000.0
+        elapsed = float(rpc_elapsed_ms)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not math.isfinite(elapsed) or elapsed < 0 or server_ms < 0 or server_ms > elapsed:
+        return None
+    return elapsed - server_ms
+
+
 @dataclass(frozen=True)
 class _RoundRuntime:
     """Everything a round needs that does not change between its batches.
@@ -167,6 +185,11 @@ class _RoundTelemetry:
     tail_wait_sec: float = 0.0
     upload_bytes: int = 0
     download_bytes: int = 0
+    activation_upload_bytes: int = 0
+    target_upload_bytes: int = 0
+    request_metadata_upload_bytes: int = 0
+    gradient_download_bytes: int = 0
+    response_metadata_download_bytes: int = 0
     boundary_serialize_sec: float = 0.0
     gradient_deserialize_sec: float = 0.0
     min_batch_size: int = 0
@@ -179,6 +202,7 @@ class _RoundTelemetry:
     _server_service_samples_ms: list[float] = field(default_factory=list, repr=False)
     _network_upload_samples_ms: list[float] = field(default_factory=list, repr=False)
     _network_download_samples_ms: list[float] = field(default_factory=list, repr=False)
+    _network_roundtrip_samples_ms: list[float] = field(default_factory=list, repr=False)
 
     def record_batch(self, batch_size: int) -> None:
         self.num_batches += 1
@@ -209,6 +233,11 @@ class _RoundTelemetry:
             "tail_wait_sec": self.tail_wait_sec,
             "upload_bytes": self.upload_bytes,
             "download_bytes": self.download_bytes,
+            "activation_upload_bytes": self.activation_upload_bytes,
+            "target_upload_bytes": self.target_upload_bytes,
+            "request_metadata_upload_bytes": self.request_metadata_upload_bytes,
+            "gradient_download_bytes": self.gradient_download_bytes,
+            "response_metadata_download_bytes": self.response_metadata_download_bytes,
             "boundary_serialize_sec": self.boundary_serialize_sec,
             "gradient_deserialize_sec": self.gradient_deserialize_sec,
             "min_batch_size": self.min_batch_size,
@@ -223,6 +252,7 @@ class _RoundTelemetry:
             "server_service",
             "network_upload",
             "network_download",
+            "network_roundtrip",
         ):
             samples = getattr(self, f"_{name}_samples_ms")
             if samples:
@@ -331,13 +361,15 @@ class AutoSplitSplitLearningClient(NumPyClient):
         self._prewarmed_runtime = handle
 
     def calibrate_runtime(self, targets, *, boundaries) -> dict:
-        """Measure this client's captured model without performing optimizer steps."""
+        """Measure the captured model, restoring state after temporary calibration."""
         from splitfleet.server.placement.cosplit_ucb.calibration import calibrate_split
 
         if self._prewarmed_runtime is None:
             raise ValueError("Prepare the runtime before measuring calibration anchors")
         if self.task is None:
             raise ValueError("CoSplit-UCB calibration requires a task loss")
+        if self.optimizer_fn is None:
+            raise ValueError("training cost calibration requires an optimizer factory")
         targets = move_value(targets, self.backend_adapter, self.device)
         self.online_calibration_receipt = calibrate_split(
             self.model, ModelInputs(self.sample_inputs, self.sample_kwargs), targets,
@@ -345,10 +377,20 @@ class AutoSplitSplitLearningClient(NumPyClient):
             make_handle=lambda cut: self.autosplit_session.repartition_runtime(self._prewarmed_runtime, cut),
             loss_fn=self.task.loss, device=self.device,
             source="client_private_sample_current_deployment",
+            optimizer_fn=self.optimizer_fn,
         )
         return self.online_calibration_receipt
 
     def get_properties(self, config):
+        if "cosplit_probe_payload" in config:
+            payload = config["cosplit_probe_payload"]
+            if not isinstance(payload, bytes) or not 1 <= len(payload) <= 2097152:
+                raise ValueError("Invalid CoSplit transport probe")
+            reply_size = config.get("cosplit_probe_reply_bytes", len(payload))
+            if type(reply_size) is not int or not 1 <= reply_size <= 2097152:
+                raise ValueError("Invalid CoSplit transport reply size")
+            # This echo changes no model, optimizer or random generator state.
+            return {"cosplit_probe_payload": (payload if reply_size == len(payload) else bytes(reply_size))}
         cuts = config.get("cosplit_calibration_boundaries")
         if cuts:
             from flwr.common import parameters_to_ndarrays, serde
@@ -376,6 +418,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
             receipt = self.online_calibration_receipt
             current_hash = tensor_state_hash(self.model.state_dict())
             if (receipt is None or receipt["model_hash_after"] != current_hash
+                    or receipt.get("schema") != "splitfleet.cosplit-calibration"
                     or {row["boundary"] for row in receipt["records"]} != set(boundaries)
                     or any(row["graph_signature"] != self._prewarmed_runtime.plan.graph_signature
                            for row in receipt["records"])):
@@ -544,6 +587,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
                        state_upload_bytes=sum(value.nbytes for value in values))
         if ownership:
             metrics[DIGEST_KEY] = ownership[DIGEST_KEY]
+        metrics["client_fit_handler_ms"] = (time.perf_counter() - fit_start) * 1000
         return values, num_examples, metrics
 
     def evaluate(self, parameters, config):
@@ -830,10 +874,23 @@ class AutoSplitSplitLearningClient(NumPyClient):
         )
         client_receive_ns = time.time_ns()
         if telemetry is not None:
-            telemetry.tail_wait_sec += time.perf_counter() - started
+            rpc_elapsed_sec = time.perf_counter() - started
+            telemetry.tail_wait_sec += rpc_elapsed_sec
+            telemetry.record_component("network_roundtrip", _transport_roundtrip_ms(
+                response.metadata, rpc_elapsed_ms=rpc_elapsed_sec * 1000.0))
             telemetry.upload_bytes += len(boundary_payload) + len(target_payload)
             telemetry.download_bytes += sum(
                 len(value) for value in response.data.values() if isinstance(value, bytes)
+            )
+            # Count the actual serialized application buffers. Keep targets and
+            # response metadata separate; these are not NIC/TLS/gRPC byte counts.
+            telemetry.activation_upload_bytes += len(boundary_payload)
+            telemetry.target_upload_bytes += len(target_payload)
+            telemetry.request_metadata_upload_bytes += len(request.data["metadata"])
+            telemetry.gradient_download_bytes += len(response.data.get("gradients", b""))
+            telemetry.response_metadata_download_bytes += sum(
+                len(value) for key, value in response.data.items()
+                if key != "gradients" and isinstance(value, bytes)
             )
         metadata = json.loads(response.data["metadata"].decode("utf-8"))
         if telemetry is not None:

@@ -15,7 +15,7 @@ def _model(*, gamma: float = 0.98) -> DiscountedLinUCB:
         discount_gamma=gamma,
         alpha=1.0,
         target_scale=1.0,
-        feature_schema_version="test-v1",
+        feature_schema="test",
     )
 
 
@@ -109,7 +109,7 @@ def test_restore_rejects_incompatible_confidence_and_corrupt_covariance() -> Non
         discount_gamma=0.98,
         alpha=2.0,
         target_scale=1.0,
-        feature_schema_version="test-v1",
+        feature_schema="test",
     )
     with pytest.raises(ValueError, match="alpha mismatch"):
         incompatible.load_state_dict(state)

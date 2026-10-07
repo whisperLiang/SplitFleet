@@ -232,6 +232,17 @@ class JaxBackendAdapter(ArrayBackendAdapter):
 
 class TinygradBackendAdapter(ArrayBackendAdapter):
     backend_name = "tinygrad"
+    def clone_model(self, model):
+        # deepcopy bypasses Tensor.__init__, so copied tensors are absent from
+        # tinygrad's live-tensor registry used by backward and realization.
+        # Construct native parameter leaves and preserve every tied alias.
+        memo = {}
+        for tensor in self._state(model).values():
+            if id(tensor) not in memo:
+                copied = self._from_numpy(self._to_numpy(tensor).copy(), device=tensor.device)
+                copied.requires_grad = tensor.requires_grad
+                memo[id(tensor)] = copied
+        return copy.deepcopy(model, memo)
     def _to_numpy(self, value): return np.asarray(value.numpy())
     def _from_numpy(self, value, *, device=None):
         from tinygrad import Tensor
@@ -243,7 +254,14 @@ class TinygradBackendAdapter(ArrayBackendAdapter):
         from tinygrad.nn.state import get_state_dict
         return get_state_dict(model)
     def _load_arrays(self, model, values):
-        for name, tensor in self._state(model).items(): tensor.assign(self._from_numpy(values[name], device=tensor.device))
+        for name, tensor in self._state(model).items():
+            restored = self._from_numpy(values[name], device=tensor.device)
+            if restored.dtype != tensor.dtype:
+                raise ValueError(f"tinygrad parameter dtype mismatch for {name}")
+            # Round loads replace data while retaining the Tensor object used
+            # by optimizers and live graph bindings. A lazy assign adds STORE /
+            # AFTER history and changes subsequent capture's named cut IDs.
+            tensor.replace(restored)
     def build_optimizer(self, model, config):
         from tinygrad import Tensor
         from tinygrad.nn.optim import Adam, SGD

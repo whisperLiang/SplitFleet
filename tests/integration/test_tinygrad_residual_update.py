@@ -13,6 +13,7 @@ def test_tinygrad_parameter_view_replay_preserves_values_after_state_load(reques
         return
     pytest.importorskip("tinygrad")
     from tinygrad import Tensor
+    from tinygrad.nn.optim import SGD
 
     from splitfleet.autosplit import prepare_torchlens_runtime
     from splitfleet.backends.utils import adapter_for
@@ -37,7 +38,11 @@ def test_tinygrad_parameter_view_replay_preserves_values_after_state_load(reques
         model, inputs, boundary="50%", trainable=True,
         dynamic_batch=(1, 1), batch_axes={},
     )
-    for replacement in (None, np.array([[.75, 1.], [.75, 1.]], dtype=np.float32)):
+    for replacement in (
+        None,
+        np.array([[.75, 1.], [.75, 1.]], dtype=np.float32),
+        np.array([[.75, -.25], [1.5, 2.]], dtype=np.float32),
+    ):
         if replacement is not None:
             adapter.load_ndarrays(model, [replacement])
         expected = model(inputs).numpy().copy()
@@ -45,6 +50,36 @@ def test_tinygrad_parameter_view_replay_preserves_values_after_state_load(reques
             boundary = runtime.backend.run_prefix(inputs, training=training)
             actual = runtime.backend.run_suffix(boundary).numpy()
             np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-7)
+
+        reference = Model()
+        adapter.load_ndarrays(reference, [model.weight.numpy().copy()])
+        native_optimizer = SGD([reference.weight], lr=1e-4)
+        split_optimizer = adapter.build_optimizer(model, {"name": "sgd", "lr": 1e-4})
+        split_loss_values = []
+
+        def split_loss(output, _target):
+            value = output.square().mean()
+            # Materialize the loss before SGD replaces its referenced buffers.
+            split_loss_values.append(value.item())
+            return value
+
+        with Tensor.train():
+            native_optimizer.zero_grad()
+            native_loss = reference(inputs).square().mean()
+            expected_loss = native_loss.item()
+            native_loss.backward()
+            native_optimizer.step()
+            expected_weight = reference.weight.numpy().copy()
+
+            boundary = runtime.backend.run_prefix(inputs, training=True)
+            loss, gradients = runtime.backend.train_suffix(
+                boundary, None, loss_fn=split_loss,
+                optimizer=split_optimizer,
+            )
+            runtime.backend.backward_prefix(boundary, gradients, optimizer=split_optimizer)
+        assert np.isfinite(adapter.scalar_value(loss))
+        np.testing.assert_allclose(split_loss_values, [expected_loss], rtol=1e-6)
+        np.testing.assert_allclose(model.weight.numpy(), expected_weight, rtol=1e-6, atol=1e-7)
 
 
 def test_tinygrad_residual_split_update_matches_native_sgd(request):

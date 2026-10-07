@@ -85,6 +85,8 @@ class GlobalPlacementSolver:
                 (estimate.server_service_mean_ms, estimate.server_service_uncertainty_ms),
                 (estimate.network_download_mean_ms, estimate.network_download_uncertainty_ms),
                 (estimate.client_backward_mean_ms, estimate.client_backward_uncertainty_ms),
+                (estimate.network_roundtrip_mean_ms, estimate.network_roundtrip_uncertainty_ms),
+                (estimate.state_exchange_mean_ms, estimate.state_exchange_uncertainty_ms),
             )) for cid, estimate in assignment.items()
         }
         if self.simulation_cache_size:
@@ -110,17 +112,17 @@ class GlobalPlacementSolver:
                 )
         self.simulation_cache_misses += 1
         lanes = [0.0] * self.server_concurrency
-        jobs: list[tuple[float, str, int, CandidateEstimate, float, float, float, float, float]] = []
+        jobs: list[tuple[float, str, int, CandidateEstimate, float, float, float, float, float, float]] = []
         for client_id, estimate in assignment.items():
-            switch, forward, upload, service, download, backward = components[str(client_id)]
-            jobs.append((switch + forward + upload, str(client_id), 0, estimate, forward, upload, service, download, backward))
+            switch, forward, upload, service, download, backward, roundtrip, _exchange = components[str(client_id)]
+            jobs.append((switch + forward + upload, str(client_id), 0, estimate, forward, upload, service, download, backward, roundtrip))
         heapq.heapify(jobs)
 
         # Keep scalar accumulators during scheduling; constructing an immutable
         # timeline for every batch adds no information to the final result.
         records: dict[str, list[float]] = {}
         while jobs:
-            arrival, client_id, batch_index, estimate, forward, upload, service, download, backward = heapq.heappop(jobs)
+            arrival, client_id, batch_index, estimate, forward, upload, service, download, backward, roundtrip = heapq.heappop(jobs)
             lane_index = (
                 0 if len(lanes) == 1
                 else min(range(len(lanes)), key=lambda index: (lanes[index], index))
@@ -128,7 +130,9 @@ class GlobalPlacementSolver:
             start = max(arrival, lanes[lane_index])
             finish = start + service
             lanes[lane_index] = finish
-            completion = finish + download + backward
+            # Combined transport overhead is client think time; it is not
+            # divided into unmeasured one-way network phases.
+            completion = finish + download + backward + roundtrip
             previous = records.get(client_id)
             if previous is None:
                 records[client_id] = [arrival, start, finish, max(start - arrival, 0.0) + 0.0, completion]
@@ -139,8 +143,13 @@ class GlobalPlacementSolver:
             if batch_index + 1 < counts[client_id]:
                 heapq.heappush(
                     jobs,
-                    (completion + forward + upload, client_id, batch_index + 1, estimate, forward, upload, service, download, backward),
+                    (completion + forward + upload, client_id, batch_index + 1, estimate, forward, upload, service, download, backward, roundtrip),
                 )
+        # Round state transfer/codec costs and measured state preparation/export
+        # happen once. This additive approximation leaves server batch queues
+        # unchanged; it does not model the ordering of download and upload.
+        for cid, values in records.items():
+            values[4] += components[cid][7]
         timelines = {
             cid: ClientTimeline(cid, assignment[cid].boundary, *values)
             for cid, values in records.items()
@@ -181,7 +190,8 @@ class GlobalPlacementSolver:
             multiplier = int((batch_counts or {}).get(option.client_id, 1))
             total = option.ucb_total_without_queue_ms if use_upper else option.mean_total_without_queue_ms
             switch = option.switch_mean_ms + (option.switch_uncertainty_ms if use_upper else 0.0)
-            return switch + multiplier * (total - switch)
+            exchange = option.state_exchange_mean_ms + (option.state_exchange_uncertainty_ms if use_upper else 0.0)
+            return switch + exchange + multiplier * (total - switch - exchange)
 
         order = sorted(
             feasible,

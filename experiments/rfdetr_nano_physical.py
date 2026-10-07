@@ -36,8 +36,16 @@ class RFDETRNanoDetector(nn.Module):
 
     def __init__(self, *, pretrain_weights: str | None = None) -> None:
         super().__init__()
-        from rfdetr import RFDETRNano
+        # RF-DETR sets matmul precision to "high" at package import. Preserve
+        # the caller's physical-study policy, including its disabled TF32.
+        precision = torch.get_float32_matmul_precision()
+        try:
+            from rfdetr import RFDETRNano
+        finally:
+            torch.set_float32_matmul_precision(precision)
+        from experiments.rfdetr_grid_sampling import install_rfdetr_sampler
 
+        install_rfdetr_sampler()
         options = _config().model_dump()
         options["pretrain_weights"] = pretrain_weights
         self.model = RFDETRNano(**options).model.model

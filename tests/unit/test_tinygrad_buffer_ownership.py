@@ -59,11 +59,6 @@ def segment(nodes):
     return result
 
 
-@pytest.fixture(autouse=True)
-def tinygrad_operations(monkeypatch):
-    monkeypatch.setattr("torchlens.split.adapters.tinygrad._tinygrad_ops", lambda: Ops)
-
-
 def test_exact_tensor_capture_wins_over_unrelated_ancestor_parameter():
     buffer = UOp((1,))
     owner = Tensor(buffer)
@@ -74,40 +69,42 @@ def test_exact_tensor_capture_wins_over_unrelated_ancestor_parameter():
         param_refs=(SimpleNamespace(_param_ref=stem),),
     )
 
-    assert segment([source, descendant])._live_child_param_source_value(source) is owner
+    assert segment([source, descendant])._live_buffer_value(source) is owner
 
 
-def test_captured_ancestry_finds_owner_without_parameter_annotations():
+def test_capture_time_owner_binding_does_not_require_parameter_annotations():
     buffer = UOp((4,))
     view_uop = UOp((4,), buffer)
     owner = Tensor(view_uop)
-    source = capture(buffer)
+    # Current capture resolves ownership before replay; the bound handle
+    # survives subsequent graph changes without a descendant graph walk.
+    source = capture(buffer, owner)
     owner_capture = capture(view_uop, owner, op_type="reshape")
 
-    assert segment([source, owner_capture])._live_child_param_source_value(source) is owner
+    assert segment([source, owner_capture])._live_buffer_value(source) is owner
 
 
 def test_captured_ownership_survives_live_state_replacement():
     buffer = UOp((4,))
     view_uop = UOp((4,), buffer)
     owner = Tensor(view_uop)
-    source = capture(buffer)
+    source = capture(buffer, owner)
     owner_capture = capture(view_uop, owner, op_type="reshape")
     # State assignment changes the tensor's UOp but must retain its ownership.
     owner.uop = UOp((4,))
 
-    assert segment([source, owner_capture])._live_child_param_source_value(source) is owner
+    assert segment([source, owner_capture])._live_buffer_value(source) is owner
 
 
 def test_matrix_owner_is_flattened_once_despite_repeated_capture():
     buffer = UOp((6,))
     view_uop = UOp((2, 3), buffer)
     owner = Tensor(view_uop)
-    source = capture(buffer)
+    source = capture(buffer, owner)
     first = capture(view_uop, owner, op_type="reshape")
     second = capture(UOp((2, 3), view_uop), owner, op_type="reshape")
 
-    result = segment([source, first, second])._live_child_param_source_value(source)
+    result = segment([source, first, second])._live_buffer_value(source)
 
     assert result.shape == (6,)
     assert result.owner is owner
@@ -124,7 +121,7 @@ def test_ambiguous_tensor_owners_are_not_arbitrarily_selected():
         capture(second_uop, Tensor(second_uop)),
     ]
 
-    assert segment(candidates)._live_child_param_source_value(source) is None
+    assert segment(candidates)._live_buffer_value(source) is None
 
 
 def test_parameter_references_alone_do_not_establish_buffer_ownership():
@@ -136,7 +133,7 @@ def test_parameter_references_alone_do_not_establish_buffer_ownership():
         param_refs=(SimpleNamespace(_param_ref=unrelated),),
     )
 
-    assert segment([source, descendant])._live_child_param_source_value(source) is None
+    assert segment([source, descendant])._live_buffer_value(source) is None
 
 
 def test_permuted_owner_cannot_be_flattened_into_original_buffer():
@@ -147,7 +144,7 @@ def test_permuted_owner_cannot_be_flattened_into_original_buffer():
     source = capture(buffer)
     owner_capture = capture(permuted, owner, op_type="permute")
 
-    assert segment([source, owner_capture])._live_child_param_source_value(source) is None
+    assert segment([source, owner_capture])._live_buffer_value(source) is None
     assert owner.reshape_calls == 0
 
 
@@ -156,14 +153,15 @@ def test_incompatible_owner_shape_is_rejected(exact):
     buffer = UOp((4,))
     owner_uop = UOp((6,), buffer)
     owner = Tensor(owner_uop)
-    source = capture(buffer, owner if exact else None)
+    source = capture(buffer, owner if exact else None,
+                     param_refs=() if exact else (SimpleNamespace(_param_ref=owner),))
     owner_capture = capture(owner_uop, owner)
 
-    assert segment([source, owner_capture])._live_child_param_source_value(source) is None
+    assert segment([source, owner_capture])._live_buffer_value(source) is None
 
 
 def test_non_buffer_node_has_no_buffer_owner():
     uop = UOp((1,))
     node = capture(uop, Tensor(uop), op_type="multiply")
 
-    assert segment([node])._live_child_param_source_value(node) is None
+    assert segment([node])._live_buffer_value(node) is None

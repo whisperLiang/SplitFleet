@@ -37,6 +37,13 @@ def sparse_cross_entropy(logits: Any, targets: Any, *, ignore_index: int = -100)
         from torch.nn.functional import cross_entropy
         labels = targets.long()
         valid_count = (labels != ignore_index).sum().clamp_min(1)
+        if logits.ndim > 2:
+            # Spatial CUDA NLL loss uses a nondeterministic reduction. Treat
+            # each spatial position as one sample without changing sparse CE
+            # or its ignore-index normalization, using the deterministic 2D path.
+            classes = logits.shape[1]
+            logits = logits.movedim(1, -1).reshape(-1, classes)
+            labels = labels.reshape(-1)
         return cross_entropy(logits, labels, ignore_index=ignore_index, reduction="sum") / valid_count
     if backend == "paddle":
         from paddle.nn.functional import cross_entropy

@@ -31,7 +31,7 @@ def _candidate(boundary: str, position: float) -> SplitCandidateDescriptor:
         server_memory_bytes=None,
         trainable=True,
         feature_abi_id=f"abi-{boundary}",
-        graph_signature="graph-v1",
+        graph_signature="graph",
         framework_backend="pytorch",
     )
 

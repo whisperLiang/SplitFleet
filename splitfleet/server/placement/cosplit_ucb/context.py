@@ -6,7 +6,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from .types import FEATURE_SCHEMA_VERSION, SplitCandidateDescriptor
+from .types import FEATURE_SCHEMA, SplitCandidateDescriptor
 
 
 def _number(values: Mapping[str, Any], key: str) -> tuple[float, float]:
@@ -34,11 +34,12 @@ def _utilization(value: float) -> float:
 class ContextEncoder:
     """Encode fixed-schema numerical contexts without online renormalization."""
 
-    feature_schema_version = FEATURE_SCHEMA_VERSION
-    edge_dimension = 12
-    network_dimension = 13
-    server_dimension = 12
+    feature_schema = FEATURE_SCHEMA
+    edge_dimension = 13
+    network_dimension = 14
+    server_dimension = 13
     switch_dimension = 9
+    exchange_dimension = 5
 
     def edge_context(
         self,
@@ -57,7 +58,7 @@ class ContextEncoder:
                 1.0,
                 candidate.graph_position_ratio,
                 _ratio(prefix_ratio),
-                np.log1p(max(candidate.prefix_parameter_bytes or 0, 0)),
+                self._parameter_fraction(candidate),
                 np.log1p(max(candidate.boundary_tensor_count, 0)),
                 np.log1p(max(int(batch_size or values.get("batch_size") or 0), 0)),
                 _utilization(cpu),
@@ -66,6 +67,7 @@ class ContextEncoder:
                 gpu_missing,
                 _ratio(memory),
                 memory_missing,
+                self._missing(candidate),
             ],
             dtype=np.float64,
         )
@@ -80,7 +82,15 @@ class ContextEncoder:
         if direction not in {"upload", "download"}:
             raise ValueError("network direction must be 'upload' or 'download'")
         values = telemetry or {}
-        forward_bytes = candidate.boundary_forward_bytes
+        batch = int(values.get("batch_size") or candidate.metadata.get("payload_batch_size") or 0)
+        sizes = candidate.metadata.get("boundary_forward_bytes_by_batch_size", {})
+        forward_bytes = sizes.get(batch, sizes.get(str(batch)))
+        # Other backends may only provide the captured payload. Reuse it for
+        # that batch alone, and respect explicitly unknown shape-program sizes.
+        capture_batch = candidate.metadata.get("payload_batch_size")
+        if (batch not in sizes and str(batch) not in sizes and capture_batch is not None
+                and batch == int(capture_batch)):
+            forward_bytes = candidate.boundary_forward_bytes
         gradient_bytes = candidate.boundary_gradient_bytes
         uplink, uplink_missing = _number(values, "uplink_mbps")
         downlink, downlink_missing = _number(values, "downlink_mbps")
@@ -88,9 +98,9 @@ class ContextEncoder:
         return np.asarray(
             [
                 1.0,
-                np.log1p(max(forward_bytes or 0, 0)),
+                max(forward_bytes or 0, 0) / 1048576.0,
                 1.0 if forward_bytes is None else 0.0,
-                np.log1p(max(gradient_bytes or 0, 0)),
+                max(gradient_bytes or 0, 0) / 1048576.0,
                 1.0 if gradient_bytes is None else 0.0,
                 np.log1p(max(candidate.boundary_tensor_count, 0)),
                 np.log1p(max(uplink, 0.0)),
@@ -100,6 +110,7 @@ class ContextEncoder:
                 np.log1p(max(rtt, 0.0)),
                 rtt_missing,
                 1.0 if direction == "download" else 0.0,
+                1.0 if forward_bytes is None else 0.0,
             ],
             dtype=np.float64,
         )
@@ -121,7 +132,7 @@ class ContextEncoder:
             [
                 1.0,
                 _ratio(suffix_ratio),
-                np.log1p(max(candidate.suffix_parameter_bytes or 0, 0)),
+                self._parameter_fraction(candidate, suffix=True),
                 _utilization(gpu),
                 gpu_missing,
                 np.log1p(max(active, 0.0)),
@@ -131,6 +142,7 @@ class ContextEncoder:
                 np.log1p(max(int(max_concurrency), 1)),
                 _ratio(memory),
                 memory_missing,
+                self._missing(candidate),
             ],
             dtype=np.float64,
         )
@@ -166,6 +178,30 @@ class ContextEncoder:
             ],
             dtype=np.float64,
         )
+
+    @staticmethod
+    def _parameter_fraction(candidate, *, suffix=False):
+        prefix = candidate.metadata.get("optimizer_prefix_parameter_bytes")
+        tail = candidate.metadata.get("optimizer_suffix_parameter_bytes")
+        if prefix is None or tail is None:
+            return 0.0
+        return (tail if suffix else prefix) / max(prefix + tail, 1)
+
+    @staticmethod
+    def _missing(candidate):
+        return float(any(candidate.metadata.get(key) is None for key in
+                         ("optimizer_prefix_parameter_bytes", "optimizer_suffix_parameter_bytes")))
+
+    @staticmethod
+    def exchange_context(*, download_bytes, upload_bytes):
+        """Encode actual download bytes and an owned-parameter upload proxy.
+
+        State exchange is learned once per client round. The upload proxy
+        does not imply that buffers or framing occupy zero bytes.
+        """
+        return np.asarray([1., max(download_bytes or 0, 0) / 1048576.,
+                           max(upload_bytes or 0, 0) / 1048576.,
+                           float(download_bytes is None), float(upload_bytes is None)])
 
 
 __all__ = ["ContextEncoder"]

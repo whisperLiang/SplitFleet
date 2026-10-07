@@ -179,7 +179,7 @@ def test_seed_and_rng_state_reproduce_equal_priority_exploration() -> None:
 
 def test_multiple_probes_share_one_joint_mean_budget() -> None:
     solver = GlobalPlacementSolver()
-    baseline = {cid: replace(_estimate(cid, "base", 0, 1000), server_service_mean_ms=50)
+    baseline = {cid: replace(_estimate(cid, "base", 0, .1), server_service_mean_ms=50)
                 for cid in ("a", "b")}
     estimates = {cid: [base, replace(base, boundary="probe", server_service_mean_ms=54)]
                  for cid, base in baseline.items()}

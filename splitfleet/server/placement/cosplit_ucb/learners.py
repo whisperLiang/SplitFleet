@@ -7,7 +7,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from .bandit import DiscountedLinUCB, LinearPrediction
+from .bandit import DiscountedLinUCB, LinearPrediction, MonotoneStateExchangeLinUCB
 from .config import CoSplitUCBConfig
 from .context import ContextEncoder
 from .types import CandidateEstimate, ExecutionProfileKey
@@ -22,10 +22,10 @@ class CandidateContexts:
     """Feature vectors retained so round feedback updates the selected action."""
 
     edge: np.ndarray
-    upload: np.ndarray
-    download: np.ndarray
+    network: np.ndarray
     server: np.ndarray
     switch: np.ndarray
+    exchange: np.ndarray
 
 
 class _LearnerFactory:
@@ -34,13 +34,25 @@ class _LearnerFactory:
         self.encoder = encoder
 
     def make(self, dimension: int, alpha: float) -> DiscountedLinUCB:
-        return DiscountedLinUCB(
+        from .residual import ResidualLinUCB
+
+        return ResidualLinUCB(
             dimension,
             ridge_lambda=self.config.ridge_lambda,
             discount_gamma=self.config.discount_gamma,
             alpha=alpha,
             target_scale=self.config.target_scale_ms,
-            feature_schema_version=self.encoder.feature_schema_version,
+            feature_schema=self.encoder.feature_schema,
+        )
+
+    def make_exchange(self) -> MonotoneStateExchangeLinUCB:
+        return MonotoneStateExchangeLinUCB(
+            self.encoder.exchange_dimension,
+            ridge_lambda=self.config.ridge_lambda,
+            discount_gamma=self.config.discount_gamma,
+            alpha=self.config.alpha_network,
+            target_scale=self.config.target_scale_ms,
+            feature_schema=self.encoder.feature_schema,
         )
 
 
@@ -76,12 +88,13 @@ class EdgeGroupLearner:
         forward_ms: float | None,
         backward_ms: float | None,
         round_id: int,
+        sample_weight: float = 1.0,
     ) -> None:
         models = self._models(profile)
         if forward_ms is not None:
-            models["forward"].update(context, forward_ms, round_id=round_id)
+            models["forward"].update(context, forward_ms, round_id=round_id, sample_weight=sample_weight)
         if backward_ms is not None:
-            models["backward"].update(context, backward_ms, round_id=round_id)
+            models["backward"].update(context, backward_ms, round_id=round_id, sample_weight=sample_weight)
 
     def state_dict(self) -> dict[str, Any]:
         return {key: {name: model.state_dict() for name, model in models.items()} for key, models in self._groups.items()}
@@ -102,7 +115,7 @@ class EdgeGroupLearner:
 
 
 class NetworkClientLearner:
-    """Keep upload/download dynamics isolated per client link."""
+    """Learn batch roundtrip and per-round state exchange for each client link."""
 
     def __init__(self, factory: _LearnerFactory) -> None:
         self._factory = factory
@@ -112,8 +125,8 @@ class NetworkClientLearner:
         key = str(client_id)
         if key not in self._clients:
             self._clients[key] = {
-                "upload": self._factory.make(self._factory.encoder.network_dimension, self._factory.config.alpha_network),
-                "download": self._factory.make(self._factory.encoder.network_dimension, self._factory.config.alpha_network),
+                "roundtrip": self._factory.make(self._factory.encoder.network_dimension, self._factory.config.alpha_network),
+                "exchange": self._factory.make_exchange(),
             }
         return self._clients[key]
 
@@ -122,41 +135,46 @@ class NetworkClientLearner:
             for model in models.values():
                 model.advance_round(round_id)
 
-    def predict(
-        self, client_id: str, upload: np.ndarray, download: np.ndarray
-    ) -> tuple[LinearPrediction, LinearPrediction]:
-        models = self._models(client_id)
-        return models["upload"].predict(upload), models["download"].predict(download)
+    def predict_roundtrip(self, client_id: str, context: np.ndarray) -> LinearPrediction:
+        return self._models(client_id)["roundtrip"].predict(context)
 
     def update(
         self,
         client_id: str,
-        upload: np.ndarray,
-        download: np.ndarray,
+        context: np.ndarray,
+        target_ms: float | None,
         *,
-        upload_ms: float | None,
-        download_ms: float | None,
         round_id: int,
+        sample_weight: float = 1.0,
     ) -> None:
-        models = self._models(client_id)
-        if upload_ms is not None:
-            models["upload"].update(upload, upload_ms, round_id=round_id)
-        if download_ms is not None:
-            models["download"].update(download, download_ms, round_id=round_id)
+        if target_ms is not None:
+            self._models(client_id)["roundtrip"].update(
+                context, target_ms, round_id=round_id, sample_weight=sample_weight,
+            )
+
+    def predict_exchange(self, client_id, context):
+        return self._models(client_id)["exchange"].predict(context)
+
+    def update_exchange(self, client_id, context, target_ms, *, round_id):
+        if target_ms is not None:
+            self._models(client_id)["exchange"].update(context, target_ms, round_id=round_id)
+
+    def exchange_update_count(self, client_id):
+        return self._models(client_id)["exchange"].num_updates
 
     def state_dict(self) -> dict[str, Any]:
         return {key: {name: model.state_dict() for name, model in models.items()} for key, models in self._clients.items()}
 
     def update_count(self, client_id: str) -> int:
-        """Return the combined upload/download update count for a link."""
+        """Return the batch roundtrip update count for a link."""
 
-        return sum(model.num_updates for model in self._models(client_id).values())
+        return sum(model.num_updates for name, model in self._models(client_id).items() if name != "exchange")
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
         self._clients.clear()
         for client_id, values in state.items():
             models = self._models(client_id)
-            for name in ("upload", "download"):
+            for name in models:
                 models[name].load_state_dict(values[name])
 
 
@@ -169,8 +187,8 @@ class GlobalServerLearner:
     def predict(self, context: np.ndarray) -> LinearPrediction:
         return self.model.predict(context)
 
-    def update(self, context: np.ndarray, target_ms: float, *, round_id: int) -> None:
-        self.model.update(context, target_ms, round_id=round_id)
+    def update(self, context: np.ndarray, target_ms: float, *, round_id: int, sample_weight: float = 1.0) -> None:
+        self.model.update(context, target_ms, round_id=round_id, sample_weight=sample_weight)
 
 
 class SwitchLearner:
@@ -224,7 +242,8 @@ class CooperativeLearners:
         infeasible_reason: str | None = None,
     ) -> CandidateEstimate:
         forward, backward = self.edge.predict(profile, contexts.edge)
-        upload, download = self.network.predict(client_id, contexts.upload, contexts.download)
+        roundtrip = self.network.predict_roundtrip(client_id, contexts.network)
+        exchange = self.network.predict_exchange(client_id, contexts.exchange)
         server = self.server.predict(contexts.server)
         switch = self.switch.predict(contexts.switch)
         return CandidateEstimate(
@@ -232,14 +251,18 @@ class CooperativeLearners:
             boundary=str(boundary),
             client_forward_mean_ms=forward.mean,
             client_backward_mean_ms=backward.mean,
-            network_upload_mean_ms=upload.mean,
-            network_download_mean_ms=download.mean,
+            network_upload_mean_ms=0.0,
+            network_download_mean_ms=0.0,
             server_service_mean_ms=server.mean,
             switch_mean_ms=switch.mean,
+            network_roundtrip_mean_ms=roundtrip.mean,
+            network_roundtrip_uncertainty_ms=roundtrip.uncertainty,
+            state_exchange_mean_ms=exchange.mean,
+            state_exchange_uncertainty_ms=exchange.uncertainty,
             client_forward_uncertainty_ms=forward.uncertainty,
             client_backward_uncertainty_ms=backward.uncertainty,
-            network_upload_uncertainty_ms=upload.uncertainty,
-            network_download_uncertainty_ms=download.uncertainty,
+            network_upload_uncertainty_ms=0.0,
+            network_download_uncertainty_ms=0.0,
             server_service_uncertainty_ms=server.uncertainty,
             switch_uncertainty_ms=switch.uncertainty,
             feasible=feasible,

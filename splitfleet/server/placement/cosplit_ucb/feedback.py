@@ -15,6 +15,8 @@ _MEASUREMENTS = (
     "client_backward_ms",
     "network_upload_ms",
     "network_download_ms",
+    "network_roundtrip_ms",
+    "state_exchange_ms",
     "server_service_ms",
     "switch_ms",
     "completion_ms",

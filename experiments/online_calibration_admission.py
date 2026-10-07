@@ -41,7 +41,8 @@ def admit(bundle_path, device, *, cuda_memory_fraction=None):
     receipt = calibrate_split(model, call, targets, boundaries=anchors,
         make_handle=lambda cut: session.repartition_runtime(handle, cut),
         loss_fn=workload.task.make_adapter().loss, device=device,
-        source="server_shape_matched_current_deployment" if bundle["role"] == "server" else "client_private_sample_current_deployment")
+        source="server_shape_matched_current_deployment" if bundle["role"] == "server" else "client_private_sample_current_deployment",
+        optimizer_fn=lambda module: torch.optim.Adam(module.parameters(), lr=1e-4))
     if receipt["model_hash_before"] != bundle["initial_model_hash"]:
         raise ValueError("Admission capture changed the frozen initial model")
     return dict(status="passed", receipt=receipt,

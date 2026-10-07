@@ -37,7 +37,7 @@ class SplitCandidate:
         return asdict(self)
 
 
-def payload_bytes_from_plan(runtime: Any, plan: Any) -> int:
+def payload_bytes_from_plan(runtime: Any, plan: Any, *, batch_size: int | None = None) -> int:
     """Count boundary tensor bytes at the native capture batch.
 
     ABI shapes collapse expressions such as ``B * 10`` to ``B``. The shape
@@ -47,7 +47,13 @@ def payload_bytes_from_plan(runtime: Any, plan: Any) -> int:
     program = runtime.trace_graph.shape_program
     if program is None:
         raise RuntimeError("TorchLens payload estimation requires a captured shape program.")
-    binding = ShapeBinding({program.batch_symbol: program.traced_batch_size}, {})
+    resolved_batch = program.traced_batch_size if batch_size is None else int(batch_size)
+    if resolved_batch < 1:
+        raise ValueError("Payload batch size must be positive")
+    if batch_size is not None:
+        program.require_batch_resolvable(resolved_batch, set(plan.boundary_bindings.values()),
+            backend="torchlens_native", split_point=f"{plan.boundary_kind}:{plan.target_node_id}")
+    binding = ShapeBinding({program.batch_symbol: resolved_batch}, {})
     total = 0
     for label, spec in plan.boundary_spec.items():
         shape = program.value_shapes[plan.boundary_bindings[label]].evaluate(binding)
@@ -55,7 +61,13 @@ def payload_bytes_from_plan(runtime: Any, plan: Any) -> int:
         match = re.fullmatch(r"<dtype: '([^']+)'>", dtype_name)
         if match:
             dtype_name = match.group(1)
-        itemsize = 2 if dtype_name == "bfloat16" else np.dtype(dtype_name).itemsize
+        if str(spec.dtype).startswith("dtypes."):
+            # tinygrad's float/int/uint aliases have fixed native widths;
+            # NumPy interprets unqualified float/int as platform defaults.
+            from tinygrad import dtypes
+            itemsize = getattr(dtypes, dtype_name).itemsize
+        else:
+            itemsize = 2 if dtype_name == "bfloat16" else np.dtype(dtype_name).itemsize
         total += math.prod(shape) * itemsize
     return total
 
@@ -122,6 +134,39 @@ class ParameterCountIndex:
                 if (not trainable_only or trainable) and identity not in seen:
                     seen.add(identity)
                     total += size
+        return total
+
+
+@dataclass
+class ParameterByteIndex:
+    """Dtype-aware trainable storage sizes, without preparing executable cuts."""
+
+    by_node: dict[str, tuple[tuple[int, int | None, bool], ...]]
+
+    @classmethod
+    def from_runtime(cls, runtime: Any) -> "ParameterByteIndex":
+        by_node = {}
+        for node in runtime.trace_graph.nodes:
+            entries = []
+            for parameter in node.param_refs:
+                value = parameter.handle
+                identity = id(value) if value is not None else hash((parameter.address, parameter.shape))
+                size = (int(value.numel()) * int(value.element_size())
+                        if value is not None and callable(getattr(value, "element_size", None)) else None)
+                entries.append((identity, size, bool(parameter.is_trainable)))
+            by_node[node.canonical_id] = tuple(entries)
+        return cls(by_node)
+
+    def count(self, node_names: Iterable[str]) -> int | None:
+        seen, total = set(), 0
+        for name in node_names:
+            for identity, size, trainable in self.by_node.get(name, ()):
+                if not trainable or identity in seen:
+                    continue
+                if size is None:
+                    return None
+                seen.add(identity)
+                total += size
         return total
 
 

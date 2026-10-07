@@ -19,8 +19,8 @@ from .policy import CoSplitUCBPlacementPolicy
 from .solver import ClientTimeline, GlobalPlacementSolver, PlacementSimulation
 from .state import BanditStateStore
 from .types import (
-    ALGORITHM_VERSION,
-    FEATURE_SCHEMA_VERSION,
+    ALGORITHM_NAME,
+    FEATURE_SCHEMA,
     CandidateEstimate,
     ExecutionProfileKey,
     PlacementFailure,
@@ -31,8 +31,8 @@ from .types import (
 )
 
 __all__ = [
-    "ALGORITHM_VERSION",
-    "FEATURE_SCHEMA_VERSION",
+    "ALGORITHM_NAME",
+    "FEATURE_SCHEMA",
     "BanditStateStore",
     "CandidateContexts",
     "CandidateEstimate",

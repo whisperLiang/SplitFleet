@@ -1,13 +1,14 @@
-"""Small current-deployment calibrations for fresh online CoSplit-UCB.
+"""State-preserving deployment calibrations for fresh online CoSplit-UCB.
 
-The existing captured graph is reused. Calibration performs split backward but
-no optimizer step; state, gradients and random streams are restored. Samples
+The existing captured graph is reused. Calibration performs temporary stage-owned optimizer steps; model, gradients
+and RNG are restored. Samples
 initialize the existing discounted learners, never replace their predictions.
 """
 
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 import json
 import math
 import random
@@ -28,13 +29,12 @@ from .types import ExecutionProfileKey
 
 
 def calibration_boundaries(candidates):
-    """Three structural anchors, independent of previously measured timings."""
+    """Four structural anchors, independent of previously measured timings."""
     candidates = tuple(candidates)
     if not candidates:
         raise ValueError("Calibration requires an admitted training catalog")
-    anchors = (min(candidates, key=lambda c: (c.graph_position_ratio, c.boundary)),
-               min(candidates, key=lambda c: (abs(c.graph_position_ratio - .25), c.boundary)),
-               max(candidates, key=lambda c: (c.graph_position_ratio, c.boundary)))
+    anchors = tuple(min(candidates, key=lambda c: (abs(c.graph_position_ratio - fraction), c.boundary))
+                    for fraction in (0.0, .25, .75, 1.0))
     return tuple(dict.fromkeys(candidate.boundary for candidate in anchors))
 
 
@@ -44,8 +44,12 @@ def _synchronize(device):
 
 
 def calibrate_split(model, inputs, targets, *, boundaries, make_handle, loss_fn,
-                    device, source):
-    """Measure F/B on this device, with no optimization or persistent RNG change."""
+                    device, source, optimizer_fn):
+    """Measure device costs and restore training state.
+
+    Deployment callers supply the training optimizer factory. Offline profiles
+    explicitly pass ``None`` to measure forward/backward without updates.
+    """
     device = torch.device(device)
     boundaries = tuple(boundaries)
     if not boundaries or len(set(boundaries)) != len(boundaries):
@@ -59,6 +63,8 @@ def calibrate_split(model, inputs, targets, *, boundaries, make_handle, loss_fn,
     python_rng, numpy_rng, cpu_rng = random.getstate(), np.random.get_state(), torch.get_rng_state().clone()
     cuda_rng = torch.cuda.get_rng_state(device).clone() if device.type == "cuda" else None
     records = []
+    warmup, repeats = 1, 1
+    optimizer_stage = "suffix" if source == "server_shape_matched_current_deployment" else "prefix"
     try:
         model.train()
         for cut in boundaries:
@@ -68,20 +74,38 @@ def calibrate_split(model, inputs, targets, *, boundaries, make_handle, loss_fn,
             handle = make_handle(cut)
             if handle.plan.boundary != cut:
                 raise ValueError("Calibration must use an exact admitted canonical boundary")
-            model.zero_grad(set_to_none=True)
-            _synchronize(device)
-            begin = time.perf_counter()
-            boundary = handle.backend.run_prefix(*inputs.args, input_kwargs=dict(inputs.kwargs), training=True)
-            _synchronize(device)
-            forward_ms = (time.perf_counter() - begin) * 1000
-            begin = time.perf_counter()
-            loss, returned = handle.backend.train_suffix(boundary, targets, loss_fn=loss_fn, optimizer=None)
-            _synchronize(device)
-            local_service_ms = (time.perf_counter() - begin) * 1000
-            begin = time.perf_counter()
-            handle.backend.backward_prefix(boundary, boundary_grads=returned, optimizer=None)
-            _synchronize(device)
-            backward_ms = (time.perf_counter() - begin) * 1000
+            optimizer = None
+            if optimizer_fn is not None:
+                from splitfleet.autosplit.state_ownership import state_ownership
+                ownership = state_ownership(handle, "calibration")
+                owned_names = {name for name, owner in zip(ownership["names"], ownership["owners"])
+                               if owner == optimizer_stage}
+                parameters = [parameter for name, parameter in model.named_parameters()
+                              if name in owned_names and parameter.requires_grad]
+                if parameters:
+                    optimizer = optimizer_fn(torch.nn.ParameterList(parameters))
+            samples = []
+            for batch_index in range(warmup + repeats):
+                model.zero_grad(set_to_none=True)
+                _synchronize(device)
+                begin = time.perf_counter()
+                boundary = handle.backend.run_prefix(*inputs.args, input_kwargs=dict(inputs.kwargs), training=True)
+                _synchronize(device)
+                forward_ms = (time.perf_counter() - begin) * 1000
+                begin = time.perf_counter()
+                loss, returned = handle.backend.train_suffix(boundary, targets, loss_fn=loss_fn,
+                    optimizer=optimizer if optimizer_stage == "suffix" else None)
+                _synchronize(device)
+                local_service_ms = (time.perf_counter() - begin) * 1000
+                begin = time.perf_counter()
+                handle.backend.backward_prefix(boundary, boundary_grads=returned,
+                    optimizer=optimizer if optimizer_stage == "prefix" else None)
+                _synchronize(device)
+                backward_ms = (time.perf_counter() - begin) * 1000
+                if batch_index >= warmup:
+                    samples.append((forward_ms, backward_ms, local_service_ms))
+                del boundary, returned
+            forward_ms, backward_ms, local_service_ms = np.median(samples, axis=0).tolist()
             if not bool(torch.isfinite(loss).all()):
                 raise ValueError("Calibration loss is non-finite")
             if any(p.grad is not None and not bool(torch.isfinite(p.grad).all()) for p in model.parameters()):
@@ -90,8 +114,10 @@ def calibrate_split(model, inputs, targets, *, boundaries, make_handle, loss_fn,
                 "feature_abi_id": handle.plan.feature_abi_id,
                 "client_forward_ms": forward_ms, "client_backward_ms": backward_ms,
                 "local_tail_service_ms": local_service_ms, "loss": float(loss.detach()),
-                "measured_batches": 1, "optimizer_steps": 0})
-            del boundary, returned, loss, handle
+                "measured_batches": repeats,
+                "optimizer_steps": warmup + repeats if optimizer is not None else 0,
+                "optimizer_stage": optimizer_stage if optimizer_fn is not None else None})
+            del loss, handle, optimizer
     finally:
         model.load_state_dict(state)
         for name, parameter in model.named_parameters():
@@ -109,11 +135,13 @@ def calibrate_split(model, inputs, targets, *, boundaries, make_handle, loss_fn,
         raise ValueError("Calibration did not preserve the initial model / RNG")
     if cuda_rng is not None and not torch.equal(cuda_rng, torch.cuda.get_rng_state(device)):
         raise ValueError("Calibration did not preserve CUDA RNG")
-    return {"schema": "splitfleet.online-calibration.v1", "source": source,
+    return {"schema": "splitfleet.cosplit-calibration", "source": source,
         "device": str(device), "model_hash_before": initial_hash, "model_hash_after": final_hash,
-        "state_and_torch_rng_preserved": True, "optimizer_steps": 0,
+        "state_and_torch_rng_preserved": True,
+        "optimizer_steps": sum(row["optimizer_steps"] for row in records),
+        "persistent_optimizer_steps": 0, "warmup_batches": warmup,
         "elapsed_sec": time.perf_counter() - started, "records": records,
-        "interpretation": "Synchronized local split execution without Adam updates or wire transport; online training feedback corrects initialization bias"}
+        "interpretation": "Local split execution; temporary optimizer state discarded and model/RNG restored; not network or global round timing"}
 
 
 def provider_handle(provider, boundary):
@@ -122,6 +150,22 @@ def provider_handle(provider, boundary):
     backend = copy.copy(provider._backends[True])
     backend.split(provider._candidates[True][boundary])
     return backend.make_handle()
+
+
+def measure_transport_echo(client, *, size, round_id, reply_size=None):
+    """Measure coordinator monotonic RTT without inspecting private tensors."""
+    payload = bytes(size)
+    config = {"cosplit_probe_payload": payload}
+    if reply_size is not None:
+        config["cosplit_probe_reply_bytes"] = reply_size
+    begin = time.perf_counter_ns()
+    result = client.get_properties(GetPropertiesIns(config=config),
+                                   timeout=60, group_id=round_id)
+    elapsed_ms = (time.perf_counter_ns() - begin) / 1e6
+    expected = payload if reply_size is None or reply_size == size else bytes(reply_size)
+    if result.properties.get("cosplit_probe_payload") != expected or not math.isfinite(elapsed_ms) or elapsed_ms <= 0:
+        raise ValueError("Current-deployment transport probe failed")
+    return elapsed_ms
 
 
 class ClientTelemetry:
@@ -214,15 +258,22 @@ class CalibratedTelemetry(ClientTelemetry):
         self._bind_properties(clients, round_id, config=config, refresh=True)
         calibration_clients = tuple(str(client.cid) for client in clients)
         expected = set(calibration_boundaries(catalog.values()))
+        steps, measured = 2, 1
         measurements = []
         # Validate every receipt before mutating any sufficient statistics.
         receipts = [(cid, json.loads(self.clients[cid]["online_calibration_receipt"]))
                     for cid in calibration_clients]
         receipts.append((None, self.server_receipt))
         for cid, receipt in receipts:
+            stage = "prefix" if cid is not None else "suffix"
+            expected_steps = {
+                cut: 0 if catalog[cut].metadata.get(f"optimizer_{stage}_parameter_bytes") == 0 else steps
+                for cut in expected
+            }
             expected_source = ("client_private_sample_current_deployment" if cid is not None
                                else "server_shape_matched_current_deployment")
-            if receipt.get("schema") != "splitfleet.online-calibration.v1" or receipt.get("source") != expected_source:
+            expected_schema = "splitfleet.cosplit-calibration"
+            if receipt.get("schema") != expected_schema or receipt.get("source") != expected_source:
                 raise ValueError("Calibration must come from the current deployment")
             if cid is not None and str(receipt.get("device", "")).split(":", 1)[0] != self.clients[cid]["device_type"]:
                 raise ValueError("Calibration device differs from the worker execution profile")
@@ -230,8 +281,12 @@ class CalibratedTelemetry(ClientTelemetry):
                 raise ValueError("Calibration duration must be finite and nonnegative")
             if (receipt.get("model_hash_before") != self.initial_model_hash or
                 receipt.get("model_hash_after") != self.initial_model_hash or
-                receipt.get("state_and_torch_rng_preserved") is not True or receipt.get("optimizer_steps") != 0):
+                receipt.get("state_and_torch_rng_preserved") is not True or
+                receipt.get("persistent_optimizer_steps") != 0):
                 raise ValueError("Calibration state does not match the frozen initial model")
+            if (receipt.get("optimizer_steps") != sum(expected_steps.values())
+                                  or receipt.get("warmup_batches") != 1):
+                raise ValueError("Calibration optimizer scope mismatch")
             records = receipt["records"]
             if len(records) != len(expected) or {r["boundary"] for r in records} != expected:
                 raise ValueError("Calibration anchors differ from the canonical catalog")
@@ -240,7 +295,9 @@ class CalibratedTelemetry(ClientTelemetry):
                 if row["graph_signature"] != candidate.graph_signature or row["feature_abi_id"] != candidate.feature_abi_id:
                     raise ValueError("Calibration graph / boundary ABI mismatch")
                 names = ("client_forward_ms", "client_backward_ms") if cid is not None else ("local_tail_service_ms",)
-                if row.get("measured_batches") != 1 or row.get("optimizer_steps") != 0:
+                if (row.get("measured_batches") != measured or
+                        row.get("optimizer_steps") != expected_steps[row["boundary"]] or
+                        row.get("optimizer_stage") != stage):
                     raise ValueError("Calibration sample scope mismatch")
                 if any(not math.isfinite(float(row[name])) or float(row[name]) < 0 for name in names):
                     raise ValueError("Calibration costs must be finite and nonnegative")
@@ -254,6 +311,41 @@ class CalibratedTelemetry(ClientTelemetry):
                                        client_telemetry=props, server_telemetry=server_context)
             profile = ExecutionProfileKey.from_value(self.execution_profile(context_cid))
             prepared.append((cid, row, contexts, profile))
+        transport_samples, transport_contexts, transport_warmup = [], [], []
+        exchange_samples, exchange_contexts = [], []
+        # Application-level echo is a bootstrap prior measured here, not
+        # a one-way timing or an assertion that Flower and split RPCs
+        # have identical serialization. Actual training RTT replaces it.
+        template = next(iter(catalog.values()))
+        probe_started = time.perf_counter()
+        for client in clients:
+            cid = str(client.cid)
+            for repeat in range(2):
+                elapsed_ms = measure_transport_echo(client, size=65536, round_id=round_id)
+                transport_warmup.append({"logical_client_id": self.clients[cid]["logical_client_id"],
+                    "payload_bytes": 65536, "repeat": repeat, "roundtrip_ms": elapsed_ms, "echo_verified": True})
+            for size in (65536, 2097152):
+                batch_size = int(self.client_context(cid)["batch_size"])
+                candidate = replace(template, boundary_forward_bytes=size,
+                                    boundary_gradient_bytes=None, boundary_tensor_count=1,
+                                    metadata={**template.metadata, "payload_batch_size": batch_size,
+                                              "boundary_forward_bytes_by_batch_size": {batch_size: size}})
+                context = policy.context_encoder.network_context(candidate, self.client_context(cid), direction="upload")
+                for repeat in range(2):
+                    elapsed_ms = measure_transport_echo(client, size=size, round_id=round_id)
+                    transport_samples.append({"logical_client_id": self.clients[cid]["logical_client_id"],
+                        "payload_bytes": size, "repeat": repeat, "roundtrip_ms": elapsed_ms,
+                        "echo_verified": True})
+                    transport_contexts.append((cid, context, elapsed_ms))
+            for request_size, reply_size in ((65536, 65536), (2097152, 65536), (65536, 2097152)):
+                context = policy.context_encoder.exchange_context(download_bytes=request_size, upload_bytes=reply_size)
+                for repeat in range(2):
+                    elapsed_ms = measure_transport_echo(client, size=request_size, reply_size=reply_size, round_id=round_id)
+                    exchange_samples.append({"logical_client_id": self.clients[cid]["logical_client_id"],
+                        "request_bytes": request_size, "reply_bytes": reply_size, "repeat": repeat,
+                        "roundtrip_ms": elapsed_ms, "reply_verified": True})
+                    exchange_contexts.append((cid, context, elapsed_ms))
+        probe_elapsed = time.perf_counter() - probe_started
         for cid, row, contexts, profile in prepared:
             if cid is not None:
                 policy.learners.edge.update(profile, contexts.edge,
@@ -261,12 +353,26 @@ class CalibratedTelemetry(ClientTelemetry):
                 logical.append({"logical_client_id": self.clients[cid]["logical_client_id"], **row})
             else:
                 policy.learners.server.update(contexts.server, row["local_tail_service_ms"], round_id=0)
-        self.receipt = {"source": "current_deployment_no_update_split_calibration",
+        for cid, context, elapsed_ms in transport_contexts:
+            policy.learners.network.update(cid, context, elapsed_ms, round_id=0)
+        for cid, context, elapsed_ms in exchange_contexts:
+            policy.learners.network.update_exchange(cid, context, elapsed_ms, round_id=0)
+        self.receipt = {"source": "current_deployment_restored_training_cost_calibration",
             "initial_model_hash": self.initial_model_hash, "client_samples": logical,
             "server_calibration": self.server_receipt,
             "client_calibration_elapsed_sec": {self.clients[cid]["logical_client_id"]: receipt["elapsed_sec"] for cid, receipt in receipts if cid is not None},
-            "network_initialized": False, "prediction_override": False,
+            "network_initialized": True, "prediction_override": False,
             "discounted_online_updates_retained": True,
             "mean_exploration_budget_enabled": True}
+        self.receipt["temporary_optimizer_updates"] = True
+        self.receipt["transport_bootstrap"] = {
+            "schema": "splitfleet.current-transport-probe", "elapsed_sec": probe_elapsed,
+            "source": "current_deployment_flower_echo", "samples": transport_samples,
+            "warmup_samples": transport_warmup,
+            "interpretation": "Coordinator monotonic RTT for a payload and its echo; no cross-host timestamp subtraction. Bootstrap only; split-RPC RTT feedback remains active."}
+        self.receipt["state_exchange_bootstrap"] = {
+            "schema": "splitfleet.current-state-exchange-probe",
+            "source": "current_deployment_controlled_request_reply_sizes", "samples": exchange_samples,
+            "interpretation": "Whole property-RPC durations with independently varied request/reply sizes, not unmeasured one-way delays. Bootstrap only; actual fit RPC minus full client-handler duration updates the per-round model."}
         self.initialized = True
         self.parameters = None

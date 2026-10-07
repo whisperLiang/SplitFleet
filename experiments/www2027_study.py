@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+from collections import Counter
 import hashlib
 from importlib import metadata
 import json
@@ -22,6 +23,8 @@ import time
 from experiments.common.statistics import holm_adjust, paired_effect
 from experiments.physical_multitask import FIXED_BOUNDARIES, METHODS, scheme_name
 from experiments.summarize_physical_multitask import PRIMARY, summarize
+from experiments.analysis.time_to_quality import time_to_quality, summarize_paired_ttq
+from experiments.analysis.communication import communication_summary
 
 SCHEMES = ("fedavg", "fedprox", "splitfed_fixed25", "splitfed_fixed50", "splitfed_fixed75", "splitfleet")
 
@@ -49,8 +52,14 @@ def freeze_runtime(workspace: Path, root: Path) -> tuple[Path, dict]:
             packages[package] = metadata.version(package)
         except metadata.PackageNotFoundError:
             packages[package] = None
+    from experiments.analysis.partition_coverage import _torchlens_source_identity
+    artifacts = {name: hashlib.sha256((workspace / name).read_bytes()).hexdigest()
+                 for name in ("torchlens-2.34.1-py3-none-any.whl", "uv.lock", "pyproject.toml")
+                 if (workspace / name).is_file()}
     record = {"source_hashes": hashes,
               "source_identity": hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest(),
+              "torchlens_source_sha256": _torchlens_source_identity(),
+              "dependency_artifacts_sha256": artifacts,
               "python": sys.version, "executable": sys.executable,
               "platform": platform.platform(), "packages": packages}
     save_json(root / "runtime_manifest.json", record)
@@ -97,7 +106,16 @@ def analyze(plan: dict, root: Path) -> dict:
     runtime = json.loads((root / "runtime_manifest.json").read_text()) if (root / "runtime_manifest.json").exists() else None
     source_identity = runtime["source_hashes"] if runtime else None
     jobs = {(job["stage"], job["seed"]): job for job in ledger.get("jobs", [])}
+    job_counts = Counter((job["stage"], job["seed"]) for job in ledger.get("jobs", []))
     attempts = []
+    ttq_rows, communication_rows = [], []
+    frozen_file = root / "frozen_plan.json"
+    frozen = json.loads(frozen_file.read_text()) if frozen_file.exists() else None
+    frozen_hash = hashlib.sha256(json.dumps(frozen, sort_keys=True).encode()).hexdigest() if frozen is not None else None
+    ledger_plan_matches = frozen_hash is not None and ledger.get("plan_sha256") == frozen_hash
+    plan_bound_to_execution = ledger_plan_matches and frozen == plan
+    thresholds_frozen = (frozen is not None and frozen.get("analysis_config") == plan.get("analysis_config")
+        and ("plan_sha256" not in ledger or ledger_plan_matches))
     for stage in plan["stages"]:
         by_task = {task: {} for task in stage["tasks"]}
         for seed in stage["seeds"]:
@@ -115,6 +133,14 @@ def analyze(plan: dict, root: Path) -> dict:
             if not (folder / "summary.json").exists():
                 continue
             try:
+                if any(attempt.get("status") != "completed" for attempt in attempted):
+                    raise ValueError("seed block contains a failed, running or unknown attempt")
+                job_key = (stage["name"], seed)
+                if job_counts[job_key] > 1:
+                    raise ValueError("execution ledger contains duplicate seed attempts")
+                if job_key in jobs and jobs[job_key].get("status") != "completed":
+                    raise ValueError("execution ledger does not mark the seed block completed")
+                block_ttq, block_communication = [], []
                 hashes = json.loads((folder / "source_hashes.json").read_text())
                 if source_identity is not None and hashes != source_identity:
                     raise ValueError("seed block differs from the study's frozen runtime")
@@ -169,12 +195,29 @@ def analyze(plan: dict, root: Path) -> dict:
                                 result.get("worker_ids") != worker_ids or
                                 result.get("expected_clients") != stage.get("workers", plan["workers"])):
                             raise ValueError("physical worker topology differs from the matched protocol")
-                        observations[scheme_name(result["method"], result["fixed_boundary"])] = {
+                        scheme = scheme_name(result["method"], result["fixed_boundary"])
+                        observations[scheme] = {
                             "time_sec": float(result["server_duration_sec"]),
                             "quality": float(row["final_metrics"][PRIMARY[task]]),
                             "resolved_cut": result.get("resolved_fixed_boundary"),
                             "final_model_hash": result["final_model_hash"],
                         }
+                        analysis_config = plan.get("analysis_config", {})
+                        quality_config = analysis_config.get("tasks", {}).get(task, analysis_config)
+                        metric = quality_config.get("quality_metric", PRIMARY[task])
+                        for threshold in quality_config.get("time_to_quality_thresholds", []):
+                            # TTQ follows the metric frozen in the plan. It may
+                            # differ from the final-quality comparison metric
+                            # (e.g. text accuracy versus macro-F1).
+                            if not math.isfinite(threshold):
+                                raise ValueError("TTQ requires finite frozen thresholds")
+                            value = time_to_quality(result.get("evaluation_records", []), metric=metric, threshold=threshold) if thresholds_frozen else {
+                                "metric": metric, "threshold": threshold, "status": "unavailable", "time_sec": None,
+                                "reason": "Threshold configuration is not bound to the execution-time frozen plan"}
+                            block_ttq.append({"stage": stage["name"], "task": task, "seed": seed, "scheme": scheme,
+                                              "valid": True, "complete_paired_seed": True, **value})
+                        block_communication.append({"stage": stage["name"], "task": task, "seed": seed,
+                            "scheme": scheme, "complete_paired_seed": True, **communication_summary(result)})
                     if set(observations) != set(SCHEMES):
                         raise ValueError("missing comparator")
                     if any(not math.isfinite(v["time_sec"]) or v["time_sec"] <= 0
@@ -183,6 +226,8 @@ def analyze(plan: dict, root: Path) -> dict:
                     by_task[task][seed] = observations
                 if source_identity is None:
                     source_identity = hashes
+                ttq_rows.extend(block_ttq)
+                communication_rows.extend(block_communication)
             except (ValueError, KeyError, OSError) as exc:
                 # Exclude the entire seed block; successful methods must not
                 # turn a failed block into a favourable complete-case claim.
@@ -219,7 +264,9 @@ def analyze(plan: dict, root: Path) -> dict:
                 adjusted = holm_adjust(effect["sign_flip_p_value"] for effect in time_effects)
                 for index, baseline in enumerate(SCHEMES[:-1]):
                     time_effect, quality_effect = time_effects[index], quality_effects[index]
-                    complete = len(seeds) == len(stage["seeds"]) and len(seeds) >= plan["minimum_complete_pairs_for_primary_claim"]
+                    complete = (plan_bound_to_execution and len(seeds) == len(stage["seeds"])
+                        and len(seeds) >= plan["minimum_complete_pairs_for_primary_claim"]
+                        and all((stage["name"], seed) in jobs for seed in seeds))
                     faster = time_effect["confidence_interval_95"][1] < 0 and adjusted[index] < 0.05
                     noninferior = quality_effect["confidence_interval_95"][0] > -plan["quality_margin"][task]
                     item["comparisons"].append({
@@ -236,6 +283,10 @@ def analyze(plan: dict, root: Path) -> dict:
     return {"schema": "splitfleet.www2027-study-analysis.v1", "updated_unix": time.time(),
             "reports": reports, "exclusions": exclusions, "attempts": attempts,
             "selected_stages": ledger.get("selected_stages"), "execution_status": ledger.get("status", "unknown"),
+            "time_to_quality": ttq_rows, "paired_ttq_summary": summarize_paired_ttq(ttq_rows),
+            "ttq_thresholds_bound_to_frozen_plan": thresholds_frozen,
+            "plan_bound_to_execution": plan_bound_to_execution,
+            "communication": communication_rows,
             "inference_unit": "seed; stages and tasks analyzed separately",
             "limitations": ["Percentile bootstrap is approximate, particularly with few seeds",
                             "Sign-flip test assumes exchangeability of paired difference signs",
@@ -246,6 +297,9 @@ def analyze(plan: dict, root: Path) -> dict:
 
 def write_report(analysis: dict, root: Path) -> None:
     save_json(root / "analysis.json", analysis)
+    save_json(root / "time_to_quality.json", {"rows": analysis["time_to_quality"], "summaries": analysis["paired_ttq_summary"],
+        "thresholds_bound_to_frozen_plan": analysis["ttq_thresholds_bound_to_frozen_plan"]})
+    save_json(root / "communication.json", analysis["communication"])
     lines = ["# WWW2027 当前执行结果", "", "由真实结果与验证收据自动生成。校准不纳入推断；未完成不表示零耗时或零失败。", "",
              "| 阶段 | 任务 | 完成 seeds / 计划 | 方法 | 平均服务器秒 | 平均任务指标 |",
              "|---|---|---:|---|---:|---:|"]

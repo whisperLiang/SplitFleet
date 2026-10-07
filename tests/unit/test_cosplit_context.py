@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -48,6 +50,28 @@ def test_missing_telemetry_has_explicit_indicators() -> None:
     assert tuple(network[[7, 9, 11]]) == (1.0, 1.0, 1.0)
     assert tuple(server[[4, 6, 8, 11]]) == (1.0, 1.0, 1.0, 1.0)
     assert tuple(switch[[4, 6, 8]]) == (1.0, 1.0, 1.0)
+
+
+@pytest.mark.parametrize("direction", ["upload", "download"])
+def test_captured_payload_is_used_only_for_its_declared_batch(direction):
+    candidate = replace(_candidate(), framework_backend="jax", metadata={"payload_batch_size": 2})
+    encoder = ContextEncoder()
+    for telemetry in ({}, {"batch_size": 2}):
+        context = encoder.network_context(candidate, telemetry, direction=direction)
+        assert context[1] * 1048576 == candidate.boundary_forward_bytes
+        assert context[2] == context[-1] == 0
+    context = encoder.network_context(candidate, {"batch_size": 3}, direction=direction)
+    assert context[1] == 0 and context[2] == context[-1] == 1
+
+
+@pytest.mark.parametrize("sizes", [{2: None}, {"2": None}, {2: 8192}, {"2": 8192}])
+def test_batch_payload_map_overrides_capture_fallback_even_for_unknown_sizes(sizes):
+    candidate = replace(_candidate(), metadata={"payload_batch_size": 2,
+        "boundary_forward_bytes_by_batch_size": sizes})
+    context = ContextEncoder().network_context(candidate, {"batch_size": 2}, direction="upload")
+    expected = next(iter(sizes.values()))
+    assert context[1] * 1048576 == (expected or 0)
+    assert context[2] == context[-1] == float(expected is None)
 
 
 @pytest.mark.parametrize("value", ["invalid", float("nan"), float("inf")])

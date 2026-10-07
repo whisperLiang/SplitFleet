@@ -18,7 +18,8 @@ def test_physical_policy_uses_default_controller_without_experiment_switches(tmp
     )
     assert type(policy.exploration_controller) is SafeExplorationController
     assert policy.config.safe_exploration_epsilon == .05
-    assert policy.context_encoder.edge_dimension == 12
+    assert policy.context_encoder.edge_dimension == 13
+    assert policy.context_encoder.feature_schema == "cosplit_context"
 
 
 def test_missing_worker_batch_context_is_refused_before_cost_updates(tmp_path):

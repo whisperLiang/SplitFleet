@@ -44,8 +44,12 @@ def test_adaptation_metric_requires_sustained_recovery_and_preserves_censoring()
 
 def test_online_feedback_moves_preference_after_declared_link_change():
     # This is a synthetic mechanism check, not a physical training result.
-    early = replace(_candidate("early", .25), boundary_forward_bytes=100000, boundary_gradient_bytes=100000)
-    late = replace(_candidate("late", .75), boundary_forward_bytes=10000, boundary_gradient_bytes=10000)
+    # MiB-scale payloads exercise the canonical linear byte features. Scale
+    # compute times equally to preserve the scenario's two optimal cuts.
+    early = replace(_candidate("early", .25), boundary_forward_bytes=1000000, boundary_gradient_bytes=1000000,
+                    metadata={"payload_batch_size": 1, "boundary_forward_bytes_by_batch_size": {1: 1000000}})
+    late = replace(_candidate("late", .75), boundary_forward_bytes=100000, boundary_gradient_bytes=100000,
+                   metadata={"payload_batch_size": 1, "boundary_forward_bytes_by_batch_size": {1: 100000}})
     scenario = bandwidth_degradation(change_round=41)
     telemetry = {"client": {"num_batches": 1, "batch_size": 1}}
     # Disable exploratory replacements to test the learned cost preference.
@@ -63,10 +67,12 @@ def test_online_feedback_moves_preference_after_declared_link_change():
         candidate = candidates[boundary]
         policy.observe_round(round_id=round_id, feedback=[PlacementFeedback(
             round_id=round_id, client_id="client", boundary=boundary,
-            client_forward_ms=10 if boundary == "early" else 80, client_backward_ms=0,
+            client_forward_ms=100 if boundary == "early" else 800, client_backward_ms=0,
             network_upload_ms=network.transfer_ms(candidate.boundary_forward_bytes, direction="upload"),
             network_download_ms=network.transfer_ms(candidate.boundary_gradient_bytes, direction="download"),
-            server_service_ms=20 if boundary == "early" else 2, switch_ms=0, num_batches=1)])
+            network_roundtrip_ms=(network.transfer_ms(candidate.boundary_forward_bytes, direction="upload")
+                                  + network.transfer_ms(candidate.boundary_gradient_bytes, direction="download")),
+            server_service_ms=200 if boundary == "early" else 20, switch_ms=0, num_batches=1)])
     assert choices[20:40].count("early") > choices[20:40].count("late")
     assert choices[-20:].count("late") > choices[-20:].count("early")
-    assert policy.learners.network.update_count("client") == 180
+    assert policy.learners.network.update_count("client") == 90

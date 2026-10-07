@@ -7,8 +7,8 @@ from math import isfinite
 from typing import Any, Mapping, Protocol, Sequence
 
 
-ALGORITHM_VERSION = "cosplit_ucb_v1"
-FEATURE_SCHEMA_VERSION = "cosplit_context_v1"
+ALGORITHM_NAME = "cosplit_ucb"
+FEATURE_SCHEMA = "cosplit_context"
 
 
 @dataclass(frozen=True, order=True)
@@ -125,6 +125,10 @@ class CandidateEstimate:
     switch_uncertainty_ms: float
     feasible: bool = True
     infeasible_reason: str | None = None
+    network_roundtrip_mean_ms: float = 0.0
+    network_roundtrip_uncertainty_ms: float = 0.0
+    state_exchange_mean_ms: float = 0.0
+    state_exchange_uncertainty_ms: float = 0.0
 
     def __post_init__(self) -> None:
         numeric_fields = (
@@ -140,6 +144,10 @@ class CandidateEstimate:
             "network_download_uncertainty_ms",
             "server_service_uncertainty_ms",
             "switch_uncertainty_ms",
+            "network_roundtrip_mean_ms",
+            "network_roundtrip_uncertainty_ms",
+            "state_exchange_mean_ms",
+            "state_exchange_uncertainty_ms",
         )
         for name in numeric_fields:
             value = float(getattr(self, name))
@@ -157,6 +165,8 @@ class CandidateEstimate:
                 self.network_download_mean_ms,
                 self.server_service_mean_ms,
                 self.switch_mean_ms,
+                self.network_roundtrip_mean_ms,
+                self.state_exchange_mean_ms,
             )
         )
 
@@ -170,6 +180,8 @@ class CandidateEstimate:
                 self.network_download_uncertainty_ms,
                 self.server_service_uncertainty_ms,
                 self.switch_uncertainty_ms,
+                self.network_roundtrip_uncertainty_ms,
+                self.state_exchange_uncertainty_ms,
             )
         )
 
@@ -200,8 +212,10 @@ class PlacementFeedback:
     num_batches: int = 0
     client_peak_memory_mb: float | None = None
     server_peak_memory_mb: float | None = None
+    network_roundtrip_ms: float | None = None
     execution_profile: ExecutionProfileKey | Mapping[str, Any] | str | None = None
     success: bool = True
+    state_exchange_ms: float | None = None
 
 
 @dataclass(frozen=True)
@@ -261,8 +275,8 @@ class RuntimeTelemetryProvider(Protocol):
 
 
 __all__ = [
-    "ALGORITHM_VERSION",
-    "FEATURE_SCHEMA_VERSION",
+    "ALGORITHM_NAME",
+    "FEATURE_SCHEMA",
     "CandidateEstimate",
     "ExecutionProfileKey",
     "PlacementFailure",

@@ -118,13 +118,19 @@ class TorchLensCandidateProvider:
             cross_stage_spans = tuple((min(positions), max(positions))
                                       for positions in locations.values())
         pre_rejected: dict[str, str] = {}
+        parameter_bytes = {}
+        payload_sizes = {}
         if self.framework_backend == "torch":
-            from splitfleet.autosplit.torchlens_candidate import ParameterCountIndex
-            from torchlens.split.errors import SplitRequestError, SplitUnsupportedError
+            from splitfleet.autosplit.torchlens_candidate import ParameterCountIndex, ParameterByteIndex, payload_bytes_from_plan
+            from torchlens.split.errors import SplitRequestError, SplitUnsupportedError, SplitBoundaryError
             from torchlens.split.planner import plan_split
 
             runtime = backend.runtime
             parameter_index = ParameterCountIndex.from_runtime(runtime)
+            byte_index = ParameterByteIndex.from_runtime(runtime)
+            low, high = self.dynamic_batch or (runtime.traced_batch_size, runtime.traced_batch_size)
+            batches = set(range(low, high + 1)) if high - low < 64 else {low, high}
+            batches.add(runtime.traced_batch_size)
             for site in runtime.split_points(diagnose=False).candidates:
                 if site.kind not in self.kinds:
                     continue
@@ -134,6 +140,17 @@ class TorchLensCandidateProvider:
                     # Leave structural failures to TorchLens's normal report.
                     continue
                 boundary = f"{plan.boundary_kind}:{plan.target_node_id}"
+                parameter_bytes[boundary] = (byte_index.count(plan.prefix_node_ids),
+                                             byte_index.count(plan.suffix_node_ids))
+                sizes = {}
+                for batch_size in sorted(batches):
+                    try:
+                        sizes[batch_size] = payload_bytes_from_plan(runtime, plan, batch_size=batch_size)
+                    except SplitBoundaryError:
+                        # Missing shape proofs remain unknown cost features;
+                        # they do not silently change the existing catalog.
+                        sizes[batch_size] = None
+                payload_sizes[boundary] = sizes
                 prefix_nodes = len(plan.prefix_node_ids)
                 if training and not parameter_index.count(plan.suffix_node_ids, trainable_only=True):
                     pre_rejected[boundary] = "suffix_not_trainable"
@@ -221,6 +238,10 @@ class TorchLensCandidateProvider:
                     valid=True,
                     runtime_contract=dict(runtime_plan.runtime_contract),
                     metadata={
+                        "optimizer_prefix_parameter_bytes": parameter_bytes.get(candidate.boundary, (None, None))[0],
+                        "optimizer_suffix_parameter_bytes": parameter_bytes.get(candidate.boundary, (None, None))[1],
+                        "boundary_forward_bytes_by_batch_size": payload_sizes.get(candidate.boundary, {}),
+                        "payload_batch_size": candidate.descriptor.get("payload_batch_size"),
                         "candidate_id": candidate.candidate_id,
                         "node_index": candidate.node_index,
                         "boundary_tensor_labels": tuple(candidate.boundary_tensor_labels),

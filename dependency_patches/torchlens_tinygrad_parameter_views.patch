@@ -1,0 +1,21 @@
+diff --git a/torchlens/split/adapters/tinygrad.py b/torchlens/split/adapters/tinygrad.py
+index 9657abff..0e55ab98 100644
+--- a/torchlens/split/adapters/tinygrad.py
++++ b/torchlens/split/adapters/tinygrad.py
+@@ -588,6 +588,16 @@ class _TinygradGeneratedSegmentBase:
+                 f"{node.label!r} has no tinygrad UOp capture.",
+                 context=self._context(node, "missing tinygrad UOp capture"),
+             )
++        live_tensor = capture.live_tensor
++        if node.op_type != "buffer" and self._backend.is_tensor(live_tensor):
++            # A named parameter may itself be a PERMUTE or SHRINK view. Its
++            # BUFFER ancestor cannot be rebound by flattening that parameter:
++            # the view changes element order or selects only part of storage.
++            # Bind the exact captured parameter occurrence instead, retaining
++            # the Tensor identity when state loading replaces its lazy UOp.
++            if any(getattr(param, "_param_ref", None) is live_tensor for param in node.param_refs):
++                bound = self._move_source_to_device(live_tensor, target_device)
++                return bound if preserve_autograd else self._backend._realized_copy(bound)
+         if node.op_type == "buffer":
+             # BUFFER UOps identify an allocation, not a portable parameter
+             # value.  Rewriting only their DEVICE leaf can reinterpret a CPU

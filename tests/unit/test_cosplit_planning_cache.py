@@ -12,7 +12,7 @@ from splitfleet.server.placement.cosplit_ucb import (
 
 
 def _model(size=2):
-    return DiscountedLinUCB(3, discount_gamma=0.5, feature_schema_version="cache-test",
+    return DiscountedLinUCB(3, discount_gamma=0.5, feature_schema="cache-test",
                            prediction_cache_size=size)
 
 
@@ -94,11 +94,11 @@ def test_model_lookup_creates_only_one_pair_per_execution_group_and_link(monkeyp
     profile = ExecutionProfileKey("pytorch", "native", "cuda", "orin", "fp32")
     for _ in range(5):
         learners.edge.predict(profile, np.ones(ContextEncoder.edge_dimension))
-        learners.network.predict("a", np.ones(13), np.ones(13))
-    assert len(calls) == 4
+        learners.network.predict_roundtrip("a", np.ones(ContextEncoder.network_dimension))
+    assert len(calls) == 3
     learners.edge.predict(replace(profile, precision="fp16"), np.ones(ContextEncoder.edge_dimension))
-    learners.network.predict("b", np.ones(13), np.ones(13))
-    assert len(calls) == 8
+    learners.network.predict_roundtrip("b", np.ones(ContextEncoder.network_dimension))
+    assert len(calls) == 6
 
 
 def _estimate(cid, boundary="x", forward=1, service=5):

@@ -123,6 +123,148 @@ class RoundBarrier:
                 connection.close()
 
 
+def _validate_training_calibration(result, bundle, identities):
+    """Audit restored optimizer calibration, including original worker receipts."""
+    errors = []
+    initialization = result.get("cost_initialization_receipt") or {}
+    steps, measured = 2, 1
+    anchors = bundle.get("online_calibration_boundaries") or []
+    if (not anchors or len(anchors) != len(set(anchors))
+            or tuple(result.get("online_calibration_boundaries") or ()) != tuple(anchors)):
+        errors.append("training calibration anchors differ from the frozen bundle")
+    expected = set(anchors)
+    if not expected <= {row.get("boundary") for row in result.get("candidate_catalog", [])}:
+        errors.append("training calibration anchors are absent from the candidate catalog")
+    if (initialization.get("temporary_optimizer_updates") is not True
+            or initialization.get("discounted_online_updates_retained") is not True
+            or initialization.get("network_initialized") is not True):
+        errors.append("training calibration initialization scope is invalid")
+    probe = initialization.get("transport_bootstrap") or {}
+    samples = probe.get("samples", [])
+    expected_probes = {(cid, size, repeat) for cid in identities
+                       for size in (65536, 2097152) for repeat in range(2)}
+    observed_probes = {(row.get("logical_client_id"), row.get("payload_bytes"), row.get("repeat"))
+                       for row in samples}
+    try:
+        valid_probe_costs = all(math.isfinite(float(row["roundtrip_ms"])) and float(row["roundtrip_ms"]) > 0
+                                and row.get("echo_verified") is True for row in samples)
+        valid_probe_costs = valid_probe_costs and math.isfinite(float(probe["elapsed_sec"])) and float(probe["elapsed_sec"]) >= 0
+    except (KeyError, TypeError, ValueError):
+        valid_probe_costs = False
+    warmup = probe.get("warmup_samples", [])
+    expected_warmup = {(cid, 65536, repeat) for cid in identities for repeat in range(2)}
+    try:
+        valid_warmup = (len(warmup) == len(expected_warmup)
+            and {(row["logical_client_id"], row["payload_bytes"], row["repeat"]) for row in warmup} == expected_warmup
+            and all(math.isfinite(float(row["roundtrip_ms"])) and float(row["roundtrip_ms"]) > 0
+                    and row.get("echo_verified") is True for row in warmup))
+    except (KeyError, TypeError, ValueError):
+        valid_warmup = False
+    if (probe.get("schema") != "splitfleet.current-transport-probe"
+            or probe.get("source") != "current_deployment_flower_echo"
+            or observed_probes != expected_probes or len(samples) != len(expected_probes)
+            or not valid_probe_costs or not valid_warmup):
+        errors.append("online transport bootstrap is incomplete or invalid")
+    exchange = initialization.get("state_exchange_bootstrap") or {}
+    rows = exchange.get("samples", [])
+    expected_exchange = {(cid, down, up, repeat) for cid in identities
+                         for down, up in ((65536, 65536), (2097152, 65536), (65536, 2097152))
+                         for repeat in range(2)}
+    try:
+        valid_exchange = (len(rows) == len(expected_exchange)
+            and {(row["logical_client_id"], row["request_bytes"], row["reply_bytes"], row["repeat"])
+                 for row in rows} == expected_exchange
+            and all(math.isfinite(float(row["roundtrip_ms"])) and float(row["roundtrip_ms"]) > 0
+                    and row.get("reply_verified") is True for row in rows))
+    except (KeyError, TypeError, ValueError):
+        valid_exchange = False
+    if (exchange.get("schema") != "splitfleet.current-state-exchange-probe"
+            or exchange.get("source") != "current_deployment_controlled_request_reply_sizes"
+            or not valid_exchange):
+        errors.append("online state exchange bootstrap is incomplete or invalid")
+    for row in result.get("candidate_catalog", []):
+        if any(not isinstance(row.get(key), int) or row[key] <= 0 for key in
+               ("optimizer_prefix_parameter_bytes", "optimizer_suffix_parameter_bytes")):
+            errors.append("online optimizer ownership byte features are missing or invalid")
+            break
+        sizes = row.get("boundary_forward_bytes_by_batch_size") or {}
+        batch = int(bundle.get("batch_size", 1))
+        size = sizes.get(batch, sizes.get(str(batch)))
+        if not isinstance(size, int) or size <= 0:
+            errors.append("online training batch payload size is missing or invalid")
+            break
+    server = initialization.get("server_calibration") or {}
+    receipts = [(None, server)]
+    clients = {}
+    for context in (result.get("online_worker_contexts") or {}).values():
+        logical_id = context.get("logical_client_id")
+        try:
+            receipt = json.loads(context.get("online_calibration_receipt", "null"))
+        except (TypeError, ValueError):
+            receipt = None
+        if (logical_id not in identities or logical_id in clients
+                or not isinstance(receipt, dict)):
+            errors.append("training calibration worker receipt is missing or duplicated")
+            continue
+        clients[logical_id] = receipt
+        receipts.append((logical_id, receipt))
+        if str(receipt.get("device", "")).split(":", 1)[0] != (
+                "cuda" if identities[logical_id] == "gpu" else "cpu"):
+            errors.append(f"training calibration {logical_id}: device mismatch")
+    if set(clients) != set(identities):
+        errors.append("training calibration does not cover every configured worker")
+    server_rows = {row.get("boundary"): row for row in server.get("records", [])}
+    logical_samples = []
+    for logical_id, receipt in receipts:
+        label = logical_id or "server"
+        source = ("client_private_sample_current_deployment" if logical_id is not None
+                  else "server_shape_matched_current_deployment")
+        if receipt.get("schema") != "splitfleet.cosplit-calibration" or receipt.get("source") != source:
+            errors.append(f"training calibration {label}: schema or source mismatch")
+        if (receipt.get("model_hash_before") != bundle.get("initial_model_hash")
+                or receipt.get("model_hash_after") != bundle.get("initial_model_hash")
+                or receipt.get("state_and_torch_rng_preserved") is not True
+                or receipt.get("persistent_optimizer_steps") != 0
+                or receipt.get("optimizer_steps") != len(expected) * steps
+                or receipt.get("warmup_batches") != 1):
+            errors.append(f"training calibration {label}: restored state or optimizer scope mismatch")
+        rows = receipt.get("records", [])
+        if len(rows) != len(expected) or {row.get("boundary") for row in rows} != expected:
+            errors.append(f"training calibration {label}: anchor coverage mismatch")
+        try:
+            duration = float(receipt.get("elapsed_sec", -1))
+            valid = math.isfinite(duration) and duration >= 0
+        except (TypeError, ValueError):
+            valid = False
+        if not valid:
+            errors.append(f"training calibration {label}: invalid duration")
+        for row in rows:
+            canonical = server_rows.get(row.get("boundary"), {})
+            if (not row.get("graph_signature") or not row.get("feature_abi_id")
+                    or any(row.get(key) != canonical.get(key)
+                           for key in ("graph_signature", "feature_abi_id"))):
+                errors.append(f"training calibration {label}: graph or boundary ABI mismatch")
+            if (row.get("optimizer_stage") != ("prefix" if logical_id is not None else "suffix")
+                    or row.get("optimizer_steps") != steps or row.get("measured_batches") != measured):
+                errors.append(f"training calibration {label}: sample optimizer scope mismatch")
+            try:
+                valid = all(math.isfinite(float(row[key])) and float(row[key]) >= 0
+                            for key in ("client_forward_ms", "client_backward_ms", "local_tail_service_ms", "loss"))
+            except (KeyError, TypeError, ValueError):
+                valid = False
+            if not valid:
+                errors.append(f"training calibration {label}: invalid measured costs")
+            if logical_id is not None:
+                logical_samples.append({"logical_client_id": logical_id, **row})
+    sample_key = lambda row: (str(row.get("logical_client_id")), str(row.get("boundary")))
+    if sorted(logical_samples, key=sample_key) != sorted(initialization.get("client_samples", []), key=sample_key):
+        errors.append("training calibration learner samples differ from the original worker receipts")
+    if initialization.get("client_calibration_elapsed_sec") != {
+            logical_id: receipt.get("elapsed_sec") for logical_id, receipt in clients.items()}:
+        errors.append("training calibration worker durations differ from the original receipts")
+    return errors
+
+
 def validate_result(result: dict[str, Any], *, task: str, method: str, rounds: int,
                     hosts: list[dict[str, str]], batch_size: int,
                     bundle: dict[str, Any],
@@ -169,8 +311,9 @@ def validate_result(result: dict[str, Any], *, task: str, method: str, rounds: i
         if result.get("online_cost_learning") is not True:
             errors.append("SplitFleet online cost learning receipt is missing")
         initialization = result.get("cost_initialization_receipt") or {}
-        if initialization.get("source") != "current_deployment_no_update_split_calibration":
+        if initialization.get("source") != "current_deployment_restored_training_cost_calibration":
             errors.append("current-deployment calibration receipt is missing")
+        errors.extend(_validate_training_calibration(result, bundle, identities))
         if initialization.get("initial_model_hash") != bundle.get("initial_model_hash"):
             errors.append("calibration initial model differs from the frozen bundle")
         if initialization.get("prediction_override") is not False:
@@ -184,6 +327,9 @@ def validate_result(result: dict[str, Any], *, task: str, method: str, rounds: i
                 for value in counts.values()
             ):
                 errors.append(f"round {round_id}: online learner update receipt is missing")
+            if any(
+                    value.get("state_exchange_update_count") != 6 + round_id for value in counts.values()):
+                errors.append(f"round {round_id}: state exchange learner update receipt is invalid")
     if result.get("fit_failures") or result.get("expected_clients") != num_workers:
         errors.append("all configured failure-free workers were not reported")
     all_fits = result.get("fit_records", [])
@@ -239,6 +385,10 @@ def validate_result(result: dict[str, Any], *, task: str, method: str, rounds: i
                 errors.append(f"round {round_id}: {host['id']} has no distinct CPU/GPU processes")
         for row in fits:
             metrics = row.get("metrics", {})
+            if method == "splitfleet":
+                from splitfleet.server.placement.cosplit_ucb.rpc_timing import state_exchange_duration
+                if state_exchange_duration(metrics) is None:
+                    errors.append(f"round {round_id}: actual state exchange timing is missing or invalid")
             identity = metrics.get("logical_client_id")
             kind = identities.get(identity)
             device = str(metrics.get("device", ""))

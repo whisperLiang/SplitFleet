@@ -14,10 +14,10 @@ from splitfleet.server.placement.cosplit_ucb.learners import CandidateContexts
 def _contexts(encoder: ContextEncoder) -> CandidateContexts:
     return CandidateContexts(
         edge=np.ones(encoder.edge_dimension),
-        upload=np.ones(encoder.network_dimension),
-        download=np.ones(encoder.network_dimension),
+        network=np.ones(encoder.network_dimension),
         server=np.ones(encoder.server_dimension),
         switch=np.ones(encoder.switch_dimension),
+        exchange=np.ones(encoder.exchange_dimension),
     )
 
 
@@ -50,14 +50,12 @@ def test_network_is_client_specific_and_server_is_global() -> None:
     contexts = _contexts(encoder)
     learners.network.update(
         "a",
-        contexts.upload,
-        contexts.download,
-        upload_ms=50.0,
-        download_ms=10.0,
+        contexts.network,
+        60.0,
         round_id=1,
     )
-    assert learners.network.predict("a", contexts.upload, contexts.download)[0].mean > 0
-    assert learners.network.predict("b", contexts.upload, contexts.download)[0].mean == 0
+    assert learners.network.predict_roundtrip("a", contexts.network).mean > 0
+    assert learners.network.predict_roundtrip("b", contexts.network).mean == 0
 
     learners.server.update(contexts.server, 80.0, round_id=1)
     assert learners.server.predict(contexts.server).mean > 0

@@ -516,6 +516,8 @@ class AutoSplitStrategy(PlainSlStrategy):
             np.array(value, copy=True) for value in initial
         ]
         instructions = super().configure_fit(server_round, parameters, client_manager)
+        if hasattr(self.placement_policy, "state_download_bytes"):
+            self.placement_policy.state_download_bytes = sum(len(value) for value in parameters.tensors)
         prepare_calibration = getattr(self.placement_policy, "prepare_calibration", None)
         if (prepare_calibration is not None and self.backend_adapter.backend_name == "torch"
                 and hasattr(self.placement_policy.candidate_provider, "model")):
@@ -525,6 +527,7 @@ class AutoSplitStrategy(PlainSlStrategy):
                 if self._calibration_batch is not None else None,
                 loss_fn=self.loss_fn, device=self.runtime_device,
                 parameters=initial,
+                optimizer_fn=self.optimizer_fn,
             )
         bind_clients = getattr(self.placement_policy, "bind_clients", None)
         if bind_clients is not None:
@@ -545,6 +548,9 @@ class AutoSplitStrategy(PlainSlStrategy):
                 self._round_ownership.setdefault(int(server_round), {})[str(client.cid)] = json.loads(
                     fit_ins.config[OWNERSHIP_KEY])
         self._round_fit_dispatch_start[int(server_round)] = time.perf_counter()
+        if hasattr(self.placement_policy, "state_download_bytes"):
+            from splitfleet.server.placement.cosplit_ucb.rpc_timing import TimedFitClientProxy
+            instructions = [(TimedFitClientProxy(client), ins) for client, ins in instructions]
         return instructions
 
     def select_fit_clients(
@@ -750,6 +756,7 @@ class AutoSplitStrategy(PlainSlStrategy):
         if observe_round is None and observe_failure is None:
             return
         if observe_round is not None:
+            from splitfleet.server.placement.cosplit_ucb.rpc_timing import state_exchange_duration
             observations = []
             for client, fit_res in results:
                 cid = getattr(client, "cid", None)
@@ -768,6 +775,8 @@ class AutoSplitStrategy(PlainSlStrategy):
                     client_backward_ms=self._optional_metric(metrics, "client_backward_ms"),
                     network_upload_ms=self._optional_metric(metrics, "network_upload_ms"),
                     network_download_ms=self._optional_metric(metrics, "network_download_ms"),
+                    network_roundtrip_ms=self._optional_metric(metrics, "network_roundtrip_ms"),
+                    state_exchange_ms=state_exchange_duration(metrics),
                     server_service_ms=self._optional_metric(metrics, "server_service_ms"),
                     switch_ms=self._optional_metric(metrics, "switch_ms"),
                     completion_ms=self._optional_metric(metrics, "fit_duration_ms"),

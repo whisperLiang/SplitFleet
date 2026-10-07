@@ -66,12 +66,13 @@ class SafeExplorationController:
         baseline_upper = solver.simulate(
             baseline, use_upper=True, batch_counts=batch_counts
         ).max_client_completion_ms
-        safe_budget = (1.0 + self.epsilon) * baseline_upper
         baseline_mean = solver.simulate(
             baseline, batch_counts=batch_counts
         ).max_client_completion_ms
         mean_budget = (1.0 + self.epsilon) * baseline_mean
+        safe_budget = mean_budget
         rejected_by_mean = 0
+        rejected_by_upper = 0
         alternatives: list[tuple[tuple[float, ...], str, CandidateEstimate, float, bool]] = []
         for client_id in sorted(baseline):
             if client_id in locked:
@@ -97,8 +98,8 @@ class SafeExplorationController:
                 )
                 trial = {**baseline, client_id: option}
                 count = int((batch_counts or {}).get(client_id, 1))
-                standalone_mean = option.switch_mean_ms + count * (
-                    option.mean_total_without_queue_ms - option.switch_mean_ms
+                standalone_mean = option.switch_mean_ms + option.state_exchange_mean_ms + count * (
+                    option.mean_total_without_queue_ms - option.switch_mean_ms - option.state_exchange_mean_ms
                 )
                 trial_mean = solver.simulate(
                     trial, batch_counts=batch_counts
@@ -110,6 +111,7 @@ class SafeExplorationController:
                     trial, use_upper=True, batch_counts=batch_counts
                 ).max_client_completion_ms
                 if upper > safe_budget + 1e-9:
+                    rejected_by_upper += 1
                     continue
                 # Forced-safe probes take precedence. Information gain is
                 # represented by the confidence radius; optimistic cost only
@@ -140,6 +142,7 @@ class SafeExplorationController:
                 trial, use_upper=True, batch_counts=batch_counts
             ).max_client_completion_ms
             if final_upper > safe_budget + 1e-9:
+                rejected_by_upper += 1
                 continue
             baseline_boundary = final[client_id].boundary
             final[client_id] = option
@@ -157,11 +160,15 @@ class SafeExplorationController:
             )
         self.round_records[int(round_id)] = {
             "baseline_mean_makespan_ms": baseline_mean,
+            "baseline_upper_makespan_ms": baseline_upper,
             "mean_budget_ms": mean_budget,
+            "safe_budget_ms": safe_budget,
+            "upper_budget_basis": "baseline_mean",
             "final_mean_makespan_ms": solver.simulate(
                 final, batch_counts=batch_counts
             ).max_client_completion_ms,
             "rejected_by_mean_budget": rejected_by_mean,
+            "rejected_by_upper_budget": rejected_by_upper,
         }
         return final, decisions
 
@@ -182,6 +189,7 @@ class SafeExplorationController:
 
     def state_dict(self) -> dict[str, Any]:
         return {
+            "upper_budget_basis": "baseline_mean",
             "last_probe_round": dict(sorted(self.last_probe_round.items())),
             "candidate_last_explored_round": {
                 client_id: {
@@ -199,6 +207,8 @@ class SafeExplorationController:
         }
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        if state.get("upper_budget_basis") != "baseline_mean":
+            raise ValueError("exploration upper-budget basis mismatch")
         self.last_probe_round = {
             str(key): int(value) for key, value in state.get("last_probe_round", {}).items()
         }
