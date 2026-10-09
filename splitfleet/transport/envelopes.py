@@ -108,7 +108,12 @@ def encode_tensor(tensor_id: str, tensor: torch.Tensor) -> TensorEnvelope:
     # PyTorch does not allow a zero-dimensional tensor to be reinterpreted as
     # a dtype with a different element size. Flattening first preserves the raw
     # storage while allowing scalar boundary metadata to use the same codec.
-    payload = value.reshape(-1).view(torch.uint8).numpy().tobytes()
+    flat = value.reshape(-1)
+    # A singleton dimension can be "contiguous" with a non-unit stride, so
+    # contiguous() alone does not guarantee a valid byte view for its dtype.
+    if flat.stride(0) != 1:
+        flat = flat.clone(memory_format=torch.contiguous_format)
+    payload = flat.view(torch.uint8).numpy().tobytes()
     return TensorEnvelope(
         tensor_id=str(tensor_id),
         shape=tuple(int(dim) for dim in value.shape),

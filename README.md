@@ -3,7 +3,7 @@
 SplitFleet combines a unified split federated learning (SFL) abstraction, SFL-grade fine-grained partitioning, and CoSplit-UCB fleet-wide adaptive placement. Built on [Flower](https://flower.ai/), it separates backend, task, partition, aggregation, and placement contracts. Five backend adapters implement the same SFL execution contract.
 
 The unified task interface covers image classification, text classification, object detection, semantic segmentation, and instance segmentation.
-Architecture notes and study protocols are kept locally in `plans/` and excluded from Git.
+Maintained experiment protocols are in `experiments/`; the local manuscript and evidence guide is `paper/README.md`.
 Dataset-level integrations can be registered through `TaskSpec`/`TaskRegistry`, which bind a task adapter, model and dataset factories, metrics, and candidate cuts without coupling the split runtime to a dataset package.
 CoSplit-UCB is the default adaptive policy. Physical PyTorch runs calibrate four structural anchors with temporary stage-owned optimizers, restore model state and random streams, and learn from measured training feedback. Costs use actual optimizer-owned parameter bytes and batch payload sizes; state exchange is learned once per client round with nonnegative coefficients. Exploration limits both mean and confidence-upper round time to 105% of the baseline mean by default.
 Fresh calibration synchronizes Flower's current global weights and uses the server's captured batch contract. Evaluation binds worker metadata without calibrating. A compatible restored learner keeps its statistics and continues from online feedback without repeating initialization.
@@ -242,9 +242,7 @@ Pass `batch_axes={}` to capture the exact example shape without dynamic batch
 axes. Set it on both `AutoSplitStrategy` and `AutoSplitSplitLearningClient`, with
 matching sample shapes, and keep the data-loader batch shape fixed. This is the
 explicit training path used by the BatchNorm1d, DeepLab and Swin configurations
-whose native dynamic batch probes cannot validate replay. Fixed-shape examples
-and native limitations are described in the local architecture guide,
-`plans/unified_framework.md`, under “细粒度分割”.
+whose native dynamic batch probes cannot validate replay. Fixed-shape examples and native limitations are covered by the batch-window tests and the full-model protocol in `experiments/EXECUTION_COVERAGE.md`.
 Changing a fixed input shape requires a separate capture; widening
 `dynamic_batch` does not make that shape dynamic.
 
@@ -357,11 +355,33 @@ mode are the two deltas summed. Shared buffers are not treated as tied.
 
 ## Validation
 
-The local architecture guide, `plans/unified_framework.md`, describes validation scopes and reproduction commands. Verify the retained physical study without rewriting its results:
+The [execution coverage guide](experiments/EXECUTION_COVERAGE.md) describes complete cut catalogs and paired training checks. Audit the retained physical study without rewriting its results:
 
 ```bash
-.venv/bin/python paper/evidence/verify_four_task_study.py
+.venv/bin/python paper/refresh_evidence.py --output-dir /tmp/splitfleet_evidence_audit --use-checkpoint-receipts
 ```
+
+Completed training weights and unused input copies have been pruned. This audit
+recomputes statistics from retained results and uses the recorded pre-pruning
+checkpoint checks; it does not reload deleted weights. The four RQ1 input bundles
+and actual PPO actor remain. See [storage cleanup](paper/evidence/storage_cleanup_receipt.json).
+
+The manuscript's retained cohorts and required support files are listed in
+[results/README.md](results/README.md). Unused pilots, intermediate analyses,
+unexecuted plans and duplicate experiment snapshots have been pruned. The
+[experiment cleanup receipt](paper/evidence/unused_experiment_cleanup_receipt.json)
+records removed paths and checks that cited raw results, failures, inputs and
+figures retain their original hashes.
+
+New experiment runs default to compact storage. Servers keep numerical results,
+failures and a final in-memory finite/hash check; full task weights require
+`--save-model`. Prepared server/client bundles reference shared weights and data,
+and layer variants change metadata without copying those tensors. The physical
+matrix deletes its owned inputs after it stops its workers, including on failure;
+use `--keep-input-bundles` to retain them for replay or debugging. Manifests,
+input hashes, frozen source and logs remain. Standalone input preparation keeps
+its shared assets for subsequent runs; it cannot delete inputs used by other jobs.
+The genuinely trained PPO actor remains a required output.
 
 TorchLens 2.34.1 wheel and API checks:
 

@@ -3,13 +3,19 @@
 from types import SimpleNamespace
 import json
 import pytest
+import torch
+
+from experiments.common.bundle_storage import write_bundle
+from experiments.common.identity import tensor_state_hash
+from experiments.unified_multitask.data import _dataset_pair_hash
 
 from experiments import orchestrate_physical_multitask as orchestrator
 
 
 @pytest.mark.parametrize("model_name", ["rfdetr_nano", "resnet50_pretrained", "bert_base", "deeplabv3_resnet50"])
 @pytest.mark.parametrize("layout", ["legacy", "first_gpu", "all_gpu"])
-def test_remote_server_outside_worker_hosts_receives_code_and_bundle(tmp_path, monkeypatch, model_name, layout):
+@pytest.mark.parametrize("keep_inputs", [False, True])
+def test_remote_server_outside_worker_hosts_receives_code_and_bundle(tmp_path, monkeypatch, model_name, layout, keep_inputs):
     hosts = [
         {"id": f"edge-{index}", "ssh": f"edge-{index}", "workdir": "/work"}
         for index in range(3)
@@ -38,9 +44,14 @@ def test_remote_server_outside_worker_hosts_receives_code_and_bundle(tmp_path, m
     def fake_prepare_bundle(*, task, output, **kwargs):
         preparations.append(kwargs)
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_bytes(b"server")
-        for index in range(6):
-            output.with_name(f"{task}.client_{index}.pt").write_bytes(b"client")
+        state = {"weight": torch.ones(4)}
+        payload = {"task": task, "initial_model_state": state,
+                   "initial_model_hash": tensor_state_hash(state), "test_items": []}
+        for index in range(-1, 6):
+            items = [(torch.full((3, 4, 4), float(index)), 0)]
+            path = output if index == -1 else output.with_name(f"{task}.client_{index}.pt")
+            write_bundle(path, {**payload, "role": "server" if index == -1 else "client",
+                               "train_items": items, "local_data_hash": _dataset_pair_hash(items, [])})
         return {"task": task}
 
     monkeypatch.setattr(orchestrator, "_ssh", fake_ssh)
@@ -60,6 +71,7 @@ def test_remote_server_outside_worker_hosts_receives_code_and_bundle(tmp_path, m
         seed=1, train_samples=1, test_samples=1, batch_size=1,
         rounds=1, timeout=1,
         model_name=model_name,
+        keep_input_bundles=keep_inputs,
     )
 
     remote_root = "/tmp/splitfleet_physical_multitask_remote-server"
@@ -84,3 +96,9 @@ def test_remote_server_outside_worker_hosts_receives_code_and_bundle(tmp_path, m
                for command in commands)
     assert all("device_profiles" not in call and "online_initialization" not in call for call in training_calls)
     assert {row["status"] for row in json.loads((tmp_path / "remote-server" / "attempts.json").read_text())} == {"completed"}
+    model_copies = [command for command in commands if command[0] == "scp"
+                    and command[-2].split('/')[-1].startswith('model-')]
+    assert len(model_copies) == 4  # Once per host, shared by its local roles.
+    assert all(call["save_model"] is False for call in training_calls)
+    assert bool(list((tmp_path / "remote-server" / "bundles").rglob('*.pt'))) == keep_inputs
+    assert (tmp_path / "remote-server" / "input_storage.json").exists() != keep_inputs

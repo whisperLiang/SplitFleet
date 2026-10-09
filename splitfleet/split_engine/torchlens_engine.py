@@ -123,7 +123,12 @@ class TorchLensSplitEngine:
             else dict(handle.metadata.get("sample_kwargs", {}))
         ) if input_kwargs is None else input_kwargs
         args, kwargs, _ = normalize_model_call(handle.metadata.get("model"), call.args, kwargs)
-        native = runtime.run_training_prefix(*args, input_kwargs=kwargs) if training else runtime.run_prefix(*args, input_kwargs=kwargs)
+        if training and handle.backend == "tf":
+            from splitfleet.runtime.tensorflow_prefix_training import run_tensorflow_training_prefix
+
+            native = run_tensorflow_training_prefix(runtime, *args, input_kwargs=kwargs)
+        else:
+            native = runtime.run_training_prefix(*args, input_kwargs=kwargs) if training else runtime.run_prefix(*args, input_kwargs=kwargs)
         contract = self.export_contract(handle)
         round_id = int(handle.metadata.get("round_id", 0))
         client_id = str(handle.metadata.get("client_id", ""))

@@ -313,10 +313,15 @@ class TorchLensSplitBackend:
             low, high = self.dynamic_batch
             if not low <= batch_size <= high:
                 raise ValueError(f"Input batch size {batch_size} is outside configured dynamic_batch={self.dynamic_batch}.")
-        raw = (
-            runtime.run_training_prefix(*args, input_kwargs=kwargs)
-            if training else runtime.run_prefix(*args, input_kwargs=kwargs)
-        )
+        if training and self.framework_backend == "tf":
+            from splitfleet.runtime.tensorflow_prefix_training import run_tensorflow_training_prefix
+
+            raw = run_tensorflow_training_prefix(runtime, *args, input_kwargs=kwargs)
+        else:
+            raw = (
+                runtime.run_training_prefix(*args, input_kwargs=kwargs)
+                if training else runtime.run_prefix(*args, input_kwargs=kwargs)
+            )
         return from_torchlens_boundary(raw)
 
     def run_suffix(self, boundary: BoundaryPayload) -> Any:

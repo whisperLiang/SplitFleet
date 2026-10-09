@@ -19,6 +19,8 @@ from typing import Any
 import torch
 
 from experiments.common.identity import tensor_state_hash
+from experiments.common.artifact_retention import cleanup_input_bundles, verify_final_state_receipt
+from experiments.common.bundle_storage import bundle_dependencies
 from experiments.common.physical_workers import physical_workers
 from experiments.physical_multitask import (
     FIXED_BOUNDARIES, METHODS, TASKS, prepare_bundle, scheme_name,
@@ -459,6 +461,7 @@ def _run_one(config: dict[str, Any], *, task: str, method: str, bundle_path: Pat
              fixed_boundary: str,
              split_state_exchange: str = "full",
              min_residence_rounds: int = 2,
+             save_model: bool = False,
              log_dir: Path | None = None,
              local_source_root: Path | None = None) -> dict[str, Any]:
     server = config["server"]
@@ -478,6 +481,8 @@ def _run_one(config: dict[str, Any], *, task: str, method: str, bundle_path: Pat
                   "--fixed-boundary", fixed_boundary]
     server_cmd.extend(["--min-residence-rounds", str(min_residence_rounds)])
     server_cmd.extend(["--split-state-exchange", split_state_exchange])
+    if save_model:
+        server_cmd.append("--save-model")
     server_process: subprocess.Popen[Any] | None = None
     workers: list[tuple[str, subprocess.Popen[Any], Any]] = []
     failure: dict[str, str] | None = None
@@ -498,15 +503,17 @@ def _run_one(config: dict[str, Any], *, task: str, method: str, bundle_path: Pat
         try:
             if remote_server:
                 command = "cd " + shlex.quote(remote_root) \
-                    + " && echo $$ > server.pid && exec env PYTHONPATH=" \
+                    + " && echo $$ > server.pid && exec env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=" \
                     + shlex.quote(remote_root) + " " + shlex.join(server_cmd)
                 server_launch = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
                                  server["ssh"], command]
                 server_process = subprocess.Popen(server_launch, stdout=server_log,
                                                   stderr=subprocess.STDOUT)
             else:
-                local_cmd = (["env", "PYTHONPATH=" + str(local_source_root), *server_cmd]
-                             if local_source_root is not None else server_cmd)
+                local_cmd = ["env", "PYTHONDONTWRITEBYTECODE=1"]
+                if local_source_root is not None:
+                    local_cmd.append("PYTHONPATH=" + str(local_source_root))
+                local_cmd.extend(server_cmd)
                 server_process = subprocess.Popen(local_cmd, cwd=local_source_root or server["workdir"],
                                                   stdout=server_log, stderr=subprocess.STDOUT)
             for worker in physical_workers(hosts):
@@ -522,7 +529,7 @@ def _run_one(config: dict[str, Any], *, task: str, method: str, bundle_path: Pat
                               "--optimizer", optimizer,
                               "--fixed-boundary", fixed_boundary]
                 command = "cd " + shlex.quote(remote_root) + " && PYTHONPATH=" \
-                    + shlex.quote(remote_root) + " " + shlex.join(remote_cmd)
+                    + shlex.quote(remote_root) + " PYTHONDONTWRITEBYTECODE=1 " + shlex.join(remote_cmd)
                 log = (log_dir / f"{identity}.log").open("w", encoding="utf-8")
                 process = subprocess.Popen(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
                                             host["ssh"], command], stdout=log,
@@ -555,25 +562,27 @@ def _run_one(config: dict[str, Any], *, task: str, method: str, bundle_path: Pat
                 subprocess.run(["scp", "-q", "-o", "BatchMode=yes",
                                 f"{server['ssh']}:{server_output}", str(run_dir / "result.json")],
                                check=True, timeout=30)
-                remote_checkpoint = str(Path(server_output).with_suffix(".model.pt"))
-                subprocess.run(["scp", "-q", "-o", "BatchMode=yes",
-                                f"{server['ssh']}:{remote_checkpoint}",
-                                str(run_dir / "final_model.pt")], check=True, timeout=30)
+                if save_model:
+                    remote_checkpoint = str(Path(server_output).with_suffix(".model.pt"))
+                    subprocess.run(["scp", "-q", "-o", "BatchMode=yes",
+                                    f"{server['ssh']}:{remote_checkpoint}",
+                                    str(run_dir / "final_model.pt")], check=True, timeout=30)
                 if method == "splitfleet":
                     remote_bandit = str(Path(server_output).with_suffix(".bandit.json"))
                     subprocess.run(["scp", "-q", "-o", "BatchMode=yes",
                                     f"{server['ssh']}:{remote_bandit}",
                                     str(run_dir / "bandit_state.json")], check=True, timeout=30)
             else:
-                Path(str(Path(server_output).with_suffix(".model.pt"))).rename(
-                    run_dir / "final_model.pt"
-                )
+                if save_model:
+                    Path(server_output).with_suffix(".model.pt").rename(run_dir / "final_model.pt")
                 if method == "splitfleet":
                     Path(server_output).with_suffix(".bandit.json").rename(
                         run_dir / "bandit_state.json"
                     )
             result = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
-            if result.get("final_model_hash"):
+            if not save_model:
+                verify_final_state_receipt(result)
+            elif result.get("final_model_hash"):
                 checkpoint = torch.load(run_dir / "final_model.pt", map_location="cpu",
                                         weights_only=False)
                 if tensor_state_hash(checkpoint["state_dict"]) != result["final_model_hash"]:
@@ -659,6 +668,7 @@ def run_matrix(config: dict[str, Any], *, run_id: str, output_root: Path,
                pretrain_weights: str | None = None,
                model_name: str | None = None, tokenizer_path: str | None = None,
                      split_state_exchange: str = "full",
+               save_model: bool = False, keep_input_bundles: bool = False,
                log_root: Path = Path("logs/physical_multitask")) -> Path:
     if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
         raise ValueError("unsafe run ID")
@@ -671,6 +681,9 @@ def run_matrix(config: dict[str, Any], *, run_id: str, output_root: Path,
         raise ValueError("three distinct SSH hosts are required")
     output = (output_root / run_id).resolve()
     output.mkdir(parents=True, exist_ok=False)
+    (output / "storage_policy.json").write_text(json.dumps({
+        "save_model": save_model, "keep_input_bundles": keep_input_bundles,
+        "bundle_encoding": "shared_model_and_data"}, indent=2) + "\n")
     remote_root = f"/tmp/splitfleet_physical_multitask_{run_id}"
     server_ssh = config["server"].get("ssh")
     remote_hosts = list(hosts)
@@ -695,17 +708,17 @@ def run_matrix(config: dict[str, Any], *, run_id: str, output_root: Path,
             source_hashes[str(path)] = hashlib.sha256((local_source_root / path).read_bytes()).hexdigest()
     (output / "source_hashes.json").write_text(json.dumps(source_hashes, indent=2) + "\n")
     prepared: dict[str, tuple[Path, dict[str, Any]]] = {}
-    for task in tasks:
-        bundle_path = output / "bundles" / f"{task}.pt"
-        metadata = prepare_bundle(task=task, data_root=data_root, output=bundle_path,
-                                  seed=seed, train_samples=train_samples,
-                                  test_samples=test_samples, batch_size=batch_size,
-                                  alpha=alpha, image_model=image_model,
-                                  pretrain_weights=pretrain_weights,
-                                  model_name=model_name, tokenizer_path=tokenizer_path,
-                                  worker_ids=worker_ids)
-        prepared[task] = (bundle_path, metadata)
     try:
+        for task in tasks:
+            bundle_path = output / "bundles" / f"{task}.pt"
+            metadata = prepare_bundle(task=task, data_root=data_root, output=bundle_path,
+                                      seed=seed, train_samples=train_samples,
+                                      test_samples=test_samples, batch_size=batch_size,
+                                      alpha=alpha, image_model=image_model,
+                                      pretrain_weights=pretrain_weights,
+                                      model_name=model_name, tokenizer_path=tokenizer_path,
+                                      worker_ids=worker_ids)
+            prepared[task] = (bundle_path, metadata)
         for host_index, host in enumerate(remote_hosts):
             _ssh(host, "mkdir -p " + shlex.quote(remote_root + "/bundles"))
             subprocess.run(["rsync", "-az", "--exclude=__pycache__",
@@ -721,12 +734,22 @@ def run_matrix(config: dict[str, Any], *, run_id: str, output_root: Path,
                 json.dumps(staged_hashes, indent=2) + "\n")
             if staged_hashes != source_hashes:
                 raise RuntimeError(f"{host.get('id', 'server')} staged sources differ from the frozen coordinator snapshot")
+            staged_assets: set[Path] = set()
             for task, (bundle_path, _) in prepared.items():
                 paths = [bundle_path.with_name(f"{task}.client_{worker['index']}.pt")
                          for worker in physical_workers(hosts) if worker["host"]["ssh"] == host["ssh"]]
                 if host["ssh"] == server_ssh:
                     paths.append(bundle_path)
                 for path in paths:
+                    for asset in bundle_dependencies(path):
+                        if asset in staged_assets:
+                            continue
+                        relative = asset.relative_to(output / "bundles")
+                        destination = f"{remote_root}/bundles/{relative.as_posix()}"
+                        _ssh(host, "mkdir -p " + shlex.quote(str(Path(destination).parent)))
+                        subprocess.run(["scp", "-q", "-o", "BatchMode=yes", str(asset),
+                                        f"{host['ssh']}:{destination}"], check=True, timeout=300)
+                        staged_assets.add(asset)
                     subprocess.run(["scp", "-q", "-o", "BatchMode=yes", str(path),
                                     f"{host['ssh']}:{remote_root}/bundles/{path.name}"],
                                    check=True, timeout=300)
@@ -752,6 +775,7 @@ def run_matrix(config: dict[str, Any], *, run_id: str, output_root: Path,
                             timeout=timeout, learning_rate=learning_rate,
                             optimizer=optimizer, fixed_boundary=boundary or "50%",
                             split_state_exchange=split_state_exchange,
+                            save_model=save_model,
                             local_source_root=local_source_root,
                         )
                     except Exception as exc:
@@ -770,6 +794,8 @@ def run_matrix(config: dict[str, Any], *, run_id: str, output_root: Path,
                 _ssh(host, "rm -rf " + shlex.quote(remote_root), timeout=30)
             except (subprocess.SubprocessError, OSError):
                 pass
+        if not keep_input_bundles:
+            cleanup_input_bundles(output / "bundles", output / "input_storage.json")
     return output / "summary.json"
 
 
@@ -797,6 +823,8 @@ def main() -> None:
     parser.add_argument("--tokenizer-path")
     parser.add_argument("--pretrain-weights")
     parser.add_argument("--split-state-exchange", choices=("full", "owned"), default="full")
+    parser.add_argument("--save-model", action="store_true", help="Retain each final model for re-evaluation")
+    parser.add_argument("--keep-input-bundles", action="store_true", help="Keep prepared inputs after the matrix finishes")
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--timeout", type=float, default=3600)
     args = parser.parse_args()
@@ -814,6 +842,7 @@ def main() -> None:
                      pretrain_weights=args.pretrain_weights,
                      model_name=args.model, tokenizer_path=args.tokenizer_path,
                      split_state_exchange=args.split_state_exchange,
+                     save_model=args.save_model, keep_input_bundles=args.keep_input_bundles,
                      log_root=args.log_root))
 
 

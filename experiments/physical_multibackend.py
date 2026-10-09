@@ -273,15 +273,24 @@ def server(args):
     from splitfleet.tasks import ImageClassificationTask
     admission = json.loads(Path(args.admission).read_text())
     evaluation = np.load(Path(args.bundle) / "evaluation.npz")
-    records, fits, suffixes = [], {}, {}
+    records, fits, suffixes, downloads = [], {}, {}, {}
 
     class RecordingStrategy(AutoSplitStrategy):
+        def configure_fit(self, server_round, parameters, client_manager):
+            instructions = super().configure_fit(server_round, parameters, client_manager)
+            downloads[server_round] = [{"round_id": int(server_round), "cid": str(proxy.cid),
+                "model_state_download_bytes": sum(len(value) for value in ins.parameters.tensors)}
+                for proxy, ins in instructions]
+            return instructions
+
         def aggregate_fit(self, server_round, results, failures):
             if failures or len(results) != config["clients"]:
                 raise RuntimeError(f"Round {server_round}: expected every physical client; failures={failures}")
             results = sorted(results, key=lambda item: int(item[1].metrics["physical_client_index"]))
             fits[server_round] = [{"client_index": int(r.metrics["physical_client_index"]),
-                                  "num_examples": r.num_examples, "metrics": r.metrics} for _, r in results]
+                                  "cid": str(proxy.cid), "num_examples": r.num_examples,
+                                  "model_state_upload_bytes": sum(len(value) for value in r.parameters.tensors),
+                                  "metrics": r.metrics} for proxy, r in results]
             return super().aggregate_fit(server_round, results, failures)
 
         def aggregate_server_fit(self, server_round, results):
@@ -308,6 +317,7 @@ def server(args):
             entry = {"round": server_round, "test_loss": loss_total / config["test_samples"],
                      "accuracy": correct / config["test_samples"], "elapsed_sec": time.perf_counter() - started,
                      "clients": sorted(fits.get(server_round, []), key=lambda v: v["client_index"]),
+                     "state_download_records": downloads.get(server_round, []),
                      "suffixes": suffixes.get(server_round, [])}
             if server_round:
                 if sum(r["num_examples"] for r in entry["clients"]) != config["train_samples"]:
@@ -317,6 +327,7 @@ def server(args):
             record = {"backend": args.backend, "source": "real", "config": config,
                       "environment": environment(args.backend, self.model, args.device), "rounds": records,
                       "boundary": admission["boundary"], "transport": "SplitFleet Flower bidi + server-model gRPC",
+                      "communication_accounting": "training_client_application_buffers_v1",
                       "method": "SplitFed with fixed semantic cut; per-client suffix replicas"}
             save_json(args.output, record)
             print(f"SERVER_ROUND backend={args.backend} round={server_round} loss={entry['test_loss']:.6f} accuracy={entry['accuracy']:.4f}", flush=True)
@@ -339,11 +350,41 @@ def server(args):
     final = strategy.backend_adapter.export_ndarrays(strategy.model)
     if not all(np.isfinite(value).all() for value in final):
         raise RuntimeError("Final model contains nonfinite parameters")
-    np.savez(Path(args.output).with_suffix(".weights.npz"), **{str(i): value for i, value in enumerate(final)})
+    saved = getattr(args, "save_model", False)
+    if saved:
+        np.savez(Path(args.output).with_suffix(".weights.npz"), **{str(i): value for i, value in enumerate(final)})
     record = json.loads(Path(args.output).read_text())
     record.update(status="completed", duration_sec=time.perf_counter() - started,
-                  final_state_sha256=arrays_hash({str(i): value for i, value in enumerate(final)}))
+                  final_state_sha256=arrays_hash({str(i): value for i, value in enumerate(final)}),
+                  final_state_verification={"finite": True, "weights_saved": saved,
+                                            "basis": "in_memory_before_result_write"})
     save_json(args.output, record)
+
+
+def communication_records(server_result):
+    """Expose actual Flower parameter buffers to the shared accounting audit.
+
+    Legacy receipts remain incomplete: no .npy sizes are reconstructed from
+    their raw tensor counters. Suffix replicas live on the coordinator and do
+    not count as client network transfers.
+    """
+    config = server_result["config"]
+    fits, downloads, suffixes = [], [], []
+    for row in server_result["rounds"]:
+        if not row["round"]:
+            continue
+        for client in row["clients"]:
+            metrics = dict(client["metrics"])
+            if "model_state_upload_bytes" in client:
+                metrics["model_state_upload_bytes"] = client["model_state_upload_bytes"]
+            fits.append({"round_id": row["round"],
+                         "cid": client.get("cid", str(client["client_index"])), "metrics": metrics})
+        downloads.extend(row.get("state_download_records", []))
+        suffixes.extend({"metrics": value["metrics"]} for value in row["suffixes"])
+    return {"communication_accounting": server_result.get("communication_accounting"),
+            "method": "splitfed_fixed", "rounds": config["rounds"], "expected_clients": config["clients"],
+            "fit_records": fits, "state_download_records": downloads,
+            "server_fit_records": suffixes, "fit_failures": []}
 
 
 def main():
@@ -368,6 +409,8 @@ def main():
         if name != "admit":
             p.add_argument("--admission", type=Path, required=True)
             p.add_argument("--address", required=True)
+        if name == "server":
+            p.add_argument("--save-model", action="store_true", help="Retain full final weights")
         if name == "client":
             p.add_argument("--index", type=int, required=True)
     args = parser.parse_args()

@@ -57,6 +57,8 @@ def _compare(expected, actual, *, rtol, atol, path="value"):
     left, right = np.asarray(expected), np.asarray(actual)
     if left.shape != right.shape:
         raise AssertionError(f"Shape mismatch: {left.shape} versus {right.shape}")
+    if not np.isfinite(left).all() or not np.isfinite(right).all():
+        raise AssertionError(f"Nonfinite numerical values: {path}")
     np.testing.assert_allclose(right, left, rtol=rtol, atol=atol)
     # Boolean frontiers are legitimate native graph values. NumPy disallows
     # boolean subtraction; equality was checked above, so use numeric copies
@@ -222,7 +224,7 @@ class CanonicalTraining:
 
         training = self
         class GradientCollector:
-            def __init__(self): self.gradients = {name: None for name in PARAMETERS}
+            def __init__(self): self.gradients = {name: None for name in training.parameters}
             def apply_gradients(self, pairs):
                 for gradient, variable in pairs:
                     names = [name for name, value in training.parameters.items()
@@ -256,6 +258,14 @@ def validate_backend(backend, *, seed=2027, learning_rate=.01, rtol=2e-4, atol=2
     if importlib.util.find_spec(module) is None:
         return {"backend": backend, "status": "unsupported", "reason": f"Missing optional dependency: {module}", "nodes": []}
     native = CanonicalTraining(backend, seed=seed, learning_rate=learning_rate)
+    return validate_training(native, model_name="canonical_residual_mlp", batch_size=2,
+                             rtol=rtol, atol=atol)
+
+
+def validate_training(native, *, model_name, batch_size, rtol=2e-4, atol=2e-6,
+                      on_progress=None):
+    """Apply the same six checks to every enumerated cut of a native model."""
+    backend = native.backend
     from splitfleet.autosplit import prepare_torchlens_runtime
     from torchlens.split.errors import SplitUnsupportedError, SplitRequestError
     from dataclasses import replace
@@ -265,7 +275,7 @@ def validate_backend(backend, *, seed=2027, learning_rate=.01, rtol=2e-4, atol=2
     expected = native.full_step()
     native.restore()
     handle = prepare_torchlens_runtime(native.model, native.args, boundary="50%", trainable=True,
-        batch_axes={}, dynamic_batch=(2, 2), model_name="canonical_residual_mlp", model_family="canonical_residual_mlp")
+        batch_axes={}, dynamic_batch=(batch_size, batch_size), model_name=model_name, model_family=model_name)
     view = copy.copy(handle.runtime)
     view.request = replace(view.request, validation="permissive")
     rows = []
@@ -304,6 +314,9 @@ def validate_backend(backend, *, seed=2027, learning_rate=.01, rtol=2e-4, atol=2
             row.update(status="unsupported", reason=f"{type(exc).__name__}: {exc}")
         except Exception as exc:
             row.update(status="failed", reason=f"{type(exc).__name__}: {exc}")
+        finally:
+            if on_progress is not None:
+                on_progress(rows)
     native.restore()
     counts = dict(Counter(row["status"] for row in rows))
     status = "failed" if counts.get("failed") else "passed" if counts.get("passed") else "unsupported"

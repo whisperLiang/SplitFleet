@@ -38,6 +38,13 @@ TensorFlow uses a Functional Keras model: Keras removes the outer variable scope
 when cloning a Sequential model, which fails the strict state schema check.
 Functional construction preserves variable paths and the same CNN computation.
 
+TensorFlow training prefixes explicitly watch live Keras variables around native
+replay. A custom Keras model can expose weights through raw `ReadVariableOp`
+nodes without captured parameter references; relying on the inner replay tape
+alone then loses prefix gradients. Both SplitFleet runtime entry points use
+the same recording helper. The canonical numerical suite verifies the complete
+parameter gradients and SGD update across every admitted before/after cut.
+
 ## Deploy and train
 
 A deployment JSON provides a `backend`, a `server`, exactly three `hosts`, and
@@ -68,6 +75,14 @@ replicas. Success requires four clean process exits, all ten client rounds,
 baseline plus ten server evaluations, and finite final weights. No examples
 are dropped or padded. SSH transfers use the existing encrypted reverse tunnels.
 
+For a fresh source cohort, freeze the source and configuration, run admission
+again on every participating device, and give remote outputs new paths. Verify
+the exact bundled TorchLens file contents on each host; its version number alone
+does not identify the local patched wheel described in `dependency_patches/`.
+Keep learning curves from different checkpoints, partitions, seeds or source
+cohorts separate. This small common CNN establishes native training generality;
+it does not establish canonical ResNet18 equivalence or a backend speed ranking.
+
 The October 6, 2026 deployment uses three physical Orins plus an RTX A6000
 server for torch, tf and tinygrad CUDA; JAX uses the same four machines on CPU.
 Paddle uses three independent clients and a server on the physical x86 CPU,
@@ -82,3 +97,43 @@ tinygrad round loads retain the existing Tensor objects while replacing their
 data with realized native leaves. Model clones construct registered native
 Tensors with independent storage, preserving tied aliases. This keeps named
 cuts stable across loads and allows gradients to reach each suffix replica.
+
+## Exhaustive numerical checks on the real-data CNN
+
+The CIFAR CNN used by physical workers can also be checked at every enumerated
+before/after cut. The checker compares all parameter gradients and one SGD
+update in common OIHW convolution / input-by-output dense layouts, together
+with output, loss, boundary and gradient wire parity. Inputs and initial weights
+come from a frozen real CIFAR bundle; this is a representative numerical check,
+not a convergence result or a ResNet18 experiment.
+
+```bash
+.venv/bin/python -m experiments.analysis.canonical_cifar_correctness \
+  --bundle NEW_FROZEN_CIFAR_BUNDLE \
+  --output NEW_NUMERICAL_RUN --batch-size 2
+```
+
+Use a new output directory. Passed, failed and unsupported cuts retain separate
+receipts; missing frameworks are unsupported. The default tolerances are
+`rtol=2e-4`, `atol=2e-6`. Backend-specific physical admissions still need to run
+on each worker/device before distributed training.
+
+New physical server receipts additionally record the actual Flower `FitIns`
+and `FitRes` parameter tensor buffers. Pass `communication_records(receipt)`
+to the shared `communication_summary` audit to include model state uploads and
+downloads in the declared training-client application-buffer accounting domain.
+The audit requires every client and round. Older receipts lack these buffers and
+continue to report total communication as unknown; physical NIC traffic and
+transport overhead are outside this accounting domain.
+
+The shared tensor codec also handles singleton activation or gradient views
+whose storage stride is greater than one. PyTorch can report these views as
+contiguous; their flattened storage must have a unit stride before conversion
+to raw bytes. The codec normalizes only those views and preserves the original
+tensor shape, dtype and storage contents.
+## Storage defaults
+
+The server now writes metrics and final finite/hash verification by default.
+Add `--save-model` to retain `.weights.npz` for direct re-evaluation. This changes
+artifact retention, not training or communication accounting; historical frozen
+receipts and their source snapshots remain unchanged.

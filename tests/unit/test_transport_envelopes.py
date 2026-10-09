@@ -72,6 +72,28 @@ def test_scalar_tensor_envelope_round_trip(source: torch.Tensor) -> None:
     assert torch.equal(restored, source)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16])
+@pytest.mark.parametrize("shape", [(1,), (1, 1, 1)])
+def test_gradient_envelope_handles_contiguous_singleton_with_strided_storage(
+    dtype: torch.dtype, shape: tuple[int, ...],
+) -> None:
+    storage = torch.tensor([1.25, -8.0, 3.0], dtype=dtype)
+    source = torch.as_strided(storage, shape, (2,) * len(shape))
+    assert source.is_contiguous() and source.stride(-1) == 2
+    before = storage.clone()
+
+    envelope = GradientEnvelope(tensors=(encode_tensor("grad", source),))
+    restored = decode_tensor(
+        decode_gradients(encode_gradients(envelope, compression="lz4")).tensors[0]
+    )
+
+    assert restored.shape == source.shape
+    assert restored.dtype == source.dtype
+    assert torch.equal(restored, source)
+    assert torch.equal(storage, before)
+    assert source.stride(-1) == 2
+
+
 def test_prefix_context_store_consumes_context_once_and_cleans_round() -> None:
     store = PrefixContextStore()
     first = object()

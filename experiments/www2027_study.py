@@ -38,6 +38,9 @@ def save_json(path: Path, value) -> None:
 
 def freeze_runtime(workspace: Path, root: Path) -> tuple[Path, dict]:
     """Freeze once for the whole study, including independent seed blocks."""
+    import os
+    sys.dont_write_bytecode = True
+    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     runtime = root / "runtime_snapshot"
     runtime.mkdir(parents=True, exist_ok=False)
     for folder in ("splitfleet", "experiments"):
@@ -90,6 +93,10 @@ def command_for(plan: dict, stage: dict, index: int, root: Path) -> tuple[list[s
         command += ["--test-samples", str(stage["test_samples"])]
     if plan.get("split_state_exchange"):
         command += ["--split-state-exchange", plan["split_state_exchange"]]
+    if plan.get("save_model", False):
+        command.append("--save-model")
+    if plan.get("keep_input_bundles", False):
+        command.append("--keep-input-bundles")
     if stage["image_model"] == "rfdetr_nano" and not stage.get("model_id"):
         command += ["--pretrain-weights", plan["checkpoint"]]
     if stage.get("model_id"):

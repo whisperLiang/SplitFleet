@@ -23,6 +23,8 @@ from flwr.server.strategy import FedAvg
 from torch.utils.data import DataLoader, Dataset, Subset
 
 from experiments.common.identity import stable_hash, tensor_state_hash
+from experiments.common.artifact_retention import write_training_result
+from experiments.common.bundle_storage import read_bundle, write_bundle
 from experiments.common.partition import dirichlet_partition
 from experiments.unified_multitask.data import VOC_CLASSES, Workload, _build_workload
 from experiments.common.workload_training import METHODS, _batch, _evaluate, _train_client
@@ -216,7 +218,8 @@ def prepare_bundle(*, task: str, data_root: str, output: Path, seed: int,
                    pretrain_weights: str | None = None,
                    model_name: str | None = None,
                    tokenizer_path: str | None = None,
-                   worker_ids: list[str] | None = None) -> dict[str, Any]:
+                   worker_ids: list[str] | None = None,
+                   asset_dir: Path | None = None) -> dict[str, Any]:
     from experiments.unified_multitask.edge_models import (
         EDGE_MODELS, file_sha256, load_edge_workload, make_edge_model, model_configuration,
     )
@@ -309,7 +312,7 @@ def prepare_bundle(*, task: str, data_root: str, output: Path, seed: int,
                       "test_items": server_test,
                       "local_data_hash": _dataset_pair_hash(ItemDataset(server_train, task),
                                                             ItemDataset(server_test, task))}
-    torch.save(server_payload, output)
+    write_bundle(output, server_payload, asset_dir=asset_dir)
     partition_hashes = {}
     original_indices = (list(workload.train_dataset.indices)
                         if isinstance(workload.train_dataset, Subset)
@@ -324,7 +327,8 @@ def prepare_bundle(*, task: str, data_root: str, output: Path, seed: int,
                           "source_indices": [int(original_indices[index]) for index in positions],
                           "train_items": items,
                           "test_items": [], "local_data_hash": local_hash}
-        torch.save(client_payload, output.with_name(f"{output.stem}.client_{client_index}.pt"))
+        write_bundle(output.with_name(f"{output.stem}.client_{client_index}.pt"),
+                     client_payload, asset_dir=asset_dir)
         partition_hashes[str(client_index)] = local_hash
     metadata = {key: common[key] for key in ("task", "seed", "partition_hash",
                                                "data_content_hash", "initial_model_hash",
@@ -347,9 +351,7 @@ def prepare_bundle(*, task: str, data_root: str, output: Path, seed: int,
 
 
 def load_bundle(path: str | Path) -> tuple[Workload, dict[str, Any]]:
-    bundle = torch.load(path, map_location="cpu", weights_only=False)
-    if bundle.get("schema") != "splitfleet.physical-multitask-bundle.v2":
-        raise ValueError("unsupported physical bundle")
+    bundle = read_bundle(path)
     factory = _model_factory(bundle["task"], int(bundle["vocab_size"]),
                              bundle.get("model_id", bundle.get("image_model")), bundle.get("model_config"))
     from experiments.unified_multitask.data import _detection_collate
@@ -605,7 +607,8 @@ class RecordingSplit(AutoSplitStrategy):
         return 0.0, metrics
 
 
-def run_server(args: argparse.Namespace) -> None:
+def run_server(args: argparse.Namespace, *, placement_policy_factory=None,
+               recording_strategy_class=None) -> None:
     owned_exchange = args.method not in ("fedavg", "fedprox") and (
         args.method == "splitfleet" or getattr(args, "split_state_exchange", "full") == "owned")
     workload, bundle = load_bundle(args.bundle)
@@ -638,10 +641,10 @@ def run_server(args: argparse.Namespace) -> None:
         sample, calibration_targets, _ = _batch(workload, next(iter(loader)), torch.device(args.device))
         if args.method == "splitfleet":
             provider = _make_candidate_provider(model=model, sample_inputs=sample, bundle=bundle)
-            policy = _make_placement_policy(
+            policy = (placement_policy_factory or _make_placement_policy)(
                 provider=provider, bundle=bundle, args=args,
             )
-        strategy = RecordingSplit(
+        strategy = (recording_strategy_class or RecordingSplit)(
             workload=workload, model=model, sample_inputs=sample,
             batch_axes=_batch_axes(bundle["task"]),
             boundary=resolved_boundary, placement_policy=policy,
@@ -739,12 +742,12 @@ def run_server(args: argparse.Namespace) -> None:
         "fit_barrier": "all_configured_workers_ready",
     }
     output = Path(args.output)
+    experiment_result = getattr(strategy, "experiment_result", None)
+    if experiment_result is not None:
+        result["physical_placement_experiment"] = experiment_result()
     output.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"task": workload.task.name, "method": args.method,
-                "state_dict": {name: value.detach().cpu().clone()
-                               for name, value in strategy.model.state_dict().items()}},
-               output.with_suffix(".model.pt"))
-    output.write_text(json.dumps(result, indent=2, sort_keys=True, default=str) + "\n")
+    write_training_result(output, result, strategy.model.state_dict(),
+                          save_model=getattr(args, "save_model", False))
 
 
 def run_client(args: argparse.Namespace) -> None:
@@ -848,6 +851,7 @@ def main() -> None:
             item.add_argument("--bind", required=True)
             item.add_argument("--rounds", type=int, default=3)
             item.add_argument("--output", type=Path, required=True)
+            item.add_argument("--save-model", action="store_true", help="Retain full final weights for re-evaluation")
         else:
             item.add_argument("--server", required=True)
             item.add_argument("--client-id", required=True)

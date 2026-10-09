@@ -72,7 +72,6 @@ See `dependency_patches/DEEPLAB_INTERPOLATION_NOTICE.md` for attribution.
 | `www2027_study` | Freeze source and plans; execute and analyze paired seed blocks |
 | `run_edge_standard_study` | Device admission and serial model training |
 | `edge_model_admission` | Full-model and native split numerical/resource checks |
-| `online_calibration_admission` | Execute calibration anchors on a target device and verify restoration |
 | `summarize_physical_multitask` | Validate and summarize completed physical runs |
 
 Calibration and exploration live in `splitfleet/server/placement/cosplit_ucb/`, shared by the native strategy and the physical runner. Core code does not import experiment modules.
@@ -121,4 +120,6 @@ New physical records distinguish activation, target, request metadata, gradient,
 
 For historical reports, call `analyze(frozen_plan, OLD_ROOT)` read-only and `write_report(report, NEW_EXPORT_ROOT)`. The CLI `analyze --root` writes reports into that root, so do not point it at an immutable historical run. Older source cohorts without online-learning receipts are historical context, not evidence for the current CoSplit-UCB implementation.
 
-Algorithm iteration snapshots, intermediate comparisons and process reports have been removed. Formal baseline records remain in `results/`; fresh experiments must use a new output directory and the current source.
+The retained result cohorts and their manuscript uses are indexed in [results/README.md](../results/README.md). Unused backend pilots, the separate layer-oracle batch, superseded intermediate analyses, unexecuted plans and their duplicate code snapshots have been removed. The unused standalone `online_calibration_admission` command has also been removed; production calibration and its regression checks remain in `splitfleet/server/placement/cosplit_ucb/`.
+
+Formal baseline records, including cited numerical and physical failures, remain in `results/`; fresh experiments must use a new output directory and the current source. Old directory names can also contain required support files: the five-seed CNN drivers still read the earlier deployment configurations and import the earlier weight-layout parser. Those files are retained unchanged. See the [cleanup receipt](../paper/evidence/unused_experiment_cleanup_receipt.json) for removed paths and integrity checks.
