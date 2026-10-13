@@ -44,7 +44,7 @@ def test_frozen_inputs_must_match_recorded_bytes(frozen_run, monkeypatch, change
     elif change == "source":
         (frozen_run / "runtime_snapshot/splitfleet/__init__.py").write_text("changed = True\n")
     else:
-        monkeypatch.setattr("experiments.analysis.partition_coverage._torchlens_source_identity", lambda: "changed")
+        monkeypatch.setattr("experiments.common.identity.torchlens_source_identity", lambda: "changed")
     with pytest.raises(ValueError, match=reason):
         evidence.claim_frozen_run(frozen_run)
     assert not (frozen_run / "execution_attempt.json").exists()

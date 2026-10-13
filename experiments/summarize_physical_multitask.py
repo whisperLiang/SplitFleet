@@ -10,7 +10,7 @@ import math
 from pathlib import Path
 from typing import Any
 
-from experiments.physical_multitask import FIXED_BOUNDARIES, METHODS, TASKS, scheme_name
+from experiments.physical_multitask import FIXED_BOUNDARIES, SUPPORTED_METHODS, TASKS, scheme_name
 
 
 PRIMARY = {
@@ -56,6 +56,16 @@ FROZEN_FOUR_TASK_SOURCES = {
     "48080a378f1164c676a4535dc80db0cd0e828ee7f60ac2fba24dd9301eb3ddf4",
     "ef387fc7f8a289bc870b30feaa410b84d586940054996a72c06cc497d3060fd9",
 }
+FEDCOMPASS_SOURCES = (
+    "experiments/baselines/fedcompass.py",
+    "experiments/common/fedcompass_server.py",
+    "experiments/common/fedcompass_validation.py",
+    "experiments/common/time_budget_server.py",
+)
+ASYNC_FL_SOURCES = (
+    "experiments/baselines/async_fl.py", "experiments/common/async_fl_server.py",
+    "experiments/common/async_fl_validation.py",
+)
 
 
 def _runtime_code_hash(folder: Path) -> str:
@@ -74,6 +84,14 @@ def _runtime_code_hash(folder: Path) -> str:
         raise ValueError(f"runtime source hash is missing for {folder}")
     frozen = {path: source[path] for path in required}
     result = json.loads((folder / "result.json").read_text(encoding="utf-8"))
+    if any(path in source for path in FEDCOMPASS_SOURCES) or result.get("method") == "fedcompass":
+        if any(path not in source for path in FEDCOMPASS_SOURCES):
+            raise ValueError(f"FedCompass runtime source hash is missing for {folder}")
+        frozen.update({path: source[path] for path in FEDCOMPASS_SOURCES})
+    if any(path in source for path in ASYNC_FL_SOURCES) or result.get("method") in ("fedasync", "fedbuff"):
+        if any(path not in source for path in ASYNC_FL_SOURCES):
+            raise ValueError(f"Async FL runtime source hash is missing for {folder}")
+        frozen.update({path: source[path] for path in ASYNC_FL_SOURCES})
     if result.get("image_model") == "rfdetr_nano":
         path = "experiments/rfdetr_nano_physical.py"
         if path not in source:
@@ -97,10 +115,10 @@ def summarize(root: Path, *, write_outputs: bool = False) -> dict[str, Any]:
     if any(row["task"] not in TASKS for row in rows):
         raise ValueError("comparison contains an unknown task")
     tasks = [task for task in TASKS if any(row["task"] == task for row in rows)]
-    methods = [method for method in METHODS if any(row["method"] == method for row in rows)]
+    methods = [method for method in SUPPORTED_METHODS if any(row["method"] == method for row in rows)]
     scheme_order = [
         scheme_name(method, boundary)
-        for method in METHODS
+        for method in SUPPORTED_METHODS
         for boundary in (FIXED_BOUNDARIES if method == "splitfed_fixed" else (None,))
     ]
     schemes = [scheme for scheme in scheme_order if any(key[1] == scheme for key in by_key)]
@@ -118,15 +136,25 @@ def summarize(root: Path, *, write_outputs: bool = False) -> dict[str, Any]:
         if len(runtime_hashes) != 1:
             raise ValueError(f"{task} methods used different runtime source snapshots")
         runtime_code_hash = next(iter(runtime_hashes))
-        for key in ("seed", "rounds", "data_content_hash", "partition_hash", "initial_model_hash",
-                    "batch_size"):
+        protocols = [results[row["run_dir"]] for row in task_rows]
+        mixed_async = any(result["method"] in ("fedcompass", "fedasync", "fedbuff") for result in protocols)
+        timed = any(result.get("time_budget_sec") is not None for result in protocols)
+        fixed_work_comparable = not mixed_async and not timed
+        if timed:
+            for key in ("time_budget_sec", "evaluation_interval_sec"):
+                values = [result.get(key) for result in protocols]
+                if any(value is None for value in values) or len(set(values)) != 1:
+                    raise ValueError(f"{task} methods differ in {key}")
+        matched_work_keys = ("rounds", "local_epochs") if fixed_work_comparable else ()
+        for key in ("seed", "data_content_hash", "partition_hash", "initial_model_hash",
+                    "batch_size", *matched_work_keys):
             values = []
             for row in task_rows:
                 result = results[row["run_dir"]]
                 values.append(result[key])
             if len(set(values)) != 1:
                 raise ValueError(f"{task} methods differ in {key}")
-        for key in ("local_epochs", "optimizer", "learning_rate", "dirichlet_alpha",
+        for key in ("optimizer", "learning_rate", "dirichlet_alpha",
                     "train_size", "test_size", "image_model", "pretrain_checkpoint_sha256"):
             values = [results[row["run_dir"]][key] for row in task_rows]
             if len(set(values)) != 1:
@@ -142,16 +170,21 @@ def summarize(root: Path, *, write_outputs: bool = False) -> dict[str, Any]:
             report = json.loads((folder / "validation_report.json").read_text(encoding="utf-8"))
             result = results[row["run_dir"]]
             processes = json.loads((folder / "process_manifest.json").read_text(encoding="utf-8"))
+            async_run = method in ("fedcompass", "fedasync", "fedbuff")
+            fit_count = result.get("completed_dispatches") if async_run else result["rounds"] * num_workers
             if (not report["valid"] or report["workers"] != num_workers
-                    or len(result["fit_records"]) != result["rounds"] * num_workers or result["fit_failures"]):
+                    or len(result["fit_records"]) != fit_count or result["fit_failures"]):
                 raise ValueError(f"{task}/{method} failed completeness checks")
+            if async_run and (len(result.get("dispatch_records", [])) != fit_count
+                              or not report.get("initial_readiness_verified")):
+                raise ValueError(f"{task}/{method} asynchronous dispatch receipts are incomplete")
             if processes["server_exit_code"] != 0 or set(processes["worker_exit_codes"].values()) != {0}:
                 raise ValueError(f"{task}/{method} has a nonzero process exit")
             primary = float(row["final_metrics"][PRIMARY[task]])
             elapsed = float(row["elapsed_sec"])
             if not math.isfinite(primary) or not math.isfinite(elapsed):
                 raise ValueError(f"{task}/{method} has a nonfinite comparison value")
-            for round_id in range(1, result["rounds"] + 1):
+            for round_id in range(1, result["rounds"] + 1) if not (async_run or timed) else ():
                 fits = [fit for fit in result["fit_records"] if fit["round_id"] == round_id]
                 evaluations = [value for value in result["evaluation_records"]
                                if value["round_id"] == round_id]
@@ -175,7 +208,27 @@ def summarize(root: Path, *, write_outputs: bool = False) -> dict[str, Any]:
                         max(fit["metrics"]["fit_finished_unix_ns"] for fit in fits)
                         - min(fit["metrics"]["fit_started_unix_ns"] for fit in fits)
                     ) / 1e9,
+                    "elapsed_sec": evaluations[0].get("elapsed_sec"), "model_version": round_id,
+                    "training_statistics_basis": "one synchronous round",
                 })
+            if async_run or timed:
+                for evaluation in result["evaluation_records"]:
+                    fits = [fit for fit in result["fit_records"] if fit.get("update_status") == "aggregated"
+                            and fit["aggregation_elapsed_sec"] <= evaluation["snapshot_elapsed_sec"]]
+                    examples = sum(fit["num_examples"] for fit in fits)
+                    learning_rows.append({
+                        "task": task, "method": method, "scheme": scheme,
+                        "fixed_boundary": result["fixed_boundary"], "round": evaluation["round_id"],
+                        "train_examples": examples,
+                        "train_loss": sum(float(fit["metrics"].get("task_loss", fit["metrics"].get("loss")))
+                                          * fit["num_examples"] for fit in fits) / examples if examples else None,
+                        "primary_metric": PRIMARY[task], "test_primary": evaluation["metrics"][PRIMARY[task]],
+                        "slowest_client_fit_sec": max((float(fit["metrics"]["fit_duration_sec"])
+                                                       for fit in fits), default=None),
+                        "round_fit_span_sec": None, "elapsed_sec": evaluation["elapsed_sec"],
+                        "model_version": evaluation["model_version"],
+                        "training_statistics_basis": "cumulative aggregated local work at snapshot",
+                    })
             output_rows.append({
                 "task": task, "dataset": DATASETS[task],
                 "model": MODELS.get(result.get("model_id", result.get("image_model")),
@@ -185,8 +238,12 @@ def summarize(root: Path, *, write_outputs: bool = False) -> dict[str, Any]:
                 "final_primary": primary,
                 "delta_vs_fedavg": primary - fedavg_metric if fedavg_metric is not None else None,
                 "elapsed_sec": elapsed,
-                "time_ratio_vs_fedavg": elapsed / fedavg_time if fedavg_time else None,
-                "time_ratio_vs_fixed50": elapsed / fixed_time if fixed_time else None,
+                "time_ratio_vs_fedavg": elapsed / fedavg_time if fedavg_time and fixed_work_comparable else None,
+                "time_ratio_vs_fixed50": elapsed / fixed_time if fixed_time and fixed_work_comparable else None,
+                "fixed_work_time_comparable": fixed_work_comparable,
+                "time_budget_sec": result.get("time_budget_sec"),
+                "global_updates": result.get("global_updates", result["rounds"]),
+                "completed_dispatches": len(result["fit_records"]),
                 "rounds": result["rounds"],
                 "train_size": result["train_size"],
                 "test_size": result["test_size"],
@@ -196,7 +253,7 @@ def summarize(root: Path, *, write_outputs: bool = False) -> dict[str, Any]:
                 "dirichlet_alpha": result["dirichlet_alpha"],
                 "final_model_hash": result["final_model_hash"],
                 "runtime_code_hash": runtime_code_hash,
-                "min_worker_overlap_sec": min(report["fit_interval_overlap_sec"].values()),
+                "min_worker_overlap_sec": min(report["fit_interval_overlap_sec"].values(), default=None),
                 "run_dir": str(folder),
             })
     summary = {

@@ -62,7 +62,7 @@ def test_analysis_excludes_missing_online_learning_or_changed_parameters(tmp_pat
     study.save_json(path, result)
     assert study.analyze(plan, tmp_path)["reports"][0]["paired_n"] == 1
     for field, value, reason in (("online_cost_learning", False, "online learning"),
-                                 ("cosplit_config", {"discount_gamma": .9}, "parameters differ")):
+                                 ("cosplit_config", {"discount_gamma": .9}, "discount_gamma differs")):
         study.save_json(path, {**result, field: value})
         analysis = study.analyze(plan, tmp_path)
         assert analysis["reports"][0]["paired_n"] == 0

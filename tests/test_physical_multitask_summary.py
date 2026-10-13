@@ -1,11 +1,12 @@
 """Distinct fixed cuts stay paired without accepting incomplete protocols."""
 
 import json
+from pathlib import Path
 
 import pytest
 
 from experiments.physical_multitask import scheme_name
-from experiments.summarize_physical_multitask import RUNTIME_SOURCES, summarize
+from experiments.summarize_physical_multitask import FEDCOMPASS_SOURCES, RUNTIME_SOURCES, summarize
 
 
 @pytest.fixture
@@ -77,3 +78,37 @@ def test_summary_rejects_missing_protocol_mixed_protocol_and_duplicate_cut(compa
     path.write_text(json.dumps(result))
     with pytest.raises((ValueError, KeyError)):
         summarize(comparison_root)
+
+
+def test_timed_fedcompass_summary_uses_dispatches_and_wall_clock_checkpoints(comparison_root):
+    source = json.loads((comparison_root / "source_hashes.json").read_text())
+    source.update(dict.fromkeys(FEDCOMPASS_SOURCES, "new-source"))
+    (comparison_root / "source_hashes.json").write_text(json.dumps(source))
+    rows = json.loads((comparison_root / "summary.json").read_text())
+    for row in rows:
+        path = Path(row["run_dir"])
+        result = json.loads((path / "result.json").read_text())
+        result.update(time_budget_sec=10.0, evaluation_interval_sec=2.0, global_updates=1)
+        if row["method"] == "fedprox":
+            row["method"] = result["method"] = "fedcompass"
+            result.update(local_epochs=None, rounds=2, global_updates=2, completed_dispatches=6,
+                          dispatch_records=[{"dispatch_id": i} for i in range(6)])
+            report = json.loads((path / "validation_report.json").read_text())
+            report.update(initial_readiness_verified=True, fit_interval_overlap_sec={})
+            (path / "validation_report.json").write_text(json.dumps(report))
+        for fit in result["fit_records"]:
+            fit.update(update_status="aggregated", aggregation_elapsed_sec=3.0)
+        result["evaluation_records"] = [
+            {"round_id": 1, "model_version": 0, "elapsed_sec": 1.0, "snapshot_elapsed_sec": .5,
+             "metrics": {"accuracy": .1}},
+            {"round_id": 2, "model_version": result["global_updates"], "elapsed_sec": 11.0,
+             "snapshot_elapsed_sec": 10.0, "metrics": {"accuracy": .5}},
+        ]
+        (path / "result.json").write_text(json.dumps(result))
+    (comparison_root / "summary.json").write_text(json.dumps(rows))
+    report = summarize(comparison_root, write_outputs=True)
+    compass = next(row for row in report["runs"] if row["method"] == "fedcompass")
+    assert compass["time_ratio_vs_fedavg"] is None and not compass["fixed_work_time_comparable"]
+    assert compass["local_epochs"] is None and compass["min_worker_overlap_sec"] is None
+    assert len(report["learning_curves"]) == 12
+    assert all(row["elapsed_sec"] is not None for row in report["learning_curves"])

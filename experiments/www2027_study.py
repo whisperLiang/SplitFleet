@@ -26,7 +26,14 @@ from experiments.summarize_physical_multitask import PRIMARY, summarize
 from experiments.analysis.time_to_quality import time_to_quality, summarize_paired_ttq
 from experiments.analysis.communication import communication_summary
 
-SCHEMES = ("fedavg", "fedprox", "splitfed_fixed25", "splitfed_fixed50", "splitfed_fixed75", "splitfleet")
+SCHEMES = ("fedavg", "fedcompass", "splitfed_fixed25", "splitfed_fixed50", "splitfed_fixed75", "splitfleet")
+LEGACY_SCHEMES = ("fedavg", "fedprox", "splitfed_fixed25", "splitfed_fixed50", "splitfed_fixed75", "splitfleet")
+
+
+def schemes_for(plan):
+    methods = plan.get("method_order", METHODS)
+    return tuple(scheme_name(method, boundary) for method in (*methods,)
+                 for boundary in (FIXED_BOUNDARIES if method == "splitfed_fixed" else (None,)))
 
 
 def save_json(path: Path, value) -> None:
@@ -34,6 +41,47 @@ def save_json(path: Path, value) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True) + "\n")
     temporary.replace(path)
+
+
+def cosplit_metadata_correction(root: Path, plan: dict) -> dict | None:
+    """Validate an explicit correction of copied run identity, never tuning."""
+    path = root / "cosplit_run_metadata_correction.json"
+    if not path.exists():
+        return None
+    value = json.loads(path.read_text())
+    frozen = root / "frozen_plan.json"
+    runtime = json.loads((root / "runtime_manifest.json").read_text())
+    if (value.get("schema") != "splitfleet.cosplit-run-metadata-correction.v1"
+            or value.get("metadata_only") is not True
+            or value.get("training_parameters_changed") is not False
+            or value.get("runs_restarted") is not False
+            or value.get("original_frozen_plan_sha256") != hashlib.sha256(frozen.read_bytes()).hexdigest()
+            or value.get("runtime_source_identity") != runtime["source_identity"]
+            or value.get("frozen_physical_module_sha256") != runtime["source_hashes"]["experiments/physical_multitask.py"]
+            or value.get("corrected_field_rules") != {
+                "seed": "paired_seed_from_frozen_stage",
+                "state_path": "result_path_with_bandit_json_suffix"}
+            or value.get("original_fields") != {
+                key: plan.get("cosplit_hyperparameters", {}).get(key) for key in ("seed", "state_path")}):
+        raise ValueError("Invalid CoSplit run-metadata correction")
+    return value
+
+
+def validate_cosplit_config(actual: dict, expected: dict, *, seed: int,
+                            result_path: Path, correction: dict | None = None,
+                            require_run_identity: bool = False) -> None:
+    if require_run_identity:
+        if actual.get("seed") != seed:
+            raise ValueError("CoSplit-UCB parameter seed differs from the paired seed")
+        if actual.get("state_path") != str(result_path.with_suffix(".bandit.json")):
+            raise ValueError("CoSplit-UCB parameter state_path differs from the isolated output")
+    for name, value in expected.items():
+        if correction and name == "seed":
+            value = seed
+        elif correction and name == "state_path":
+            value = str(result_path.with_suffix(".bandit.json"))
+        if actual.get(name) != value:
+            raise ValueError(f"CoSplit-UCB parameter {name} differs from the frozen plan")
 
 
 def freeze_runtime(workspace: Path, root: Path) -> tuple[Path, dict]:
@@ -97,6 +145,14 @@ def command_for(plan: dict, stage: dict, index: int, root: Path) -> tuple[list[s
         command.append("--save-model")
     if plan.get("keep_input_bundles", False):
         command.append("--keep-input-bundles")
+    for name in ("time_budget_sec", "evaluation_interval_sec", "fedcompass_min_steps", "fedcompass_max_steps",
+                 "fedcompass_latest_time_factor", "fedcompass_alpha", "fedcompass_staleness_exponent",
+                 "fedcompass_rpc_timeout_sec", "async_local_steps", "fedasync_alpha",
+                 "fedasync_staleness_exponent", "fedasync_proximal_mu", "fedbuff_buffer_size",
+                 "fedbuff_server_learning_rate"):
+        value = stage.get(name, plan.get(name))
+        if value is not None:
+            command += ["--" + name.replace("_", "-"), str(value)]
     if stage["image_model"] == "rfdetr_nano" and not stage.get("model_id"):
         command += ["--pretrain-weights", plan["checkpoint"]]
     if stage.get("model_id"):
@@ -107,9 +163,11 @@ def command_for(plan: dict, stage: dict, index: int, root: Path) -> tuple[list[s
 
 
 def analyze(plan: dict, root: Path) -> dict:
+    schemes = schemes_for(plan)
     reports = []
     exclusions = []
     ledger = json.loads((root / "ledger.json").read_text()) if (root / "ledger.json").exists() else {}
+    run_metadata_correction = cosplit_metadata_correction(root, plan)
     runtime = json.loads((root / "runtime_manifest.json").read_text()) if (root / "runtime_manifest.json").exists() else None
     source_identity = runtime["source_hashes"] if runtime else None
     jobs = {(job["stage"], job["seed"]): job for job in ledger.get("jobs", [])}
@@ -131,11 +189,11 @@ def analyze(plan: dict, root: Path) -> dict:
             attempted = json.loads(attempt_file.read_text()) if attempt_file.exists() else []
             attempts.append({"stage": stage["name"], "seed": seed,
                              "block_status": jobs.get((stage["name"], seed), {}).get("status", "not_started"),
-                             "planned_schemes": len(stage["tasks"]) * len(SCHEMES),
+                             "planned_schemes": len(stage["tasks"]) * len(schemes),
                              "completed_schemes": sum(a["status"] == "completed" for a in attempted),
                              "failed_schemes": sum(a["status"] == "failed" for a in attempted),
                              "running_schemes": sum(a["status"] == "running" for a in attempted),
-                             "not_attempted_schemes": len(stage["tasks"]) * len(SCHEMES) - len(attempted),
+                             "not_attempted_schemes": len(stage["tasks"]) * len(schemes) - len(attempted),
                              "failed_attempts": [a for a in attempted if a["status"] == "failed"]})
             if not (folder / "summary.json").exists():
                 continue
@@ -152,8 +210,8 @@ def analyze(plan: dict, root: Path) -> dict:
                 if source_identity is not None and hashes != source_identity:
                     raise ValueError("seed block differs from the study's frozen runtime")
                 audited = summarize(folder)
-                if audited["scheme_count"] != 6 or len(audited["runs"]) != len(stage["tasks"]) * 6:
-                    raise ValueError("incomplete six-scheme seed block")
+                if audited["scheme_count"] != len(schemes) or len(audited["runs"]) != len(stage["tasks"]) * len(schemes):
+                    raise ValueError("incomplete planned scheme block")
                 for task in stage["tasks"]:
                     observations = {}
                     for row in json.loads((folder / "summary.json").read_text()):
@@ -164,13 +222,38 @@ def analyze(plan: dict, root: Path) -> dict:
                         validation = json.loads((run_dir / "validation_report.json").read_text())
                         if not validation.get("barrier_verified") or "server_duration_sec" not in result:
                             raise ValueError("missing barrier receipt or monotonic server endpoint")
-                        if (result["seed"] != seed or result["rounds"] != stage["rounds"]
+                        timed_budget = stage.get("time_budget_sec", plan.get("time_budget_sec"))
+                        async_run = result["method"] in ("fedcompass", "fedasync", "fedbuff")
+                        actual_updates = result.get("global_updates") if async_run else result["rounds"]
+                        if (result["seed"] != seed or (timed_budget is None and actual_updates != stage["rounds"])
                                 or result["train_size"] != stage["train_samples"]
                                 or result["optimizer"] != stage["optimizer"]
                                 or result["learning_rate"] != stage["learning_rate"]
                                 or result["batch_size"] != stage["batch_size"]
                                 or result["image_model"] != stage["image_model"]):
                             raise ValueError("result differs from frozen execution budget")
+                        if timed_budget is not None and (result.get("time_budget_sec") != timed_budget
+                                or result.get("evaluation_interval_sec") != stage.get("evaluation_interval_sec", plan.get("evaluation_interval_sec", 30.0))):
+                            raise ValueError("result differs from the frozen wall-clock budget")
+                        if result["method"] == "fedcompass":
+                            config = result.get("fedcompass_config") or {}
+                            defaults = {"min_steps": 20, "max_steps": 100, "latest_time_factor": 1.2,
+                                        "alpha": .9, "staleness_exponent": .5}
+                            keys = {"min_steps": "min_local_steps", "max_steps": "max_local_steps"}
+                            if any(config.get(keys.get(name, name)) != stage.get("fedcompass_" + name,
+                                    plan.get("fedcompass_" + name, default)) for name, default in defaults.items()):
+                                raise ValueError("FedCompass parameters differ from the frozen plan")
+                        if result["method"] in ("fedasync", "fedbuff"):
+                            config = result.get("async_fl_config") or {}
+                            expected_config = {"method": result["method"],
+                                "local_steps": stage.get("async_local_steps", plan.get("async_local_steps", 20)),
+                                "alpha": stage.get("fedasync_alpha", plan.get("fedasync_alpha", .9)),
+                                "staleness_exponent": stage.get("fedasync_staleness_exponent", plan.get("fedasync_staleness_exponent", .5)),
+                                "proximal_mu": stage.get("fedasync_proximal_mu", plan.get("fedasync_proximal_mu", .005)),
+                                "buffer_size": stage.get("fedbuff_buffer_size", plan.get("fedbuff_buffer_size", 2)),
+                                "server_learning_rate": stage.get("fedbuff_server_learning_rate", plan.get("fedbuff_server_learning_rate", 1.0))}
+                            if config != expected_config:
+                                raise ValueError("Asynchronous parameters differ from the frozen plan")
                         if stage["test_samples"] is not None and result["test_size"] != stage["test_samples"]:
                             raise ValueError("test population differs from frozen budget")
                         if (stage["image_model"] == "rfdetr_nano" and not stage.get("model_id")
@@ -184,19 +267,21 @@ def analyze(plan: dict, root: Path) -> dict:
                                 and result["method"] in ("splitfed_fixed", "splitfleet")
                                 and result.get("owned_state_exchange") is not True):
                             raise ValueError("SFL state exchange differs from the matched protocol")
-                        if (plan.get("evaluation_policy")
-                                and result.get("evaluation_policy") != plan["evaluation_policy"]):
+                        expected_evaluation = ("initial, wall-clock cadence and final frozen model"
+                                               if timed_budget is not None or async_run else plan.get("evaluation_policy"))
+                        if (expected_evaluation and result.get("evaluation_policy") != expected_evaluation):
                             raise ValueError("evaluation budget differs from the matched protocol")
-                        if (plan.get("aggregation_order")
-                                and result.get("aggregation_order") != plan["aggregation_order"]):
+                        expected_order = ("coordinator_arrival_and_group_deadline" if result["method"] == "fedcompass"
+                            else "coordinator_arrival" if async_run else plan.get("aggregation_order"))
+                        if (expected_order and result.get("aggregation_order") != expected_order):
                             raise ValueError("aggregation order differs from the matched protocol")
                         if result["method"] == "splitfleet":
                             if result.get("online_cost_learning") is not True:
                                 raise ValueError("CoSplit-UCB online learning receipt is missing")
                             actual_config = result.get("cosplit_config") or {}
-                            if any(actual_config.get(name) != value for name, value in
-                                   plan.get("cosplit_hyperparameters", {}).items()):
-                                raise ValueError("CoSplit-UCB parameters differ from the frozen plan")
+                            validate_cosplit_config(actual_config, plan.get("cosplit_hyperparameters", {}),
+                                seed=seed, result_path=run_dir / "result.json", correction=run_metadata_correction,
+                                require_run_identity=plan.get("cosplit_identity_policy") == "derive_and_verify_per_run")
                         worker_ids = stage.get("worker_ids", plan.get("worker_ids"))
                         if worker_ids and (
                                 result.get("worker_ids") != worker_ids or
@@ -208,6 +293,7 @@ def analyze(plan: dict, root: Path) -> dict:
                             "quality": float(row["final_metrics"][PRIMARY[task]]),
                             "resolved_cut": result.get("resolved_fixed_boundary"),
                             "final_model_hash": result["final_model_hash"],
+                            "fixed_work_time_comparable": not async_run and timed_budget is None,
                         }
                         analysis_config = plan.get("analysis_config", {})
                         quality_config = analysis_config.get("tasks", {}).get(task, analysis_config)
@@ -218,14 +304,17 @@ def analyze(plan: dict, root: Path) -> dict:
                             # (e.g. text accuracy versus macro-F1).
                             if not math.isfinite(threshold):
                                 raise ValueError("TTQ requires finite frozen thresholds")
-                            value = time_to_quality(result.get("evaluation_records", []), metric=metric, threshold=threshold) if thresholds_frozen else {
+                            evaluations = result.get("evaluation_records", [])
+                            if timed_budget is not None:
+                                evaluations = [row for row in evaluations if row.get("elapsed_sec", float("inf")) <= timed_budget]
+                            value = time_to_quality(evaluations, metric=metric, threshold=threshold) if thresholds_frozen else {
                                 "metric": metric, "threshold": threshold, "status": "unavailable", "time_sec": None,
                                 "reason": "Threshold configuration is not bound to the execution-time frozen plan"}
                             block_ttq.append({"stage": stage["name"], "task": task, "seed": seed, "scheme": scheme,
                                               "valid": True, "complete_paired_seed": True, **value})
                         block_communication.append({"stage": stage["name"], "task": task, "seed": seed,
                             "scheme": scheme, "complete_paired_seed": True, **communication_summary(result)})
-                    if set(observations) != set(SCHEMES):
+                    if set(observations) != set(schemes):
                         raise ValueError("missing comparator")
                     if any(not math.isfinite(v["time_sec"]) or v["time_sec"] <= 0
                            or not math.isfinite(v["quality"]) for v in observations.values()):
@@ -247,7 +336,7 @@ def analyze(plan: dict, root: Path) -> dict:
                     "planned_seeds": stage["seeds"], "complete_seeds": seeds,
                     "paired_n": len(seeds), "primary_metric": PRIMARY[task],
                     "schemes": {}, "comparisons": []}
-            for scheme in SCHEMES:
+            for scheme in schemes:
                 times = [observations[seed][scheme]["time_sec"] for seed in seeds]
                 quality = [observations[seed][scheme]["quality"] for seed in seeds]
                 item["schemes"][scheme] = {
@@ -257,7 +346,8 @@ def analyze(plan: dict, root: Path) -> dict:
                 }
             if len(seeds) >= 2 and not stage["calibration"]:
                 time_effects, quality_effects = [], []
-                for baseline in SCHEMES[:-1]:
+                baselines = [scheme for scheme in schemes if scheme != "splitfleet"]
+                for baseline in baselines:
                     time_effects.append(paired_effect(
                         [observations[s]["splitfleet"]["time_sec"] for s in seeds],
                         [observations[s][baseline]["time_sec"] for s in seeds],
@@ -269,16 +359,19 @@ def analyze(plan: dict, root: Path) -> dict:
                         bootstrap_samples=plan["bootstrap_samples"], seed=plan["analysis_seed"],
                     ).to_dict())
                 adjusted = holm_adjust(effect["sign_flip_p_value"] for effect in time_effects)
-                for index, baseline in enumerate(SCHEMES[:-1]):
+                for index, baseline in enumerate(baselines):
                     time_effect, quality_effect = time_effects[index], quality_effects[index]
                     complete = (plan_bound_to_execution and len(seeds) == len(stage["seeds"])
                         and len(seeds) >= plan["minimum_complete_pairs_for_primary_claim"]
                         and all((stage["name"], seed) in jobs for seed in seeds))
-                    faster = time_effect["confidence_interval_95"][1] < 0 and adjusted[index] < 0.05
+                    comparable = all(observations[s][baseline]["fixed_work_time_comparable"]
+                                     and observations[s]["splitfleet"]["fixed_work_time_comparable"] for s in seeds)
+                    faster = comparable and time_effect["confidence_interval_95"][1] < 0 and adjusted[index] < 0.05
                     noninferior = quality_effect["confidence_interval_95"][0] > -plan["quality_margin"][task]
                     item["comparisons"].append({
                         "baseline": baseline, "time_effect": time_effect, "quality_effect": quality_effect,
                         "holm_time_p": adjusted[index], "faster_supported": faster,
+                        "fixed_work_time_comparable": comparable,
                         "quality_noninferiority_interval_pass": noninferior,
                         "complete_planned_population": complete,
                         "joint_time_quality_supported": complete and faster and noninferior,
@@ -293,6 +386,7 @@ def analyze(plan: dict, root: Path) -> dict:
             "time_to_quality": ttq_rows, "paired_ttq_summary": summarize_paired_ttq(ttq_rows),
             "ttq_thresholds_bound_to_frozen_plan": thresholds_frozen,
             "plan_bound_to_execution": plan_bound_to_execution,
+            "cosplit_run_metadata_correction": run_metadata_correction,
             "communication": communication_rows,
             "inference_unit": "seed; stages and tasks analyzed separately",
             "limitations": ["Percentile bootstrap is approximate, particularly with few seeds",

@@ -39,7 +39,7 @@ def communication_summary(result):
     }
     if result.get("communication_accounting") != "training_client_application_buffers_v1":
         return report
-    full_model = result.get("method") in ("fedavg", "fedprox")
+    full_model = result.get("method") in ("fedavg", "fedprox", "fedcompass", "fedasync", "fedbuff")
     for key in ("activation_upload_bytes", "target_upload_bytes", "request_metadata_upload_bytes",
                 "gradient_download_bytes", "response_metadata_download_bytes"):
         report[key] = 0 if full_model else _sum_complete(fits, key)
@@ -66,6 +66,12 @@ def communication_summary(result):
         and all(len(clients) == expected_clients for clients in by_round.values()))
     population_complete = bool(budget and len(fits) == budget and set(uploaded) == set(configured)
                                and round_population_complete and not result.get("fit_failures"))
+    if result.get("method") in ("fedcompass", "fedasync", "fedbuff"):
+        dispatched = result.get("dispatch_records", [])
+        dispatch_ids = {row.get("dispatch_id") for row in dispatched}
+        population_complete = bool(fits and len(fits) == result.get("completed_dispatches") == len(dispatched)
+            and len(dispatch_ids) == len(dispatched) and dispatch_ids == {row.get("dispatch_id") for row in fits}
+            and set(uploaded) == set(configured) and not result.get("fit_failures"))
     categories = [report[key] for key in ("activation_upload_bytes", "target_upload_bytes",
         "request_metadata_upload_bytes", "gradient_download_bytes", "response_metadata_download_bytes",
         "model_state_synchronization_bytes")]
@@ -76,7 +82,7 @@ def communication_summary(result):
     report["physical_network_traffic_bytes"] = None
     report["interpretation"] = (
         "Actual serialized Boundary/Gradient envelopes, target/request/response data buffers and Flower .npy "
-        "parameter buffers over all completed training client rounds. Excludes initial/calibration/evaluation "
+        "parameter buffers over all completed training assignments, including drained assignments. Excludes initial/calibration/evaluation "
         "traffic, Flower config/metric buffers, protobuf/transport headers, TLS, retries and coordinator-local "
         "suffix replica copies. Total is complete only in this declared application-buffer domain; physical "
         "network traffic and model synchronization including transport overhead remain unmeasured.")

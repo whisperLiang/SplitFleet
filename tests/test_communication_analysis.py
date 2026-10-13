@@ -65,6 +65,20 @@ def test_native_fl_records_real_state_transfers_without_boundary_traffic():
     assert report["total_communication_bytes"] == 500 and report["complete"]
 
 
+def test_fedcompass_accounts_dispatched_work_instead_of_rounds_times_clients():
+    result = complete_result()
+    result.update(method="fedcompass", rounds=12, expected_clients=3, completed_dispatches=2,
+                  dispatch_records=[{"dispatch_id": 1}, {"dispatch_id": 2}])
+    result["fit_records"] = [{"round_id": index, "dispatch_id": index, "cid": "a",
+                              "metrics": {"model_state_upload_bytes": 200}} for index in (1, 2)]
+    result["state_download_records"] = [{"round_id": index, "cid": "a", "model_state_download_bytes": 300}
+                                        for index in (1, 2)]
+    report = communication_summary(result)
+    assert report["complete"] and report["total_communication_bytes"] == 1000
+    result["dispatch_records"].append({"dispatch_id": 3})
+    assert not communication_summary(result)["complete"]
+
+
 def test_matching_receipts_from_the_wrong_round_do_not_complete_the_budget():
     result = complete_result()
     result["fit_records"][0]["round_id"] = 2

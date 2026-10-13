@@ -22,8 +22,9 @@ from experiments.common.identity import tensor_state_hash
 from experiments.common.artifact_retention import cleanup_input_bundles, verify_final_state_receipt
 from experiments.common.bundle_storage import bundle_dependencies
 from experiments.common.physical_workers import physical_workers
+from experiments.common.fedcompass_validation import validate_fedcompass
 from experiments.physical_multitask import (
-    FIXED_BOUNDARIES, METHODS, TASKS, prepare_bundle, scheme_name,
+    FIXED_BOUNDARIES, METHODS, SUPPORTED_METHODS, TASKS, prepare_bundle, scheme_name,
 )
 
 
@@ -274,6 +275,22 @@ def validate_result(result: dict[str, Any], *, task: str, method: str, rounds: i
     errors: list[str] = []
     warnings: list[str] = []
     workers = physical_workers(hosts)
+    if method in ("fedcompass", "fedasync", "fedbuff"):
+        validator = validate_fedcompass
+        if method != "fedcompass":
+            from experiments.common.async_fl_validation import validate_async_fl
+            validator = validate_async_fl
+        report = validator(result, bundle=bundle, workers=workers,
+                                    barrier_records=barrier_records)
+        if result.get("task") != task:
+            report["errors"].append("FedCompass task differs from the requested task")
+        if result.get("time_budget_sec") is None and result.get("global_updates") != rounds:
+            report["errors"].append("FedCompass global update limit was not reached")
+        report["valid"] = not report["errors"]
+        return report
+    timed = result.get("time_budget_sec") is not None
+    if timed:
+        rounds = result["rounds"]
     identities = {worker["identity"]: worker["kind"] for worker in workers}
     indices_by_id = {worker["identity"]: worker["index"] for worker in workers}
     num_workers = len(workers)
@@ -360,9 +377,9 @@ def validate_result(result: dict[str, Any], *, task: str, method: str, rounds: i
         cids = [row.get("cid") for row in fits]
         if len(fits) != num_workers or set(ids) != set(identities) or len(set(cids)) != num_workers:
             errors.append(f"round {round_id}: distinct configured worker updates are missing")
-        if len(evaluations) != 1 or not evaluations[0].get("metrics"):
+        if not timed and (len(evaluations) != 1 or not evaluations[0].get("metrics")):
             errors.append(f"round {round_id}: task evaluation is missing")
-        else:
+        elif not timed:
             for name, value in evaluations[0]["metrics"].items():
                 try:
                     valid = math.isfinite(float(value)) and 0 <= float(value) <= 1
@@ -424,6 +441,30 @@ def validate_result(result: dict[str, Any], *, task: str, method: str, rounds: i
             if overlap <= 0:
                 warnings.append(f"round {round_id}: no common configured-worker wall-clock fit intersection; "
                                 "clock offsets and scheduling can exceed short fit durations")
+    if timed:
+        budget = result["time_budget_sec"]
+        if not math.isfinite(budget) or budget <= 0 or result.get("stop_reason") != "time_budget":
+            errors.append("invalid synchronous time budget endpoint")
+        accepted = {row["aggregated_model_version"] for row in all_fits
+                    if row.get("update_status") == "aggregated"}
+        if accepted != set(range(1, result.get("global_updates", 0) + 1)):
+            errors.append("timed synchronous model version receipts are incomplete")
+        for row in all_fits:
+            if row.get("update_status") not in ("aggregated", "discarded_at_stop"):
+                errors.append("timed fit has no completed update status")
+            if row.get("update_status") == "aggregated" and row.get("aggregation_elapsed_sec", budget) >= budget:
+                errors.append("synchronous update was accepted after the time budget")
+        if not all_evaluations or all_evaluations[0].get("model_version") != 0:
+            errors.append("timed initial evaluation is missing")
+        previous = -1.0
+        for row in all_evaluations:
+            elapsed = row.get("elapsed_sec", -1)
+            if not math.isfinite(elapsed) or elapsed < previous or not row.get("metrics"):
+                errors.append("timed evaluation timing or metrics are invalid")
+            for value in row.get("metrics", {}).values():
+                if not math.isfinite(value) or not 0 <= value <= 1:
+                    errors.append("timed task evaluation metric is invalid")
+            previous = elapsed
     return {"schema": "splitfleet.physical-multitask-validation.v3",
             "valid": not errors, "errors": errors, "warnings": warnings,
             "barrier_verified": barrier_records is not None and not any("barrier" in e or "readiness" in e for e in errors),
@@ -463,7 +504,15 @@ def _run_one(config: dict[str, Any], *, task: str, method: str, bundle_path: Pat
              min_residence_rounds: int = 2,
              save_model: bool = False,
              log_dir: Path | None = None,
-             local_source_root: Path | None = None) -> dict[str, Any]:
+             local_source_root: Path | None = None,
+             time_budget_sec: float | None = None, evaluation_interval_sec: float = 30.0,
+             fedcompass_min_steps: int = 20, fedcompass_max_steps: int = 100,
+             fedcompass_latest_time_factor: float = 1.2, fedcompass_alpha: float = 0.9,
+             fedcompass_staleness_exponent: float = 0.5,
+             fedcompass_rpc_timeout_sec: float = 1800.0,
+             async_local_steps: int = 20, fedasync_alpha: float = .9,
+             fedasync_staleness_exponent: float = .5, fedasync_proximal_mu: float = .005,
+             fedbuff_buffer_size: int = 2, fedbuff_server_learning_rate: float = 1.0) -> dict[str, Any]:
     server = config["server"]
     hosts = config["hosts"]
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -481,6 +530,21 @@ def _run_one(config: dict[str, Any], *, task: str, method: str, bundle_path: Pat
                   "--fixed-boundary", fixed_boundary]
     server_cmd.extend(["--min-residence-rounds", str(min_residence_rounds)])
     server_cmd.extend(["--split-state-exchange", split_state_exchange])
+    server_cmd.extend(["--evaluation-interval-sec", str(evaluation_interval_sec)])
+    if time_budget_sec is not None:
+        server_cmd.extend(["--time-budget-sec", str(time_budget_sec)])
+    if method in ("fedcompass", "fedasync", "fedbuff"):
+        for flag, value in (("min-steps", fedcompass_min_steps), ("max-steps", fedcompass_max_steps),
+                            ("latest-time-factor", fedcompass_latest_time_factor), ("alpha", fedcompass_alpha),
+                            ("staleness-exponent", fedcompass_staleness_exponent),
+                            ("rpc-timeout-sec", fedcompass_rpc_timeout_sec)):
+            server_cmd.extend(["--fedcompass-" + flag, str(value)])
+    if method in ("fedasync", "fedbuff"):
+        for flag, value in (("async-local-steps", async_local_steps), ("fedasync-alpha", fedasync_alpha),
+                ("fedasync-staleness-exponent", fedasync_staleness_exponent),
+                ("fedasync-proximal-mu", fedasync_proximal_mu), ("fedbuff-buffer-size", fedbuff_buffer_size),
+                ("fedbuff-server-learning-rate", fedbuff_server_learning_rate)):
+            server_cmd.extend(["--" + flag, str(value)])
     if save_model:
         server_cmd.append("--save-model")
     server_process: subprocess.Popen[Any] | None = None
@@ -496,7 +560,7 @@ def _run_one(config: dict[str, Any], *, task: str, method: str, bundle_path: Pat
     barrier = RoundBarrier(
         config["barrier"]["bind"],
         {worker["identity"] for worker in physical_workers(hosts)},
-        rounds,
+        1 if method in ("fedcompass", "fedasync", "fedbuff") else (2**31 - 1 if time_budget_sec is not None else rounds),
     )
     barrier.start()
     with (log_dir / "server.log").open("w", encoding="utf-8") as server_log:
@@ -669,9 +733,32 @@ def run_matrix(config: dict[str, Any], *, run_id: str, output_root: Path,
                model_name: str | None = None, tokenizer_path: str | None = None,
                      split_state_exchange: str = "full",
                save_model: bool = False, keep_input_bundles: bool = False,
-               log_root: Path = Path("logs/physical_multitask")) -> Path:
+               log_root: Path = Path("logs/physical_multitask"),
+               time_budget_sec: float | None = None, evaluation_interval_sec: float = 30.0,
+               fedcompass_min_steps: int = 20, fedcompass_max_steps: int = 100,
+               fedcompass_latest_time_factor: float = 1.2, fedcompass_alpha: float = 0.9,
+               fedcompass_staleness_exponent: float = 0.5,
+               fedcompass_rpc_timeout_sec: float = 1800.0,
+               async_local_steps: int = 20, fedasync_alpha: float = .9,
+               fedasync_staleness_exponent: float = .5, fedasync_proximal_mu: float = .005,
+               fedbuff_buffer_size: int = 2, fedbuff_server_learning_rate: float = 1.0) -> Path:
     if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
         raise ValueError("unsafe run ID")
+    from experiments.baselines.fedcompass import FedCompassConfig
+    FedCompassConfig(min_local_steps=fedcompass_min_steps, max_local_steps=fedcompass_max_steps,
+                     latest_time_factor=fedcompass_latest_time_factor, alpha=fedcompass_alpha,
+                     staleness_exponent=fedcompass_staleness_exponent)
+    from experiments.baselines.async_fl import AsyncFLConfig
+    for method in ("fedasync", "fedbuff"):
+        AsyncFLConfig(method=method, local_steps=async_local_steps, alpha=fedasync_alpha,
+            staleness_exponent=fedasync_staleness_exponent, proximal_mu=fedasync_proximal_mu,
+            buffer_size=fedbuff_buffer_size, server_learning_rate=fedbuff_server_learning_rate)
+    if (time_budget_sec is not None and (not math.isfinite(time_budget_sec) or time_budget_sec <= 0)):
+        raise ValueError("time_budget_sec must be finite and positive")
+    if not math.isfinite(evaluation_interval_sec) or evaluation_interval_sec <= 0:
+        raise ValueError("evaluation_interval_sec must be finite and positive")
+    if not math.isfinite(fedcompass_rpc_timeout_sec) or fedcompass_rpc_timeout_sec <= 0:
+        raise ValueError("fedcompass_rpc_timeout_sec must be finite and positive")
     if (not fixed_boundaries or len(set(fixed_boundaries)) != len(fixed_boundaries)
             or any(boundary not in FIXED_BOUNDARIES for boundary in fixed_boundaries)):
         raise ValueError("fixed_boundaries must contain distinct supported cuts")
@@ -777,6 +864,17 @@ def run_matrix(config: dict[str, Any], *, run_id: str, output_root: Path,
                             split_state_exchange=split_state_exchange,
                             save_model=save_model,
                             local_source_root=local_source_root,
+                            time_budget_sec=time_budget_sec, evaluation_interval_sec=evaluation_interval_sec,
+                            fedcompass_min_steps=fedcompass_min_steps, fedcompass_max_steps=fedcompass_max_steps,
+                            fedcompass_latest_time_factor=fedcompass_latest_time_factor,
+                            fedcompass_alpha=fedcompass_alpha,
+                            fedcompass_staleness_exponent=fedcompass_staleness_exponent,
+                            fedcompass_rpc_timeout_sec=fedcompass_rpc_timeout_sec,
+                            async_local_steps=async_local_steps, fedasync_alpha=fedasync_alpha,
+                            fedasync_staleness_exponent=fedasync_staleness_exponent,
+                            fedasync_proximal_mu=fedasync_proximal_mu,
+                            fedbuff_buffer_size=fedbuff_buffer_size,
+                            fedbuff_server_learning_rate=fedbuff_server_learning_rate,
                         )
                     except Exception as exc:
                         attempt.update(status="failed", finished_unix=time.time(),
@@ -806,7 +904,7 @@ def main() -> None:
     parser.add_argument("--output-root", type=Path, default=Path("results/physical_multitask"))
     parser.add_argument("--log-root", type=Path, default=Path("logs/physical_multitask"))
     parser.add_argument("--tasks", nargs="+", choices=TASKS, default=list(TASKS))
-    parser.add_argument("--methods", nargs="+", choices=METHODS, default=list(METHODS))
+    parser.add_argument("--methods", nargs="+", choices=SUPPORTED_METHODS, default=list(METHODS))
     parser.add_argument("--data-root", default="data")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--train-samples", type=int)
@@ -827,6 +925,21 @@ def main() -> None:
     parser.add_argument("--keep-input-bundles", action="store_true", help="Keep prepared inputs after the matrix finishes")
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--timeout", type=float, default=3600)
+    parser.add_argument("--time-budget-sec", type=float,
+                        help="Common inclusive wall-clock budget; supersedes the round cap")
+    parser.add_argument("--evaluation-interval-sec", type=float, default=30.0)
+    parser.add_argument("--fedcompass-min-steps", type=int, default=20)
+    parser.add_argument("--fedcompass-max-steps", type=int, default=100)
+    parser.add_argument("--fedcompass-latest-time-factor", type=float, default=1.2)
+    parser.add_argument("--fedcompass-alpha", type=float, default=0.9)
+    parser.add_argument("--fedcompass-staleness-exponent", type=float, default=0.5)
+    parser.add_argument("--fedcompass-rpc-timeout-sec", type=float, default=1800.0)
+    parser.add_argument("--async-local-steps", type=int, default=20)
+    parser.add_argument("--fedasync-alpha", type=float, default=.9)
+    parser.add_argument("--fedasync-staleness-exponent", type=float, default=.5)
+    parser.add_argument("--fedasync-proximal-mu", type=float, default=.005)
+    parser.add_argument("--fedbuff-buffer-size", type=int, default=2)
+    parser.add_argument("--fedbuff-server-learning-rate", type=float, default=1.0)
     args = parser.parse_args()
     config = json.loads(args.deployment.read_text(encoding="utf-8"))
     print(run_matrix(config, run_id=args.run_id, output_root=args.output_root,
@@ -843,7 +956,18 @@ def main() -> None:
                      model_name=args.model, tokenizer_path=args.tokenizer_path,
                      split_state_exchange=args.split_state_exchange,
                      save_model=args.save_model, keep_input_bundles=args.keep_input_bundles,
-                     log_root=args.log_root))
+                     log_root=args.log_root, time_budget_sec=args.time_budget_sec,
+                     evaluation_interval_sec=args.evaluation_interval_sec,
+                     fedcompass_min_steps=args.fedcompass_min_steps, fedcompass_max_steps=args.fedcompass_max_steps,
+                     fedcompass_latest_time_factor=args.fedcompass_latest_time_factor,
+                     fedcompass_alpha=args.fedcompass_alpha,
+                     fedcompass_staleness_exponent=args.fedcompass_staleness_exponent,
+                     fedcompass_rpc_timeout_sec=args.fedcompass_rpc_timeout_sec,
+                     async_local_steps=args.async_local_steps, fedasync_alpha=args.fedasync_alpha,
+                     fedasync_staleness_exponent=args.fedasync_staleness_exponent,
+                     fedasync_proximal_mu=args.fedasync_proximal_mu,
+                     fedbuff_buffer_size=args.fedbuff_buffer_size,
+                     fedbuff_server_learning_rate=args.fedbuff_server_learning_rate))
 
 
 if __name__ == "__main__":

@@ -41,7 +41,7 @@ framework executor, and report both validator hashes when the workspace version
 has advanced.
 
 Storage pruning retains exactly the four client-0 inputs named in the bundle
-catalog, together with the separate actual PPO actor. Other historical input
+catalog. Other historical input
 copies and completed training weights have been removed; raw metrics, failure
 records, frozen sources and figure data remain unchanged. This RQ1 command still
 has its original inputs. Historical end-to-end training needs newly prepared

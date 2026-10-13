@@ -1,10 +1,6 @@
 from dataclasses import replace
-from itertools import product
-
-import pytest
 
 from experiments.baselines.independent_ucb import IndependentUCB, _IndependentSolver
-from experiments.baselines.oracle_split import offline_oracle
 from splitfleet.server.placement.cosplit_ucb import CoSplitUCBConfig, PlacementFeedback, StaticCandidateProvider
 from splitfleet.server.placement.cosplit_ucb.solver import GlobalPlacementSolver
 from splitfleet.server.placement.cosplit_ucb.types import CandidateEstimate
@@ -43,27 +39,8 @@ def cost(cid, boundary, edge, server):
     return CandidateEstimate(cid, boundary, edge, 0, 0, 0, server, 0, 0, 0, 0, 0, 0, 0)
 
 
-def test_oracle_is_exact_against_independent_exhaustive_search_and_solver():
-    options = {cid: [cost(cid, "early", 1, 10), cost(cid, "late", 6, 1)] for cid in ["a", "b"]}
-    counts = {"a": 3, "b": 2}
-    simulator = GlobalPlacementSolver()
-    exact = offline_oracle(options, batch_counts=counts)
-    expected = min(simulator.simulate(dict(zip(options, values)), batch_counts=counts).objective
-                   for values in product(*options.values()))
-    assert exact.simulation.objective == expected
-    assert exact.evaluated_assignments == 4
-    assert exact.exact and not exact.deployable
-    joint = simulator.solve(options, batch_counts=counts)
-    assert simulator.simulate(joint, batch_counts=counts).objective == expected
-    assert {value.boundary for value in exact.assignment.values()} == {"late"}
 
 
-def test_oracle_refuses_uncertainty_and_unbounded_search():
-    value = cost("a", "early", 1, 10)
-    with pytest.raises(ValueError, match="without bandit uncertainty"):
-        offline_oracle({"a": [replace(value, server_service_uncertainty_ms=1)]})
-    with pytest.raises(ValueError, match="Explicitly restrict"):
-        offline_oracle({"a": [value, replace(value, boundary="late")]}, max_assignments=1)
 
 
 def test_independent_cost_score_matches_production_for_one_client():

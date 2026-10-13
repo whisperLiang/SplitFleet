@@ -4,11 +4,14 @@ import json
 import hashlib
 from pathlib import Path
 
+import pytest
+
 from experiments import www2027_study as study
 
 
 def plan_for(seeds):
-    return {"stages": [{"name": "timing", "seeds": seeds, "tasks": ["image_classification"],
+    return {"method_order": ["fedavg", "fedprox", "splitfed_fixed", "splitfleet"],
+            "stages": [{"name": "timing", "seeds": seeds, "tasks": ["image_classification"],
                         "calibration": False, "rounds": 10, "train_samples": 240,
                         "test_samples": 200, "optimizer": "adam", "learning_rate": 1e-4,
                         "batch_size": 4, "image_model": "resnet50_pretrained"}],
@@ -21,7 +24,7 @@ def write_block(root, seed, *, source="same", omit=None, barrier=True):
     folder.mkdir(parents=True)
     study.save_json(folder / "source_hashes.json", {"file": source})
     rows = []
-    for scheme in study.SCHEMES:
+    for scheme in study.LEGACY_SCHEMES:
         if scheme == omit:
             continue
         run = folder / scheme
@@ -293,3 +296,89 @@ def test_primary_nano_rejects_wrong_checkpoint_or_unmatched_exchange(tmp_path, m
         analysis = study.analyze(plan, tmp_path)
         assert analysis["reports"][0]["paired_n"] == 0
         assert reason in analysis["exclusions"][0]["reason"]
+
+
+def test_new_study_command_defaults_to_fedcompass_and_forwards_stage_budget(tmp_path):
+    plan = plan_for([19])
+    del plan["method_order"]
+    plan.update(deployment="deployment.json", data_root="data", dirichlet_alpha=.5,
+                time_budget_sec=600, fedcompass_min_steps=20, fedcompass_max_steps=100)
+    stage = plan["stages"][0]
+    stage.update(time_budget_sec=900, evaluation_interval_sec=30, timeout_per_scheme_sec=1800)
+    command, _ = study.command_for(plan, stage, 0, tmp_path)
+    assert "fedcompass" in command and "fedprox" not in command
+    assert command[command.index("--time-budget-sec") + 1] == "900"
+    assert command[command.index("--fedcompass-min-steps") + 1] == "20"
+    assert "fedcompass" in study.schemes_for(plan)
+
+
+@pytest.mark.parametrize("method", ["fedasync", "fedbuff"])
+@pytest.mark.parametrize("option,field,override,default", [
+    ("async_local_steps", "local_steps", 7, 20),
+    ("fedasync_alpha", "alpha", .4, .9),
+    ("fedasync_staleness_exponent", "staleness_exponent", .8, .5),
+    ("fedasync_proximal_mu", "proximal_mu", .02, .005),
+    ("fedbuff_buffer_size", "buffer_size", 3, 2),
+    ("fedbuff_server_learning_rate", "server_learning_rate", .6, 1.0),
+])
+def test_async_stage_override_is_used_by_command_and_audit(
+        tmp_path, monkeypatch, method, option, field, override, default):
+    monkeypatch.setattr(study, "summarize", fake_audit)
+    plan = plan_for([1])
+    plan["method_order"][1] = method
+    plan.update(deployment="deployment.json", data_root="data", dirichlet_alpha=.5,
+                time_budget_sec=20, evaluation_interval_sec=2, **{option: default})
+    stage = plan["stages"][0]
+    stage.update(timeout_per_scheme_sec=1800, **{option: override})
+    command, _ = study.command_for(plan, stage, 0, tmp_path)
+    flag = "--" + option.replace("_", "-")
+    assert command[command.index(flag) + 1] == str(override)
+    write_block(tmp_path, 1)
+    for path in (tmp_path / "physical/timing_s1").glob("*/result.json"):
+        result = json.loads(path.read_text())
+        result.update(time_budget_sec=20, evaluation_interval_sec=2,
+                      evaluation_policy="initial, wall-clock cadence and final frozen model")
+        if result["method"] == "fedprox":
+            config = {"method": method, "local_steps": 20, "alpha": .9,
+                      "staleness_exponent": .5, "proximal_mu": .005,
+                      "buffer_size": 2, "server_learning_rate": 1.0, field: override}
+            result.update(method=method, global_updates=2, async_fl_config=config,
+                          aggregation_order="coordinator_arrival")
+        study.save_json(path, result)
+    freeze_plan(tmp_path, plan)
+    analysis = study.analyze(plan, tmp_path)
+    assert not analysis["exclusions"]
+    assert analysis["reports"][0]["complete_seeds"] == [1]
+    path = tmp_path / "physical/timing_s1/fedprox/result.json"
+    result = json.loads(path.read_text())
+    result["async_fl_config"][field] = default
+    study.save_json(path, result)
+    rejected = study.analyze(plan, tmp_path)
+    assert rejected["reports"][0]["complete_seeds"] == []
+    assert "Asynchronous parameters" in rejected["exclusions"][0]["reason"]
+
+
+def test_timed_async_cohort_cannot_claim_speed_from_total_run_duration(tmp_path, monkeypatch):
+    monkeypatch.setattr(study, "summarize", fake_audit)
+    plan = plan_for(list(range(1, 13)))
+    plan["method_order"][1] = "fedcompass"
+    plan.update(time_budget_sec=20.0, evaluation_interval_sec=2.0)
+    for seed in plan["stages"][0]["seeds"]:
+        write_block(tmp_path, seed)
+        for path in (tmp_path / "physical" / f"timing_s{seed}").glob("*/result.json"):
+            result = json.loads(path.read_text())
+            result.update(time_budget_sec=20.0, evaluation_interval_sec=2.0,
+                          evaluation_policy="initial, wall-clock cadence and final frozen model")
+            if result["method"] == "fedprox":
+                result.update(method="fedcompass", global_updates=15,
+                              aggregation_order="coordinator_arrival_and_group_deadline",
+                              fedcompass_config={"min_local_steps": 20, "max_local_steps": 100,
+                                  "latest_time_factor": 1.2, "alpha": .9, "staleness_exponent": .5})
+            study.save_json(path, result)
+    freeze_plan(tmp_path, plan)
+    analysis = study.analyze(plan, tmp_path)
+    assert not analysis["exclusions"]
+    report = analysis["reports"][0]
+    assert report["paired_n"] == 12
+    assert all(not effect["fixed_work_time_comparable"] and not effect["primary_claim_supported"]
+               for effect in report["comparisons"])

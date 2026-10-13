@@ -88,15 +88,6 @@ uv sync --extra dev --extra integration --extra multibackend --reinstall-package
 
 ## Quick Start
 
-Run the same residual MLP with identical weights and inputs across all five backends:
-
-```bash
-uv run --no-sync python -m experiments.analysis.canonical_backend_correctness \
-  --output results/canonical_backend_correctness_new_run
-```
-
-This source-frozen check compares output, loss, all parameter gradients, one SGD update, and activation/gradient serialization at every enumerated boundary. Each run requires a new directory. Passed, unsupported and failed cuts remain separate; an installed backend is not proof that its cuts pass. The fixture does not establish dataset accuracy or a common ResNet18 across backends.
-
 Run the download-free task correctness matrix (image/text classification, detection,
 semantic and instance segmentation; PyTorch and JAX):
 
@@ -364,7 +355,7 @@ The [execution coverage guide](experiments/EXECUTION_COVERAGE.md) describes comp
 Completed training weights and unused input copies have been pruned. This audit
 recomputes statistics from retained results and uses the recorded pre-pruning
 checkpoint checks; it does not reload deleted weights. The four RQ1 input bundles
-and actual PPO actor remain. See [storage cleanup](paper/evidence/storage_cleanup_receipt.json).
+remain. See [storage cleanup](paper/evidence/storage_cleanup_receipt.json).
 
 The manuscript's retained cohorts and required support files are listed in
 [results/README.md](results/README.md). Unused pilots, intermediate analyses,
@@ -376,12 +367,11 @@ figures retain their original hashes.
 New experiment runs default to compact storage. Servers keep numerical results,
 failures and a final in-memory finite/hash check; full task weights require
 `--save-model`. Prepared server/client bundles reference shared weights and data,
-and layer variants change metadata without copying those tensors. The physical
+and derived role descriptors reuse those tensors. The physical
 matrix deletes its owned inputs after it stops its workers, including on failure;
 use `--keep-input-bundles` to retain them for replay or debugging. Manifests,
 input hashes, frozen source and logs remain. Standalone input preparation keeps
 its shared assets for subsequent runs; it cannot delete inputs used by other jobs.
-The genuinely trained PPO actor remains a required output.
 
 TorchLens 2.34.1 wheel and API checks:
 

@@ -1,4 +1,4 @@
-"""Actual-device comparison of published placement-controller adaptations."""
+"""Actual-device comparison of four split-placement controllers."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 import time
 
-from experiments.baselines.adaptive_reference import AdaptiveReference, LayerScopedProvider
+from experiments.baselines.adaptive_reference import AdaptiveReference
 from experiments.physical_multitask import _make_placement_policy, run_client, run_server
 from experiments.physical_placement import MeasuredRecordingSplit, PhysicalIndependentUCB
 from splitfleet.server.placement.cosplit_ucb import CoSplitUCBPlacementPolicy
@@ -15,8 +15,7 @@ from splitfleet.server.placement.cosplit_ucb.types import PlacementFeedback
 from splitfleet.server.placement.cosplit_ucb.rpc_timing import state_exchange_duration
 
 
-POLICIES = ("CoSplit-UCB-full", "CoSplit-UCB-layer", "Independent-UCB-layer",
-            "L2S-LinUCB-E", "Profile-Greedy", "FedAdapt-PPO", "FedAdapt-PPO-training")
+POLICIES = ("CoSplit-UCB", "Independent-UCB", "Greedy", "L2S")
 
 
 def reference_feedback(round_id, results):
@@ -39,7 +38,7 @@ def reference_feedback(round_id, results):
     return observations
 
 
-def scoped_initial_boundary(policy, boundary):
+def initial_admitted_boundary(policy, boundary):
     """Bootstrap within the controller's actual catalog before round planning."""
     candidates = tuple(policy.candidate_provider.get_candidates(training=True))
     if boundary in {candidate.boundary for candidate in candidates}:
@@ -50,7 +49,7 @@ def scoped_initial_boundary(policy, boundary):
 
 class AdaptiveRecordingSplit(MeasuredRecordingSplit):
     def __init__(self, *, experiment_args, **kwargs):
-        kwargs['boundary'] = scoped_initial_boundary(kwargs['placement_policy'], kwargs['boundary'])
+        kwargs['boundary'] = initial_admitted_boundary(kwargs['placement_policy'], kwargs['boundary'])
         super().__init__(experiment_args=experiment_args, **kwargs)
 
     def configure_fit(self, server_round, parameters, client_manager):
@@ -73,7 +72,7 @@ class AdaptiveRecordingSplit(MeasuredRecordingSplit):
             policy = getattr(self, "_placement_policy", None)
         if isinstance(policy, AdaptiveReference):
             result["reference_controller"] = {"algorithm": policy.algorithm,
-                "decision_receipts": policy.decision_receipts, "ppo_updates": policy.ppo_updates,
+                "decision_receipts": policy.decision_receipts,
                 "decision_granularity": "federated_round", "fully_local_escape_available": False,
                 "gradient_volume_features": "captured differentiable frontier proxy; actual buffers logged separately"}
         return result
@@ -118,8 +117,6 @@ def main():
     parser.add_argument("--client-id")
     parser.add_argument("--client-index", type=int)
     parser.add_argument("--barrier")
-    parser.add_argument("--ppo-source", type=Path)
-    parser.add_argument("--actor-checkpoint", type=Path)
     args = parser.parse_args()
     args.method = "splitfleet"
     args.fixed_boundary = args.boundary
@@ -131,21 +128,16 @@ def main():
         raise ValueError("Server requires output, bind, rounds and network-control")
     if args.change_round < 1 or args.degraded_mbps <= 0:
         raise ValueError("Invalid actual network schedule")
-    if args.policy == "FedAdapt-PPO" and not args.actor_checkpoint:
-        raise ValueError("FedAdapt deployment requires its genuinely trained frozen actor")
 
     def factory(**kwargs):
         provider = kwargs["provider"]
-        if args.policy != "CoSplit-UCB-full":
-            provider = LayerScopedProvider(provider)
         config = _make_placement_policy(**kwargs).config
-        if args.policy.startswith("CoSplit-UCB"):
+        if args.policy == "CoSplit-UCB":
             return CoSplitUCBPlacementPolicy(candidate_provider=provider, config=config)
-        if args.policy == "Independent-UCB-layer":
+        if args.policy == "Independent-UCB":
             return PhysicalIndependentUCB(candidate_provider=provider, config=config)
         return AdaptiveReference(candidate_provider=provider, config=config,
-            algorithm=args.policy, horizon=args.rounds, output=args.output,
-            ppo_source=args.ppo_source, actor_checkpoint=args.actor_checkpoint)
+            algorithm=args.policy, horizon=args.rounds, output=args.output)
 
     run_server(args, placement_policy_factory=factory,
         recording_strategy_class=lambda **kwargs: AdaptiveRecordingSplit(experiment_args=args, **kwargs))

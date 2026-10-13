@@ -20,3 +20,14 @@ def git_commit() -> str:
         ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
     )
     return result.stdout.strip()
+
+
+def torchlens_source_identity() -> str:
+    """Hash installed TorchLens Python sources for frozen execution receipts."""
+    import importlib.util
+    from pathlib import Path
+
+    package = Path(importlib.util.find_spec("torchlens").origin).parent
+    hashes = {str(path.relative_to(package)): hashlib.sha256(path.read_bytes()).hexdigest()
+              for path in sorted(package.rglob("*.py"))}
+    return hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()

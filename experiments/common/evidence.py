@@ -30,7 +30,7 @@ def claim_frozen_run(output: Path) -> dict:
     A crashed child keeps its attempt marker. Reusing a hidden --frozen entry
     point must never overwrite completed, failed or partially measured runs.
     """
-    from experiments.analysis.partition_coverage import _torchlens_source_identity
+    from experiments.common.identity import torchlens_source_identity
 
     output = output.resolve()
     snapshot = output / "runtime_snapshot"
@@ -47,7 +47,7 @@ def claim_frozen_run(output: Path) -> dict:
               for path in sorted((snapshot / folder).rglob("*.py"))}
     if hashes != manifest["source_hashes"]:
         raise ValueError("Frozen runtime source changed before execution")
-    if _torchlens_source_identity() != manifest["torchlens_source_sha256"]:
+    if torchlens_source_identity() != manifest["torchlens_source_sha256"]:
         raise ValueError("TorchLens source changed before execution")
     if json.loads((output / "result.json").read_text()).get("status") != "running":
         raise FileExistsError("Run already completed or failed; preserve it and use a new directory")

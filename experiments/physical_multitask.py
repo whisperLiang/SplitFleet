@@ -27,7 +27,10 @@ from experiments.common.artifact_retention import write_training_result
 from experiments.common.bundle_storage import read_bundle, write_bundle
 from experiments.common.partition import dirichlet_partition
 from experiments.unified_multitask.data import VOC_CLASSES, Workload, _build_workload
-from experiments.common.workload_training import METHODS, _batch, _evaluate, _train_client
+from experiments.common.workload_training import (
+    ASYNC_FULL_MODEL_METHODS, FULL_MODEL_METHODS, METHODS, SUPPORTED_METHODS,
+    _batch, _evaluate, _train_client,
+)
 from splitfleet.client.app import start_client as split_start_client
 from splitfleet.client.autosplit_split_client import AutoSplitSplitLearningClient
 from splitfleet.common.constants import AUTOSPLIT_MODEL_VERSION_CONFIG_KEY
@@ -91,7 +94,7 @@ def _configure_primary_math(bundle) -> dict:
 
 
 def scheme_name(method: str, fixed_boundary: str | None) -> str:
-    if method not in METHODS:
+    if method not in SUPPORTED_METHODS:
         raise ValueError(f"unknown method: {method}")
     if method == "splitfed_fixed":
         if fixed_boundary not in FIXED_BOUNDARIES:
@@ -426,18 +429,28 @@ class FullClient(FlowerNumPyClient):
     def get_parameters(self, config):
         return [value.detach().cpu().numpy() for value in self.model.state_dict().values()]
 
+    def get_properties(self, config):
+        return {"logical_client_id": self.identity, "client_index": self.client_index,
+                "partition_size": len(self.workload.train_dataset),
+                "partition_hash": self.bundle["partition_hash"],
+                "initial_model_hash": tensor_state_hash(self.model.state_dict())}
+
     def fit(self, parameters, config):
         state = {name: torch.from_numpy(value.copy()) for name, value in zip(self.names, parameters, strict=True)}
-        _wait_for_round_release(self.barrier, int(config["round_id"]), self.identity)
+        if self.method not in ASYNC_FULL_MODEL_METHODS or config.get("initial_dispatch", False):
+            _wait_for_round_release(self.barrier, 1 if self.method in ASYNC_FULL_MODEL_METHODS
+                                    else int(config["round_id"]), self.identity)
         started_ns = time.time_ns()
         updated, details = _train_client(
             self.workload, state, list(range(len(self.workload.train_dataset))),
             method=self.method, boundary=None, seed=int(self.bundle["seed"]),
-            round_id=int(config["round_id"]), client_id=str(self.client_index),
+            round_id=int(config.get("dispatch_index", config["round_id"])), client_id=str(self.client_index),
             batch_size=int(self.bundle["batch_size"]), max_batches=None,
-            learning_rate=self.learning_rate, proximal_mu=0.01,
+            learning_rate=self.learning_rate,
+            proximal_mu=float(config.get("proximal_mu", .005)) if self.method == "fedasync" else .01,
             device=torch.device(self.device), drop_last=False,
             optimizer_name=self.optimizer_name, model=self.model,
+            exact_local_steps=int(config["local_steps"]) if self.method in ASYNC_FULL_MODEL_METHODS else None,
         )
         finished_ns = time.time_ns()
         self.model.load_state_dict(updated)
@@ -446,6 +459,11 @@ class FullClient(FlowerNumPyClient):
                        device=self.device, pid=os.getpid(),
                        fit_started_unix_ns=started_ns, fit_finished_unix_ns=finished_ns,
                        partition_hash=self.bundle["partition_hash"])
+        if self.method in ASYNC_FULL_MODEL_METHODS:
+            metrics.update(model_version=int(config["model_version"]),
+                           assigned_local_steps=int(config["local_steps"]))
+        if self.method in ("fedasync", "fedbuff"):
+            metrics["proximal_mu"] = float(config["proximal_mu"])
         return [updated[name].numpy() for name in self.names], int(details["num_examples"]), metrics
 
     def evaluate(self, parameters, config):
@@ -609,7 +627,7 @@ class RecordingSplit(AutoSplitStrategy):
 
 def run_server(args: argparse.Namespace, *, placement_policy_factory=None,
                recording_strategy_class=None) -> None:
-    owned_exchange = args.method not in ("fedavg", "fedprox") and (
+    owned_exchange = args.method not in FULL_MODEL_METHODS and (
         args.method == "splitfleet" or getattr(args, "split_state_exchange", "full") == "owned")
     workload, bundle = load_bundle(args.bundle)
     math_policy = _configure_primary_math(bundle)
@@ -630,11 +648,58 @@ def run_server(args: argparse.Namespace, *, placement_policy_factory=None,
     start_monotonic_ns = time.monotonic_ns()
     resolved_boundary = bundle.get("fixed_cut_resolution", {}).get(args.fixed_boundary, args.fixed_boundary)
     policy = None
-    if args.method in ("fedavg", "fedprox"):
+    fedcompass_server = None
+    timed_server = None
+    if args.method in FULL_MODEL_METHODS:
         strategy = RecordingFedAvg(workload=workload, model=model, device=args.device, **common)
         strategy.measurement_started_ns = start_monotonic_ns
-        history = flower_start_server(server_address=args.bind,
-                                      config=ServerConfig(num_rounds=args.rounds), strategy=strategy)
+        if args.method in ASYNC_FULL_MODEL_METHODS:
+            from flwr.server.client_manager import SimpleClientManager
+            from experiments.baselines.fedcompass import FedCompassConfig
+            from experiments.common.fedcompass_server import FedCompassServer
+            ids = bundle.get("worker_ids")
+            if not ids or len(ids) != num_clients:
+                raise ValueError("FedCompass requires frozen logical worker IDs")
+            strategy.model_initial_hash = bundle["initial_model_hash"]
+            strategy.partition_hash = bundle["partition_hash"]
+            server_class = FedCompassServer
+            async_config = FedCompassConfig(
+                min_local_steps=getattr(args, "fedcompass_min_steps", 20),
+                max_local_steps=getattr(args, "fedcompass_max_steps", 100),
+                latest_time_factor=getattr(args, "fedcompass_latest_time_factor", 1.2),
+                alpha=getattr(args, "fedcompass_alpha", .9),
+                staleness_exponent=getattr(args, "fedcompass_staleness_exponent", .5))
+            if args.method in ("fedasync", "fedbuff"):
+                from experiments.baselines.async_fl import AsyncFLConfig
+                from experiments.common.async_fl_server import AsyncFLServer
+                server_class = AsyncFLServer
+                async_config = AsyncFLConfig(method=args.method,
+                    local_steps=args.async_local_steps, alpha=args.fedasync_alpha,
+                    staleness_exponent=args.fedasync_staleness_exponent,
+                    proximal_mu=args.fedasync_proximal_mu, buffer_size=args.fedbuff_buffer_size,
+                    server_learning_rate=args.fedbuff_server_learning_rate)
+            fedcompass_server = server_class(
+                strategy=strategy, client_manager=SimpleClientManager(), worker_ids=ids,
+                partition_sizes={cid: int(bundle["partition_sizes"][str(i)]) for i, cid in enumerate(ids)},
+                config=async_config,
+                time_budget_sec=getattr(args, "time_budget_sec", None),
+                evaluation_interval_sec=getattr(args, "evaluation_interval_sec", 30.0),
+                rpc_timeout_sec=getattr(args, "fedcompass_rpc_timeout_sec", 1800.0))
+            history = flower_start_server(server_address=args.bind, server=fedcompass_server,
+                                          config=ServerConfig(num_rounds=args.rounds))
+        else:
+            if getattr(args, "time_budget_sec", None) is not None:
+                from flwr.server.server import Server as NativeServer
+                from flwr.server.client_manager import SimpleClientManager
+                from experiments.common.time_budget_server import with_time_budget
+                timed_server = with_time_budget(
+                    NativeServer(strategy=strategy, client_manager=SimpleClientManager()),
+                    args.time_budget_sec, args.evaluation_interval_sec)
+                history = flower_start_server(server_address=args.bind, server=timed_server,
+                                              config=ServerConfig(num_rounds=args.rounds))
+            else:
+                history = flower_start_server(server_address=args.bind,
+                                              config=ServerConfig(num_rounds=args.rounds), strategy=strategy)
     else:
         loader = DataLoader(workload.train_dataset, batch_size=int(bundle["batch_size"]),
                             collate_fn=workload.collate_fn)
@@ -669,8 +734,17 @@ def run_server(args: argparse.Namespace, *, placement_policy_factory=None,
         for boundary in boundaries:
             placement = strategy.get_or_create_placement_plan(boundary)
             strategy._autosplit_config(0, training=True, placement=placement)
-        history = split_start_server(server_address=args.bind,
-                                     config=ServerConfig(num_rounds=args.rounds), strategy=strategy)
+        if getattr(args, "time_budget_sec", None) is not None:
+            from splitfleet.server.app import init_defaults
+            from experiments.common.time_budget_server import with_time_budget
+            server, config = init_defaults(None, ServerConfig(num_rounds=args.rounds), strategy, None)
+            timed_server = with_time_budget(server, args.time_budget_sec, args.evaluation_interval_sec)
+            history = split_start_server(server_address=args.bind, server=timed_server, config=config)
+            if history is None:
+                raise RuntimeError("Timed split training failed; see the server log")
+        else:
+            history = split_start_server(server_address=args.bind,
+                                         config=ServerConfig(num_rounds=args.rounds), strategy=strategy)
     result = {
         "schema": "splitfleet.physical-multitask-result.v2", "task": workload.task.name,
         "method": args.method, "source": "real", "seed": bundle["seed"],
@@ -741,6 +815,10 @@ def run_server(args: argparse.Namespace, *, placement_policy_factory=None,
         "server_device": args.device,
         "fit_barrier": "all_configured_workers_ready",
     }
+    if fedcompass_server is not None:
+        result.update(fedcompass_server.result_metadata())
+    elif timed_server is not None:
+        result.update(timed_server.budget_metadata)
     output = Path(args.output)
     experiment_result = getattr(strategy, "experiment_result", None)
     if experiment_result is not None:
@@ -759,7 +837,7 @@ def run_client(args: argparse.Namespace) -> None:
     torch.set_num_threads(1)
     torch.manual_seed(int(bundle["seed"]))
     optimizer_class = {"sgd": torch.optim.SGD, "adam": torch.optim.Adam}[args.optimizer]
-    if args.method in ("fedavg", "fedprox"):
+    if args.method in FULL_MODEL_METHODS:
         client = FullClient(workload=workload, bundle=bundle, identity=args.client_id,
                             client_index=args.client_index, method=args.method,
                             device=args.device, learning_rate=args.learning_rate,
@@ -839,7 +917,7 @@ def main() -> None:
     for role in ("server", "client"):
         item = sub.add_parser(role)
         item.add_argument("--bundle", type=Path, required=True)
-        item.add_argument("--method", choices=METHODS, required=True)
+        item.add_argument("--method", choices=SUPPORTED_METHODS, required=True)
         item.add_argument("--device", required=True)
         item.add_argument("--learning-rate", type=float, default=0.01)
         item.add_argument("--optimizer", choices=("sgd", "adam"), default="sgd")
@@ -852,6 +930,20 @@ def main() -> None:
             item.add_argument("--rounds", type=int, default=3)
             item.add_argument("--output", type=Path, required=True)
             item.add_argument("--save-model", action="store_true", help="Retain full final weights for re-evaluation")
+            item.add_argument("--time-budget-sec", type=float)
+            item.add_argument("--evaluation-interval-sec", type=float, default=30.0)
+            item.add_argument("--fedcompass-min-steps", type=int, default=20)
+            item.add_argument("--fedcompass-max-steps", type=int, default=100)
+            item.add_argument("--fedcompass-latest-time-factor", type=float, default=1.2)
+            item.add_argument("--fedcompass-alpha", type=float, default=0.9)
+            item.add_argument("--fedcompass-staleness-exponent", type=float, default=0.5)
+            item.add_argument("--fedcompass-rpc-timeout-sec", type=float, default=1800.0)
+            item.add_argument("--async-local-steps", type=int, default=20)
+            item.add_argument("--fedasync-alpha", type=float, default=.9)
+            item.add_argument("--fedasync-staleness-exponent", type=float, default=.5)
+            item.add_argument("--fedasync-proximal-mu", type=float, default=.005)
+            item.add_argument("--fedbuff-buffer-size", type=int, default=2)
+            item.add_argument("--fedbuff-server-learning-rate", type=float, default=1.0)
         else:
             item.add_argument("--server", required=True)
             item.add_argument("--client-id", required=True)

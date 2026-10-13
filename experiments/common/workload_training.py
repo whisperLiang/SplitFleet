@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from statistics import median
 import time
-from itertools import chain
+from itertools import chain, islice
 from typing import Any, Mapping
 
 import numpy as np
@@ -26,7 +26,11 @@ from splitfleet.transport.split_wire import (
 from experiments.unified_multitask.data import Workload
 
 
-METHODS = ("fedavg", "fedprox", "splitfed_fixed", "splitfleet")
+METHODS = ("fedavg", "fedcompass", "splitfed_fixed", "splitfleet")
+# Historical sources and explicitly requested legacy replays retain FedProx.
+SUPPORTED_METHODS = ("fedavg", "fedasync", "fedbuff", "fedcompass", "fedprox", "splitfed_fixed", "splitfleet")
+ASYNC_FULL_MODEL_METHODS = ("fedasync", "fedbuff", "fedcompass")
+FULL_MODEL_METHODS = ("fedavg", *ASYNC_FULL_MODEL_METHODS, "fedprox")
 
 
 def _move(value: Any, device: torch.device) -> Any:
@@ -69,7 +73,11 @@ def _train_client(
     drop_last: bool = True,
     optimizer_name: str = "sgd",
     model: torch.nn.Module | None = None,
+    exact_local_steps: int | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    if exact_local_steps is not None and (type(exact_local_steps) is not int or exact_local_steps < 1
+                                         or max_batches is not None):
+        raise ValueError("Exact local steps must be positive and cannot be combined with max_batches")
     model = (workload.model_factory() if model is None else model).to(device)
     model.load_state_dict(global_state, strict=True)
     model.train()
@@ -93,7 +101,7 @@ def _train_client(
         name: tensor.detach().to(device).clone()
         for name, tensor in global_state.items()
         if name in dict(model.named_parameters())
-    } if method == "fedprox" else {}
+    } if method in ("fedprox", "fedasync") else {}
     def synchronize_device() -> None:
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -125,7 +133,15 @@ def _train_client(
     client_forward_samples = []
     client_backward_samples = []
     server_service_samples = []
-    for raw_index, raw in enumerate(chain((first_raw,), iterator)):
+    def training_batches():
+        yield from chain((first_raw,), iterator)
+        if exact_local_steps is not None:
+            while True:
+                yield from loader
+
+    source = (islice(training_batches(), exact_local_steps)
+              if exact_local_steps is not None else training_batches())
+    for raw_index, raw in enumerate(source):
         if max_batches is not None and raw_index >= max_batches:
             break
         call, targets, count = (
@@ -138,7 +154,7 @@ def _train_client(
             if not torch.isfinite(loss).all():
                 raise FloatingPointError("Native training loss is nonfinite; refusing the optimizer update")
             objective = loss
-            if method == "fedprox":
+            if method in ("fedprox", "fedasync"):
                 objective = loss + proximal_mu * fedprox_penalty(model, reference)
             objective.backward()
             optimizer.step()
@@ -231,6 +247,8 @@ def _evaluate(workload: Workload, model: torch.nn.Module, *, batch_size: int, de
             if isinstance(outputs, dict):
                 output_key = "out" if workload.task.name == "semantic_segmentation" else "logits"
                 outputs = outputs[output_key]
+            if not torch.isfinite(outputs).all():
+                raise FloatingPointError("Native evaluation predictions are nonfinite")
             all_targets.extend(targets.detach().cpu().numpy())
             all_predictions.extend(outputs.argmax(dim=1).detach().cpu().numpy())
     return workload.task.evaluate(np.asarray(all_targets), np.asarray(all_predictions))

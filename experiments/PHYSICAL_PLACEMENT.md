@@ -65,15 +65,6 @@ Keep the first round, its calibration overhead, per-client component counters,
 actual model buffers, accuracy/F1 and final model hash. A short pilot cannot
 establish convergence, energy advantage or general policy superiority.
 
-The older `experiments.placement_study` cost simulation sets neither actual
-Flower model-download nor prefix-state-upload cost in `CandidateEstimate`.
-Its communication total includes activation and gradient bytes only. This
-omission can favor cuts near the end of the graph when activation traffic
-shrinks, and its CPU/A6000 profiles do not measure Orin execution. Retain
-those runs as simulation records; use the actual-device runner above to
-assess placement and elapsed time. Report protocol changes explicitly when
-comparing the simulated record with a new physical study.
-
 `server_duration_sec` starts after loading the evaluation bundle and initial
 model, before constructing the placement provider and strategy. It includes
 their setup, calibration, physical communication, training and evaluation;

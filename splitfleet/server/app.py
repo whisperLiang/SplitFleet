@@ -91,7 +91,7 @@ async def start_grpc_server(  # pylint: disable=too-many-arguments
         ("grpc.max_send_message_length", max_message_length),
         ("grpc.max_receive_message_length", max_message_length),
         ("grpc.keepalive_time_ms", keepalive_time_ms),
-        ("grpc.keepalive_timeout_ms", 10_000),
+        ("grpc.keepalive_timeout_ms", 60_000),
         ("grpc.http2.min_ping_interval_without_data_ms", 10_000),
         ("grpc.http2.max_pings_without_data", 0),
         ("grpc.keepalive_permit_without_calls", 1),

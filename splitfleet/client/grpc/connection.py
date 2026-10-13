@@ -104,7 +104,7 @@ def grpc_connection(  # pylint: disable=R0913, R0915
         ("grpc.max_send_message_length", max_message_length),
         ("grpc.max_receive_message_length", max_message_length),
         ("grpc.keepalive_time_ms", 30_000),
-        ("grpc.keepalive_timeout_ms", 10_000),
+        ("grpc.keepalive_timeout_ms", 60_000),
         ("grpc.keepalive_permit_without_calls", 1),
         ("grpc.http2.max_pings_without_data", 0),
         ("grpc.enable_retries", 1),

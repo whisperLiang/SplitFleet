@@ -122,6 +122,8 @@ def evaluate(workload, model: nn.Module, *, device: torch.device) -> dict[str, f
     with torch.inference_mode():
         for images, records in loader:
             outputs = model(images.to(device))
+            if not all(torch.isfinite(outputs[key]).all() for key in ("pred_logits", "pred_boxes")):
+                raise FloatingPointError("Native detection predictions are nonfinite")
             targets.extend(records)
             predictions.extend(decode_predictions(outputs))
     return workload.task.evaluate(targets, predictions)

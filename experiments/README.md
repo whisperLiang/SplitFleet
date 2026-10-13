@@ -26,7 +26,23 @@ Run RF-DETR Nano using a deployment file for the three physical hosts and a new 
   --dirichlet-alpha 10 --split-state-exchange owned
 ```
 
-For a matched comparison, use `--methods fedavg fedprox splitfed_fixed splitfleet`. Fixed SFL runs all three 25%/50%/75% cuts against the same data partition, initialization and training budget. Calibration applies to SplitFleet. Its time is included in the server's inclusive elapsed time.
+The default comparison is `--methods fedavg fedcompass splitfed_fixed splitfleet`. Fixed SFL runs all three 25%/50%/75% cuts. FedCompass trains the complete model on each client and uses dynamic local steps and semi-asynchronous arrival groups. Calibration applies to SplitFleet, with its time included in the server's inclusive elapsed time.
+
+Use a common wall-clock budget when comparing FedCompass with synchronous methods, for example:
+
+```bash
+.venv/bin/python -m experiments.orchestrate_physical_multitask \
+  --deployment PATH_TO_DEPLOYMENT.json --run-id resnet-fedcompass-pilot \
+  --model resnet50_pretrained --pretrain-weights PATH_TO_CHECKPOINT.pth \
+  --tasks image_classification --methods fedavg fedcompass splitfed_fixed splitfleet \
+  --data-root data --train-samples 240 --test-samples 200 --batch-size 4 \
+  --optimizer adam --learning-rate 1e-4 --dirichlet-alpha 10 \
+  --time-budget-sec 600 --evaluation-interval-sec 30 \
+  --fedcompass-min-steps 20 --fedcompass-max-steps 100 \
+  --split-state-exchange owned --timeout 1800
+```
+
+The time budget supersedes `--rounds` for every method. Without a time budget, `--rounds` limits FedCompass global model updates; those are not equivalent to synchronous rounds or equal work. Summaries omit total-duration speed ratios for mixed or timed comparisons. See [the FedCompass implementation and protocol](FEDCOMPASS_BASELINE.md) for source differences, defaults and receipts. Local RPC correctness checks have passed; a new physical performance cohort is still required before updating paper result tables. Historical FedProx measurements retain their labels, and `--methods fedprox` remains available for explicit legacy replay.
 
 | Task | Model | Dataset | Typical worker set | Batch | Adam learning rate |
 |---|---|---|---|---:|---:|
@@ -35,7 +51,7 @@ For a matched comparison, use `--methods fedavg fedprox splitfed_fixed splitflee
 | Object detection | RF-DETR Nano | VOC2007 | 6 CPU/GPU | 1 | 1e-5 |
 | Semantic segmentation | DeepLabV3-ResNet50 | Oxford-IIIT Pet | 6 CPU/GPU | 2 | 1e-4 |
 
-The orchestrator freezes source, verifies remote copies, prepares private client partitions, synchronizes fit starts, and records failures. Each run uses a new directory; failed attempts are retained without automatic reruns or seed replacement. Full epochs retain final partial batches and evaluate after each training round.
+The orchestrator freezes source, verifies remote copies, prepares private client partitions, and records failures. Each run uses a new directory; failed attempts are retained without automatic reruns or seed replacement. Synchronous methods synchronize each round and train full epochs, retaining partial batches. FedCompass uses one initial readiness barrier, then dispatches updates by arrival and group deadline; its exact optimizer-step assignments cycle through the private partition as needed. Timed runs evaluate initially, at a common wall-clock cadence and finally on the frozen model. Drained work and communication are recorded without changing the timed model.
 
 RF-DETR uses gather-based bilinear sampling with zero padding and
 `align_corners=False` on every device and for every comparison method. This is
@@ -70,45 +86,26 @@ See `dependency_patches/DEEPLAB_INTERPOLATION_NOTICE.md` for attribution.
 | `physical_multitask` | Prepare task bundles; run FL/SFL clients and servers |
 | `orchestrate_physical_multitask` | Execute a physical training matrix and validate its records |
 | `www2027_study` | Freeze source and plans; execute and analyze paired seed blocks |
-| `run_edge_standard_study` | Device admission and serial model training |
+| `physical_adaptive_baselines` | CoSplit-UCB, Independent-UCB, Greedy and L2S physical controls |
+| `analysis.execution_coverage` | Capture and validate the seven PyTorch model architectures |
 | `edge_model_admission` | Full-model and native split numerical/resource checks |
 | `summarize_physical_multitask` | Validate and summarize completed physical runs |
 
 Calibration and exploration live in `splitfleet/server/placement/cosplit_ucb/`, shared by the native strategy and the physical runner. Core code does not import experiment modules.
 
-`baselines/` and `ablations/` retain the independent learner, bounded-cost oracle, cooperation, joint-solver, discounting and layer-candidate controls needed for research. `heterogeneity/` defines simulated bandwidth/load scenarios. These are experiment interfaces; only CoSplit-UCB is a production adaptive policy.
+`baselines/` retains the physical Independent-UCB/Greedy/L2S controls and the FedAsync/FedBuff/FedCompass mechanisms used by the current manuscript. Their calibration, training, model-state exchange and evaluation share the physical task runtime. Unused profile simulations, oracle/ablation experiments and separate five-backend performance runners have been removed; backend adapters and their functional regression tests remain maintained.
 
-`analysis/` retains general communication accounting, time-to-quality, partition coverage, backend validation and oracle-gap analysis. Simulated measurements are labeled as such; unit tests do not constitute physical performance evidence.
+## Reproducible execution evidence
 
-## Reproducible correctness and placement evidence
-
-All evidence entry points below require a new output directory and record source, configuration, dependency identities, logs, results and validation receipts.
-
-Profile and simulation children check the frozen source, configuration and installed TorchLens content hashes before execution. Simulation also checks the copied measured profiles. Each child claims its output directory once; completed, failed and interrupted attempts cannot be rerun over their original records, including through internal `--frozen` entry points.
+The seven-model PyTorch suite requires a fresh output directory and records source, input, dependency and validation identities:
 
 ```bash
-.venv/bin/python -m experiments.analysis.canonical_backend_correctness \
-  --output results/rq1_canonical_new_run
-.venv/bin/python -m experiments.analysis.backend_validation \
-  --output results/rq1_gated_residual_new_run
-.venv/bin/python -m experiments.analysis.partition_coverage \
-  --bundle PATH_TO_REAL_TASK_BUNDLE.pt --device cuda:0 \
-  --output results/rq2_structural_new_run
-.venv/bin/python -m experiments.placement_study profile \
-  --bundle PATH_TO_REAL_TASK_BUNDLE.pt --device cuda:0 --repeats 3 \
-  --output results/rq2_measured_landscape_new_run
-.venv/bin/python -m experiments.placement_study simulate \
-  --config PATH_TO_FROZEN_SIMULATION_CONFIG.json \
-  --output results/rq3_simulation_new_run
+.venv/bin/python -m experiments.analysis.execution_coverage \
+  --suite-bundles paper/evidence/rq1_execution/bundle_catalog.json \
+  --output results/execution_coverage_new_run --steps 10
 ```
 
-Omitting `--bundle` from `profile` executes a download-free MLP fixture. Profiles measure actual local prefix/suffix forward/backward and encoded activation/gradient sizes with model/RNG restoration and no optimizer steps. They do not measure distributed round latency. CPU/GPU profiles must share graph, ABI, checkpoint and numerical input identities; mismatches and missing cost rows are refused.
-
-Simulation configurations declare clients (`id`, `profile`, `num_batches`, optional bandwidth multiplier), paired policy seeds, rounds, scenario phases, adaptation tolerance and sustained recovery window. Each phase supplies `starts_round`, network upload/download Mbps and RTT, plus optional client/server cost multipliers and server concurrency. The default matrix includes fixed 25/50/75%, Independent-UCB, CoSplit-UCB, exact bounded offline oracle, layer-only, no cooperation, no joint solver and gamma=1. Every arm uses the same declared operation catalog and conditions; layer-only keeps its original descriptors. An oracle domain restriction must be explicit, never silent.
-
-Profiles are measured local costs; network transfers and phase changes in this runner are analytical simulation. `placement_trace.jsonl` records estimates, observed simulated costs, queue time, makespan, cut switches and oracle gap per client/round. Policy seeds on one timing profile do not count as independent physical repetitions. Oracle is not deployable and optimizes the declared table and lane simulator.
-
-The canonical residual MLP checks six numerical properties with identical backend math, weights and inputs. The gated residual suite uses backend-specific models: JAX omits BatchNorm and tinygrad uses scalar affine residual blocks. Its passing replay/training checks do not establish complete native loss/gradient/update parity. Structural candidate characterization also remains distinct from numerical replay verification.
+The four original client-0 inputs named by the bundle catalog remain available. Capture coverage and numerical training equivalence are distinct; the current manuscript's Figure 5 reports computational topology. Core multi-backend correctness can still be exercised with `python -m splitfleet.validation` and the functional tests.
 
 ## Quality and communication analysis
 
@@ -120,6 +117,6 @@ New physical records distinguish activation, target, request metadata, gradient,
 
 For historical reports, call `analyze(frozen_plan, OLD_ROOT)` read-only and `write_report(report, NEW_EXPORT_ROOT)`. The CLI `analyze --root` writes reports into that root, so do not point it at an immutable historical run. Older source cohorts without online-learning receipts are historical context, not evidence for the current CoSplit-UCB implementation.
 
-The retained result cohorts and their manuscript uses are indexed in [results/README.md](../results/README.md). Unused backend pilots, the separate layer-oracle batch, superseded intermediate analyses, unexecuted plans and their duplicate code snapshots have been removed. The unused standalone `online_calibration_admission` command has also been removed; production calibration and its regression checks remain in `splitfleet/server/placement/cosplit_ucb/`.
+The current manuscript cohorts are indexed in [results/README.md](../results/README.md). Only M01, P08, P09, P10 and E01 remain, together with their required inputs, source snapshots and protocol support files. Unused older cohorts, experimental entry points and their regression cases are removed.
 
-Formal baseline records, including cited numerical and physical failures, remain in `results/`; fresh experiments must use a new output directory and the current source. Old directory names can also contain required support files: the five-seed CNN drivers still read the earlier deployment configurations and import the earlier weight-layout parser. Those files are retained unchanged. See the [cleanup receipt](../paper/evidence/unused_experiment_cleanup_receipt.json) for removed paths and integrity checks.
+At the author's request, Figure 3/4 failed and excluded attempts were also deleted. Successful raw endpoints and published data remain unchanged. Current checks verify those successes against frozen publication evidence and use [the cleanup receipt](../paper/evidence/manuscript_cleanup_20261013/receipt.json) for deleted source hashes, explicitly without reconstructing deleted attempt populations. Fresh experiments continue to record failures and require a new output directory.

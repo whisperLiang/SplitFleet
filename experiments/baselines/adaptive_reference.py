@@ -1,54 +1,21 @@
-"""Published placement-controller adaptations and a profile greedy reference.
+"""L2S controller adaptation and a profile greedy reference.
 
 Controllers share physical split execution, admission, state exchange and timing.
 L2S's decision equation and optional escaping rule are retained, with three
 state/framing features added for roundwise SFL. The physical catalog contains
 two-sided cuts; its fully-local escaping action is consequently unavailable.
-FedAdapt uses the authors' PPO.py, supplied and hashed as a separate artifact.
 """
 
 from __future__ import annotations
 
-from dataclasses import replace
-import importlib.util
 import math
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from experiments.ablations.layer_level_candidates import module_end_boundaries
 from experiments.baselines.independent_ucb import IndependentUCB
 from experiments.physical_placement import PhysicalIndependentUCB, save_json
-from splitfleet.server.placement.cosplit_ucb import TorchLensCandidateProvider
-
-
-class LayerScopedProvider(TorchLensCandidateProvider):
-    """Reuse a capture, retaining only admitted semantic module endpoints."""
-
-    def __init__(self, provider):
-        self.__dict__.update(provider.__dict__)
-        self._catalogs = dict(provider._catalogs)
-        self._candidates = {key: dict(value) for key, value in provider._candidates.items()}
-        self.catalog_diagnostics = dict(provider.catalog_diagnostics)
-        self._scoped = set()
-
-    def get_candidates(self, *, training=True):
-        key = bool(training)
-        full = super().get_candidates(training=key)
-        if key not in self._scoped:
-            endpoints = module_end_boundaries(self._backends[key].runtime.trace_graph)
-            selected = tuple(value for value in full if value.boundary in endpoints)
-            if not selected:
-                raise ValueError("No admitted semantic module endpoints")
-            self._catalogs[key] = selected
-            self._candidates[key] = {value.boundary: self._candidates[key][value.boundary] for value in selected}
-            self.catalog_diagnostics[key] = {**self.catalog_diagnostics[key],
-                "scope": "captured_semantic_module_endpoints", "full_catalog_size": len(full),
-                "catalog_size": len(selected), "boundary_modules": {
-                    value.boundary: endpoints[value.boundary] for value in selected}}
-            self._scoped.add(key)
-        return self._catalogs[key]
 
 
 def graph_workload_features(provider):
@@ -153,57 +120,21 @@ class LinUCBE:
         self.updates += 1
 
 
-def normalized_fedadapt_reward(observed, baseline):
-    observed, baseline = np.asarray(observed, dtype=float), np.asarray(baseline, dtype=float)
-    if observed.shape != baseline.shape or not np.isfinite(observed).all() or not np.isfinite(baseline).all() or (observed <= 0).any() or (baseline <= 0).any():
-        raise ValueError("FedAdapt reward needs positive real durations")
-    return float(np.where(observed <= baseline, 1 - observed / baseline, baseline / observed - 1).sum())
-
-
-def workload_action(candidates, profiles, target):
-    """FedAdapt's nearest cumulative FLOP action, over admitted cuts only."""
-    if not math.isfinite(float(target)):
-        raise ValueError("Non-finite PPO action")
-    target = float(np.clip(target, 0, 1))
-    return min(candidates, key=lambda candidate: (
-        abs(profiles[candidate.boundary]["prefix_mac_fraction"] - target),
-        -profiles[candidate.boundary]["prefix_mac_fraction"], candidate.boundary))
-
-
-def load_upstream_ppo(path, *, groups):
-    path = Path(path)
-    if not path.is_file():
-        raise FileNotFoundError("Supply the verified authors' FedAdapt PPO.py artifact")
-    spec = importlib.util.spec_from_file_location("splitfleet_fedadapt_upstream", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    module.device = torch.device("cpu")
-    # Authors' config.py hyperparameters; the paper's learning rate differs.
-    agent = module.PPO(2 * groups, groups, .5, .0003, (.9, .999), .9, 50, .2)
-    return agent, module.Memory()
-
-
 class AdaptiveReference(PhysicalIndependentUCB):
     """Private measured bootstrap plus a separately declared decision rule."""
 
-    def __init__(self, *, candidate_provider, config, algorithm, horizon, output,
-                 ppo_source=None, actor_checkpoint=None):
+    def __init__(self, *, candidate_provider, config, algorithm, horizon, output):
+        if algorithm not in ("L2S", "Greedy"):
+            raise ValueError("Unknown adaptive reference")
         super().__init__(candidate_provider=candidate_provider, config=config)
         self.algorithm = algorithm
         self.horizon = horizon
         self.output = Path(output)
         self.profiles = None
-        self.native_reference = None
-        self.groups = None
-        self.agent = self.memory = None
-        self.ppo_source = ppo_source
-        self.actor_checkpoint = actor_checkpoint
-        self.previous_times = self.previous_workloads = None
         self.linear = {}
         self.cost_tables = {}
         self.pending_features = {}
         self.decision_receipts = []
-        self.ppo_updates = []
         self.state_file = None
 
     def _initialize_reference(self):
@@ -211,7 +142,6 @@ class AdaptiveReference(PhysicalIndependentUCB):
             return
         self.profiles = graph_workload_features(self.candidate_provider)
         catalog = tuple(self.candidate_provider.get_candidates(training=True))
-        by_cut = {candidate.boundary: candidate for candidate in catalog}
         server = {row["boundary"]: row["local_tail_service_ms"] / 1000 for row in self.telemetry_provider.server_receipt["records"]}
         for cid, child in self.clients.items():
             receipt = child.telemetry_provider.receipt
@@ -236,26 +166,6 @@ class AdaptiveReference(PhysicalIndependentUCB):
             table["state_seconds_per_byte"] = max((high-low)/(2097152-65536), 0)
             table["state_intercept_seconds"] = max(low - 2*65536*table["state_seconds_per_byte"], 0)
             self.linear[cid] = LinUCBE(11, horizon=self.horizon)
-        if self.algorithm.startswith("FedAdapt"):
-            if self.actor_checkpoint:
-                artifact = torch.load(self.actor_checkpoint, map_location="cpu", weights_only=False)
-                if artifact["schema"] != "splitfleet.fedadapt-controller.v1":
-                    raise ValueError("Unknown FedAdapt checkpoint")
-                self.groups = artifact["logical_client_order"]
-                self.native_reference = np.asarray(artifact["reference_batch_seconds"])
-                self.previous_times = self.native_reference.copy()
-                self.reference_workloads = np.asarray(artifact["reference_workloads"])
-                self.previous_workloads = self.reference_workloads.copy()
-            else:
-                self.groups = sorted(props["logical_client_id"] for props in self.telemetry_provider.clients.values())
-            current = {props["logical_client_id"] for props in self.telemetry_provider.clients.values()}
-            if set(self.groups) != current or len(self.groups) != len(current):
-                raise ValueError("PPO physical group membership differs from its artifact")
-            self.agent, self.memory = load_upstream_ppo(self.ppo_source, groups=len(self.groups))
-            if self.actor_checkpoint:
-                self.agent.policy.load_state_dict(artifact["policy_state"])
-                self.agent.policy_old.load_state_dict(artifact["policy_state"])
-                self.agent.policy.eval()
 
     def _front(self, cid, candidate):
         table = self.cost_tables[cid]
@@ -284,20 +194,11 @@ class AdaptiveReference(PhysicalIndependentUCB):
     def plan_round(self, *, round_id, client_ids, training):
         if not training:
             # Flower requests an evaluation plan even when fraction_evaluate=0.
-            # Reuse the evaluation catalog contract without creating an RL
-            # transition or changing the reference controller's training state.
+            # Reuse the evaluation catalog without changing training state.
             return super().plan_round(round_id=round_id, client_ids=client_ids,
                                       training=False)
         self._initialize_reference()
         assignment = {}
-        action = None
-        if self.algorithm.startswith("FedAdapt") and self.native_reference is not None:
-            state = np.concatenate([self.previous_times, self.previous_workloads])
-            if self.algorithm == "FedAdapt-PPO-training":
-                action, _, _ = self.agent.select_action(state, self.memory)
-            else:
-                with torch.no_grad():
-                    action = self.agent.exploit(state)
         for cid in sorted(client_ids):
             child = self.clients[cid]
             child.state_download_bytes = self.state_download_bytes
@@ -311,12 +212,12 @@ class AdaptiveReference(PhysicalIndependentUCB):
             count = int(props["num_batches"])
             front = np.asarray([self._front(cid, candidate) * count for candidate in feasible])
             features = self._features(cid, feasible)
-            if self.algorithm == "L2S-LinUCB-E":
+            if self.algorithm == "L2S":
                 position = self.linear[cid].choose(features, front, round_id=round_id)
                 chosen = feasible[position]
                 self.pending_features[(round_id, cid)] = features[position]
                 scores = self.linear[cid].scores(features, front)
-            elif self.algorithm == "Profile-Greedy":
+            elif self.algorithm == "Greedy":
                 table = self.cost_tables[cid]
                 anchors = table["anchors"]
                 scores = []
@@ -330,12 +231,6 @@ class AdaptiveReference(PhysicalIndependentUCB):
                     state_network = table["state_intercept_seconds"] + (self.state_download_bytes + candidate.metadata["optimizer_prefix_parameter_bytes"]) * table["state_seconds_per_byte"]
                     scores.append(frontend + count * (tail + split_network) + state_network)
                 position = int(np.argmin(scores));chosen = feasible[position]
-            elif self.algorithm.startswith("FedAdapt"):
-                logical = props["logical_client_id"]
-                position = self.groups.index(logical)
-                chosen = (max(feasible, key=lambda candidate: candidate.graph_position_ratio)
-                          if action is None else workload_action(feasible, self.profiles, action[position]))
-                scores = None
             else:
                 raise ValueError("Unknown adaptive reference")
             assignment[cid] = chosen.boundary
@@ -358,14 +253,11 @@ class AdaptiveReference(PhysicalIndependentUCB):
         feedback = tuple(feedback)
         IndependentUCB.observe_round(self, round_id=round_id, feedback=feedback)
         candidates = {value.boundary: value for value in self.candidate_provider.get_candidates(training=True)}
-        times = {}
-        workloads = {}
         for observation in feedback:
             if not observation.success:
                 continue
             cid = observation.client_id
             props = self.telemetry_provider.clients[cid]
-            logical = props["logical_client_id"]
             count = int(observation.num_batches)
             if count < 1 or observation.completion_ms is None or observation.completion_ms <= 0:
                 raise ValueError("Reference controllers require actual fit-RPC time and batches")
@@ -373,10 +265,10 @@ class AdaptiveReference(PhysicalIndependentUCB):
             table = self.cost_tables[cid]
             table["observed_front"][observation.boundary] = front
             table["observed_tail"][observation.boundary] = observation.server_service_ms / 1000
-            if self.algorithm == "L2S-LinUCB-E":
+            if self.algorithm == "L2S":
                 edge = max(observation.completion_ms / 1000 - front * count, 0)
                 self.linear[cid].observe(self.pending_features.pop((round_id, cid)), edge)
-            if self.algorithm == "Profile-Greedy":
+            if self.algorithm == "Greedy":
                 candidate = candidates[observation.boundary]
                 batch = int(props["batch_size"])
                 volume = (candidate.metadata["boundary_forward_bytes_by_batch_size"][batch]
@@ -386,38 +278,10 @@ class AdaptiveReference(PhysicalIndependentUCB):
                 exchange = self.state_download_bytes + candidate.metadata["optimizer_prefix_parameter_bytes"]
                 if exchange > 0 and observation.state_exchange_ms is not None:
                     table["state_seconds_per_byte"] = max((observation.state_exchange_ms / 1000 - table["state_intercept_seconds"]) / exchange, 0)
-            times[logical] = observation.completion_ms / 1000 / count
-            workloads[logical] = self.profiles[observation.boundary]["prefix_mac_fraction"]
-        if self.algorithm.startswith("FedAdapt"):
-            if set(times) != set(self.groups):
-                raise ValueError("PPO update requires every physical worker")
-            current = np.asarray([times[logical] for logical in self.groups])
-            if self.native_reference is None:
-                self.native_reference = current.copy()
-                self.reference_workloads = np.asarray([workloads[logical] for logical in self.groups])
-            elif self.algorithm == "FedAdapt-PPO-training":
-                self.memory.rewards.append(normalized_fedadapt_reward(current, self.native_reference))
-                self.memory.is_terminals.append(round_id == self.horizon)
-                if len(self.memory.rewards) == 10 or round_id == self.horizon:
-                    self.agent.update(self.memory)
-                    if not all(torch.isfinite(value).all() for value in self.agent.policy.state_dict().values()):
-                        raise ValueError("Non-finite actual-trained PPO weights")
-                    self.ppo_updates.append({"round_id": round_id, "physical_transitions": len(self.memory.rewards), "optimizer_epochs": 50})
-                    self.memory.clear_memory()
-                    torch.save({"schema": "splitfleet.fedadapt-controller.v1", "policy_state": self.agent.policy.state_dict(),
-                        "logical_client_order": self.groups, "reference_batch_seconds": self.native_reference.tolist(),
-                        "reference_workloads": self.reference_workloads.tolist(), "physical_training": True,
-                        "physical_transitions": sum(row["physical_transitions"] for row in self.ppo_updates),
-                        "ppo_updates": self.ppo_updates, "normalization_reference": "latest_admitted_cut_real_fit_rpc_per_batch",
-                        "state_units": "actual fit RPC seconds per batch; selected prefix MAC fraction",
-                        "groups": "three singleton groups (K=G=3)"}, self.output.with_suffix(".ppo.pt"))
-            self.previous_times = current
-            self.previous_workloads = np.asarray([workloads[logical] for logical in self.groups])
         save_json(self.output.with_suffix(".reference.json"), {"algorithm": self.algorithm,
-            "decisions": self.decision_receipts, "ppo_updates": self.ppo_updates,
+            "decisions": self.decision_receipts,
             "l2s_updates": {cid: learner.updates for cid, learner in self.linear.items()},
             "fully_local_escape_available": False, "shared_sfl_pipeline": True})
 
 
-__all__ = ["AdaptiveReference", "LayerScopedProvider", "LinUCBE", "graph_workload_features",
-           "load_upstream_ppo", "normalized_fedadapt_reward", "workload_action"]
+__all__ = ["AdaptiveReference", "LinUCBE", "graph_workload_features"]
