@@ -4,16 +4,27 @@ from __future__ import annotations
 
 import importlib.metadata
 import inspect
+from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import replace
-from typing import Any, Mapping
+from typing import Any
 
 import torch
 from torchlens import release_model
-from torchlens.split import SplitFeatures, SplitPoint, SplitRequest, SplitRuntime, after, before, percent, prepare
+from torchlens.split import (
+    SplitFeatures,
+    SplitPoint,
+    SplitRequest,
+    SplitRuntime,
+    after,
+    before,
+    percent,
+    prepare,
+)
+
 from splitfleet.backends.utils import detect_torchlens_backend
 
-TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION = "splitfleet-torchlens-v8-live-rng-selective-capture"
+TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION = "splitfleet-torchlens-v15-native-replica-lazy-tiny"
 REQUIRED_TORCHLENS_VERSION = "2.34.1"
 
 
@@ -184,8 +195,17 @@ def prepare_split_runtime(
         guard = torch.random.fork_rng(devices=devices) if backend == "torch" else nullcontext()
         with guard:
             if backend == "torch" and request.trainable and request.features.retain_trace is None:
-                from splitfleet.autosplit.torch_training_capture import prepare_training_runtime
+                from splitfleet.autosplit.torch_training_capture import (
+                    prepare_training_runtime,
+                )
                 runtime = prepare_training_runtime(model, inputs, request, input_kwargs=input_kwargs)
+            elif backend == "tf":
+                from splitfleet.runtime.tensorflow_capture_scope import tensorflow_capture_scope
+                from splitfleet.runtime.native_frontier import (
+                    prepare_native_frontier_runtime,
+                )
+                with tensorflow_capture_scope():
+                    runtime = prepare_native_frontier_runtime(model, inputs, request, input_kwargs=input_kwargs)
             else:
                 runtime = prepare(model, inputs, request, input_kwargs=input_kwargs)
         from splitfleet.autosplit.torch_live_rng import enable_live_torch_rng
@@ -214,7 +234,17 @@ def trace_signature(runtime: SplitRuntime) -> str:
     return runtime.graph_ir.graph_hash
 
 
-__all__ = ["SplitRuntime", "SplitRequest",
-    "TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION", "make_split_spec", "normalize_example_inputs", "normalize_model_call",
-    "prepare_split_runtime", "repartition_split_runtime",
-    "require_torchlens_version", "runtime_input_batch_size", "torchlens_runtime_version", "trace_signature"]
+__all__ = [
+    "TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION",
+    "SplitRequest",
+    "SplitRuntime",
+    "make_split_spec",
+    "normalize_example_inputs",
+    "normalize_model_call",
+    "prepare_split_runtime",
+    "repartition_split_runtime",
+    "require_torchlens_version",
+    "runtime_input_batch_size",
+    "torchlens_runtime_version",
+    "trace_signature",
+]

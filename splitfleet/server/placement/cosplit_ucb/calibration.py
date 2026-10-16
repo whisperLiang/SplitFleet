@@ -8,6 +8,7 @@ initialize the existing discounted learners, never replace their predictions.
 from __future__ import annotations
 
 import copy
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import json
 import math
@@ -23,6 +24,8 @@ from flwr.common import GetPropertiesIns
 from splitfleet.common.constants import (
     AUTOSPLIT_DYNAMIC_BATCH_CONFIG_KEY, AUTOSPLIT_MODE_CONFIG_KEY, AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY,
     COSPLIT_CALIBRATION_PARAMETERS_CONFIG_KEY,
+    COSPLIT_CALIBRATION_HASH_HANDSHAKE_KEY, COSPLIT_CALIBRATION_MODEL_HASH_CONFIG_KEY,
+    COSPLIT_CALIBRATION_PARAMETERS_REQUIRED_KEY,
 )
 from splitfleet.common.model_state import tensor_state_hash
 from .types import ExecutionProfileKey
@@ -50,6 +53,13 @@ def calibrate_split(model, inputs, targets, *, boundaries, make_handle, loss_fn,
     Deployment callers supply the training optimizer factory. Offline profiles
     explicitly pass ``None`` to measure forward/backward without updates.
     """
+    from splitfleet.backends.utils import adapter_for
+    adapter = adapter_for(model, inputs.args if inputs.args else inputs.kwargs)
+    if adapter.backend_name != 'torch':
+        from .native_calibration import calibrate_native_split
+        return calibrate_native_split(model, inputs, targets, boundaries=boundaries,
+            make_handle=make_handle, loss_fn=loss_fn, device=device, source=source,
+            optimizer_fn=optimizer_fn, adapter=adapter)
     device = torch.device(device)
     boundaries = tuple(boundaries)
     if not boundaries or len(set(boundaries)) != len(boundaries):
@@ -94,7 +104,8 @@ def calibrate_split(model, inputs, targets, *, boundaries, make_handle, loss_fn,
                 forward_ms = (time.perf_counter() - begin) * 1000
                 begin = time.perf_counter()
                 loss, returned = handle.backend.train_suffix(boundary, targets, loss_fn=loss_fn,
-                    optimizer=optimizer if optimizer_stage == "suffix" else None)
+                    optimizer=optimizer if optimizer_stage == "suffix" else None,
+                    boundary_gradients_only=optimizer_stage == "prefix")
                 _synchronize(device)
                 local_service_ms = (time.perf_counter() - begin) * 1000
                 begin = time.perf_counter()
@@ -176,20 +187,63 @@ class ClientTelemetry:
         self.policy = policy
         self.receipt = None
 
+    def _client_workers(self, count):
+        solver = getattr(self.policy, 'solver', None)
+        return min(count, getattr(solver, 'client_concurrency', None) or 1)
+
+    def _map_clients(self, call, clients):
+        workers = self._client_workers(len(clients))
+        if workers <= 1:
+            return [call(client) for client in clients]
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            # Ordered results preserve learner update and receipt order.
+            return list(executor.map(call, clients))
+
     def _bind_properties(self, clients, round_id: int, *, config=None, refresh=False) -> None:
-        for client in clients:
-            if str(client.cid) in self.clients and not refresh:
-                continue
+        pending = [client for client in clients if refresh or str(client.cid) not in self.clients]
+        if not pending:
+            return
+
+        def fetch(client):
+            request = dict(config or {})
+            payload = request.get(COSPLIT_CALIBRATION_PARAMETERS_CONFIG_KEY)
+            capabilities = {**self.clients.get(str(client.cid), {}), **getattr(client, 'properties', {})}
+            handshake = (payload is not None and COSPLIT_CALIBRATION_MODEL_HASH_CONFIG_KEY in request
+                         and capabilities.get(COSPLIT_CALIBRATION_HASH_HANDSHAKE_KEY) is True)
+            if handshake:
+                request.pop(COSPLIT_CALIBRATION_PARAMETERS_CONFIG_KEY)
             result = client.get_properties(
-                GetPropertiesIns(config=config or {}), timeout=300, group_id=round_id,
+                GetPropertiesIns(config=request), timeout=300, group_id=round_id,
             )
             props = dict(result.properties)
+            fallback = props.get(COSPLIT_CALIBRATION_PARAMETERS_REQUIRED_KEY) is True
+            if fallback:
+                if not handshake:
+                    raise ValueError('Client requested calibration parameters after receiving the full payload')
+                result = client.get_properties(GetPropertiesIns(config=dict(config)), timeout=300, group_id=round_id)
+                props = dict(result.properties)
+                if props.get(COSPLIT_CALIBRATION_PARAMETERS_REQUIRED_KEY):
+                    raise ValueError('Client still requires calibration parameters after the full payload')
             if not props.get("logical_client_id"):
                 raise ValueError("Online placement requires a physical worker identity")
             for field in ("num_batches", "batch_size"):
                 if int(props.get(field, 0)) < 1:
                     raise ValueError(f"Online placement requires positive {field}")
-            self.clients[str(client.cid)] = props
+            return str(client.cid), props, {
+                'requests': 1 + int(fallback), 'hash_matched_clients': int(handshake and not fallback),
+                'fallback_clients': int(fallback),
+                'parameter_payload_bytes': len(payload) if payload is not None and (not handshake or fallback) else 0,
+                'avoided_parameter_payload_bytes': len(payload) if handshake and not fallback else 0,
+            }
+
+        # The virtual runtime supplies its admitted worker bound. Each client
+        # still measures its own private model/data and returns its own receipt.
+        # Physical deployments retain the sequential default unless bounded.
+        results = self._map_clients(fetch, pending)
+        self.clients.update((cid, props) for cid, props, _ in results)
+        return {key: sum(transfer[key] for _, _, transfer in results) for key in (
+            'requests', 'hash_matched_clients', 'fallback_clients',
+            'parameter_payload_bytes', 'avoided_parameter_payload_bytes')}
 
     def bind_clients(self, clients, round_id):
         self._bind_properties(clients, round_id)
@@ -253,9 +307,13 @@ class CalibratedTelemetry(ClientTelemetry):
             config[AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY] = provider.trace_batch_mode
         if self.parameters is not None:
             config[COSPLIT_CALIBRATION_PARAMETERS_CONFIG_KEY] = self.parameters
+            config[COSPLIT_CALIBRATION_MODEL_HASH_CONFIG_KEY] = self.initial_model_hash
         # Evaluation may have bound these workers without calibration. Request
         # receipts only for the first training cohort, using its global model.
-        self._bind_properties(clients, round_id, config=config, refresh=True)
+        binding_started = time.perf_counter()
+        transfer = self._bind_properties(clients, round_id, config=config, refresh=True)
+        binding_elapsed = time.perf_counter() - binding_started
+        validation_started = time.perf_counter()
         calibration_clients = tuple(str(client.cid) for client in clients)
         expected = set(calibration_boundaries(catalog.values()))
         steps, measured = 2, 1
@@ -317,12 +375,18 @@ class CalibratedTelemetry(ClientTelemetry):
         # a one-way timing or an assertion that Flower and split RPCs
         # have identical serialization. Actual training RTT replaces it.
         template = next(iter(catalog.values()))
+        validation_elapsed = time.perf_counter() - validation_started
         probe_started = time.perf_counter()
-        for client in clients:
+
+        def probe_client(client):
+            # A client has one outstanding request at a time, as on a physical
+            # connection. Independent clients use the admitted worker pool.
+            samples, contexts, warmup = [], [], []
+            exchanges, exchange_features = [], []
             cid = str(client.cid)
             for repeat in range(2):
                 elapsed_ms = measure_transport_echo(client, size=65536, round_id=round_id)
-                transport_warmup.append({"logical_client_id": self.clients[cid]["logical_client_id"],
+                warmup.append({"logical_client_id": self.clients[cid]["logical_client_id"],
                     "payload_bytes": 65536, "repeat": repeat, "roundtrip_ms": elapsed_ms, "echo_verified": True})
             for size in (65536, 2097152):
                 batch_size = int(self.client_context(cid)["batch_size"])
@@ -333,19 +397,30 @@ class CalibratedTelemetry(ClientTelemetry):
                 context = policy.context_encoder.network_context(candidate, self.client_context(cid), direction="upload")
                 for repeat in range(2):
                     elapsed_ms = measure_transport_echo(client, size=size, round_id=round_id)
-                    transport_samples.append({"logical_client_id": self.clients[cid]["logical_client_id"],
+                    samples.append({"logical_client_id": self.clients[cid]["logical_client_id"],
                         "payload_bytes": size, "repeat": repeat, "roundtrip_ms": elapsed_ms,
                         "echo_verified": True})
-                    transport_contexts.append((cid, context, elapsed_ms))
+                    contexts.append((cid, context, elapsed_ms))
             for request_size, reply_size in ((65536, 65536), (2097152, 65536), (65536, 2097152)):
                 context = policy.context_encoder.exchange_context(download_bytes=request_size, upload_bytes=reply_size)
                 for repeat in range(2):
                     elapsed_ms = measure_transport_echo(client, size=request_size, reply_size=reply_size, round_id=round_id)
-                    exchange_samples.append({"logical_client_id": self.clients[cid]["logical_client_id"],
+                    exchanges.append({"logical_client_id": self.clients[cid]["logical_client_id"],
                         "request_bytes": request_size, "reply_bytes": reply_size, "repeat": repeat,
                         "roundtrip_ms": elapsed_ms, "reply_verified": True})
-                    exchange_contexts.append((cid, context, elapsed_ms))
+                    exchange_features.append((cid, context, elapsed_ms))
+            return samples, contexts, warmup, exchanges, exchange_features
+
+        # Finish and validate every RPC before updating any learner. Physical
+        # deployments keep their sequential default when no pool is declared.
+        for samples, contexts, warmup, exchanges, exchange_features in self._map_clients(probe_client, clients):
+            transport_samples.extend(samples)
+            transport_contexts.extend(contexts)
+            transport_warmup.extend(warmup)
+            exchange_samples.extend(exchanges)
+            exchange_contexts.extend(exchange_features)
         probe_elapsed = time.perf_counter() - probe_started
+        update_started = time.perf_counter()
         for cid, row, contexts, profile in prepared:
             if cid is not None:
                 policy.learners.edge.update(profile, contexts.edge,
@@ -358,6 +433,11 @@ class CalibratedTelemetry(ClientTelemetry):
         for cid, context, elapsed_ms in exchange_contexts:
             policy.learners.network.update_exchange(cid, context, elapsed_ms, round_id=0)
         self.receipt = {"source": "current_deployment_restored_training_cost_calibration",
+            "parameter_handshake": transfer,
+            "timing": {"client_binding_sec": binding_elapsed, "receipt_validation_sec": validation_elapsed,
+                       "transport_probe_sec": probe_elapsed,
+                       "learner_initialization_sec": time.perf_counter() - update_started,
+                       "client_concurrency_limit": self._client_workers(len(clients))},
             "initial_model_hash": self.initial_model_hash, "client_samples": logical,
             "server_calibration": self.server_receipt,
             "client_calibration_elapsed_sec": {self.clients[cid]["logical_client_id"]: receipt["elapsed_sec"] for cid, receipt in receipts if cid is not None},

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
-from typing import Any, Mapping
+from typing import Any
 
 import numpy as np
 import torch
@@ -25,6 +26,10 @@ def stable_digest(payload: object) -> str:
 
 
 def _json_safe(value: Any) -> Any:
+    # Most ABI leaves are plain JSON scalars. Keep subclass serializers on
+    # the existing path rather than bypassing their to_dict hooks.
+    if value is None or type(value) in (str, int, float, bool):
+        return value
     if hasattr(value, "to_dict") and callable(value.to_dict):
         return _json_safe(value.to_dict())
     if hasattr(value, "__dataclass_fields__"):
@@ -295,6 +300,7 @@ def build_runtime_contract(
         "trace_batch_size": trace_batch_size,
         "batch_symbol": batch_symbol,
     }
+    abi_payload = abi_spec.to_dict()
     contract = {
         "contract_version": RUNTIME_CONTRACT_VERSION,
         "runtime_backend": runtime_backend,
@@ -308,8 +314,8 @@ def build_runtime_contract(
         "boundary": str(boundary or canonical_split_key or ""),
         "boundary_tensor_labels": labels,
         "boundary_schema": abi_spec.boundary_schema,
-        "feature_abi_spec": abi_spec.to_dict(),
-        "feature_abi_id": feature_abi_id(abi_spec),
+        "feature_abi_spec": abi_payload,
+        "feature_abi_id": feature_abi_id(abi_payload),
         "runtime_identity": _json_safe(identity),
         "runtime_identity_id": runtime_identity_id(identity),
         "trace_batch_mode": str(trace_batch_mode or ""),

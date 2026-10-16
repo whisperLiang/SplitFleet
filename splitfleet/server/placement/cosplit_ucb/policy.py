@@ -16,6 +16,7 @@ from .learners import CandidateContexts, CooperativeLearners
 from .solver import GlobalPlacementSolver
 from .state import BanditStateStore
 from .types import (
+    CandidateEstimate,
     ExecutionProfileKey,
     PlacementFeedback,
     RuntimeTelemetryProvider,
@@ -41,6 +42,7 @@ class CoSplitUCBPlacementPolicy:
         config: CoSplitUCBConfig | None = None,
         telemetry_provider: RuntimeTelemetryProvider | Mapping[str, Any] | None = None,
         state_store: BanditStateStore | None = None,
+        runtime_context_provider=None,
     ) -> None:
         self.config = config or CoSplitUCBConfig()
         self.candidate_provider = candidate_provider
@@ -60,6 +62,7 @@ class CoSplitUCBPlacementPolicy:
             seed=self.config.seed,
         )
         self.telemetry_provider = telemetry_provider
+        self.runtime_context_provider = runtime_context_provider
         self.state_store = state_store or (
             BanditStateStore(self.config.state_path) if self.config.state_path else None
         )
@@ -148,7 +151,7 @@ class CoSplitUCBPlacementPolicy:
             return
         from flwr.common import ndarrays_to_parameters, serde
         from splitfleet.backends.utils import adapter_for
-        from splitfleet.common.model_state import tensor_state_hash
+        from splitfleet.common.model_state import model_state_hash
 
         model = self.candidate_provider.model
         adapter = adapter_for(model, inputs.args if inputs.args else inputs.kwargs)
@@ -165,7 +168,7 @@ class CoSplitUCBPlacementPolicy:
             parameters if parameters is not None else adapter.export_ndarrays(model)
         )).SerializeToString()
         if (isinstance(previous, CalibratedTelemetry)
-                and previous.initial_model_hash == tensor_state_hash(model.state_dict())):
+                and previous.initial_model_hash == model_state_hash(model, adapter)):
             previous.parameters = payload
             return
         if targets is None:
@@ -189,6 +192,11 @@ class CoSplitUCBPlacementPolicy:
         self.telemetry_provider = telemetry
 
     def _client_telemetry(self, client_id: str) -> Mapping[str, Any]:
+        values = self._calibrated_client_telemetry(client_id)
+        method = getattr(self.runtime_context_provider, "client_context", None)
+        return {**values, **dict(method(str(client_id)) or {})} if method is not None else values
+
+    def _calibrated_client_telemetry(self, client_id: str) -> Mapping[str, Any]:
         provider = self.telemetry_provider
         if provider is None:
             return {}
@@ -203,7 +211,9 @@ class CoSplitUCBPlacementPolicy:
 
     def _server_telemetry(self) -> Mapping[str, Any]:
         method = getattr(self.telemetry_provider, "server_context", None)
-        return dict(method() or {}) if method is not None else {}
+        values = dict(method() or {}) if method is not None else {}
+        runtime = getattr(self.runtime_context_provider, "server_context", None)
+        return {**values, **dict(runtime() or {})} if runtime is not None else values
 
     def _execution_profile(
         self,

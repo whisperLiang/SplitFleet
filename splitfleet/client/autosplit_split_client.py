@@ -8,9 +8,10 @@ import math
 import platform
 import time
 import uuid
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from statistics import fmean, median
-from typing import Any, Callable, Iterable, Optional
+from typing import Any
 
 from splitfleet.autosplit import (
     AutoSplitSession,
@@ -21,6 +22,11 @@ from splitfleet.autosplit import (
     normalize_batch_window,
     require_batch_in_window,
 )
+from splitfleet.autosplit.torchlens_runtime import (
+    model_input_batch_size,
+    runtime_input_batch_size,
+    torchlens_runtime_version,
+)
 from splitfleet.backends.utils import (
     adapter_for,
     bind_model_inputs,
@@ -29,13 +35,6 @@ from splitfleet.backends.utils import (
     move_value,
     zero_grad,
 )
-from splitfleet.runtime import PrefixContextStore
-from splitfleet.tasks import ModelInputs, TaskAdapter, TaskBatch, infer_num_examples, prepare_task_batch
-from splitfleet.split_engine.contracts import GraphContract, ModelVersionContract, validate_contract
-from splitfleet.split_engine import graph_contract_for_runtime_handle
-from splitfleet.autosplit.torchlens_runtime import model_input_batch_size, runtime_input_batch_size, torchlens_runtime_version
-from splitfleet.transport import decode_gradients, encode_boundary, encode_bundle_wire
-from splitfleet.transport.split_wire import boundary_to_envelope, envelope_to_gradients
 from splitfleet.client.numpy_client import NumPyClient
 from splitfleet.common import BatchData, ControlCode
 from splitfleet.common.constants import (
@@ -45,12 +44,12 @@ from splitfleet.common.constants import (
     AUTOSPLIT_CLIENT_STAGE_COUNT_CONFIG_KEY,
     AUTOSPLIT_DYNAMIC_BATCH_CONFIG_KEY,
     AUTOSPLIT_FEATURE_ABI_ID_CONFIG_KEY,
-    AUTOSPLIT_GRAPH_SIGNATURE_CONFIG_KEY,
     AUTOSPLIT_GRAPH_CONTRACT_CONFIG_KEY,
     AUTOSPLIT_GRAPH_CONTRACT_DIGEST_CONFIG_KEY,
+    AUTOSPLIT_GRAPH_SIGNATURE_CONFIG_KEY,
+    AUTOSPLIT_MODE_CONFIG_KEY,
     AUTOSPLIT_MODEL_VERSION_CONFIG_KEY,
     AUTOSPLIT_MODEL_VERSION_CONTRACT_CONFIG_KEY,
-    AUTOSPLIT_MODE_CONFIG_KEY,
     AUTOSPLIT_PLAN_ID_CONFIG_KEY,
     AUTOSPLIT_RUNTIME_BACKEND_CONFIG_KEY,
     AUTOSPLIT_RUNTIME_CONTRACT_CONFIG_KEY,
@@ -58,13 +57,36 @@ from splitfleet.common.constants import (
     AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY,
     AUTOSPLIT_TRAINABLE_CONFIG_KEY,
     CLIENT_ID_CONFIG_KEY,
+    COSPLIT_CALIBRATION_HASH_HANDSHAKE_KEY,
+    COSPLIT_CALIBRATION_MODEL_HASH_CONFIG_KEY,
     COSPLIT_CALIBRATION_PARAMETERS_CONFIG_KEY,
+    COSPLIT_CALIBRATION_PARAMETERS_REQUIRED_KEY,
     TRANSPORT_CLIENT_SEND_NS_METADATA_KEY,
-    TRANSPORT_SERVER_RECEIVE_NS_METADATA_KEY,
     TRANSPORT_SERVER_ELAPSED_NS_METADATA_KEY,
+    TRANSPORT_SERVER_RECEIVE_NS_METADATA_KEY,
     TRANSPORT_SERVER_SEND_NS_METADATA_KEY,
 )
-
+from splitfleet.runtime import PrefixContextStore
+from splitfleet.split_engine import graph_contract_for_runtime_handle
+from splitfleet.split_engine.contracts import (
+    GraphContract,
+    ModelVersionContract,
+    validate_contract,
+)
+from splitfleet.tasks import (
+    ModelInputs,
+    TaskAdapter,
+    TaskBatch,
+    infer_num_examples,
+    prepare_task_batch,
+)
+from splitfleet.transport import (
+    decode_bundle_wire,
+    decode_gradients,
+    encode_boundary,
+    encode_bundle_wire,
+)
+from splitfleet.transport.split_wire import boundary_to_envelope, envelope_to_gradients
 
 PARTIAL_BATCH_POLICIES = ("error", "skip")
 
@@ -183,6 +205,7 @@ class _RoundTelemetry:
     skipped_examples: int = 0
     prefix_compute_sec: float = 0.0
     tail_wait_sec: float = 0.0
+    suffix_server_queue_sec: float = 0.0
     upload_bytes: int = 0
     download_bytes: int = 0
     activation_upload_bytes: int = 0
@@ -231,6 +254,7 @@ class _RoundTelemetry:
             "skipped_examples": self.skipped_examples,
             "prefix_compute_sec": self.prefix_compute_sec,
             "tail_wait_sec": self.tail_wait_sec,
+            "suffix_server_queue_sec": self.suffix_server_queue_sec,
             "upload_bytes": self.upload_bytes,
             "download_bytes": self.download_bytes,
             "activation_upload_bytes": self.activation_upload_bytes,
@@ -256,6 +280,7 @@ class _RoundTelemetry:
         ):
             samples = getattr(self, f"_{name}_samples_ms")
             if samples:
+                metrics[f"{name}_sec"] = float(sum(samples)) / 1000.
                 metrics[f"{name}_ms"] = float(median(samples))
                 metrics[f"{name}_mean_ms"] = float(fmean(samples))
                 metrics[f"{name}_samples"] = len(samples)
@@ -271,17 +296,18 @@ class AutoSplitSplitLearningClient(NumPyClient):
         model: Any,
         train_data: Iterable[Any],
         sample_inputs: Any,
-        evaluate_data: Optional[Iterable[Any]] = None,
-        sample_kwargs: Optional[dict] = None,
-        batch_axes: Optional[dict[str, int]] = None,
-        batch_adapter: Optional[Callable[[Any], tuple[Any, Any]]] = None,
+        evaluate_data: Iterable[Any] | None = None,
+        sample_kwargs: dict | None = None,
+        batch_axes: dict[str, int] | None = None,
+        batch_adapter: Callable[[Any], tuple[Any, Any]] | None = None,
         task: TaskAdapter | None = None,
         optimizer_fn=None,
-        functional_update_fn: Optional[Callable[[Any, Any], Any]] = None,
-        autosplit_session: Optional[AutoSplitSession] = None,
+        functional_update_fn: Callable[[Any, Any], Any] | None = None,
+        autosplit_session: AutoSplitSession | None = None,
         device: str = "cpu",
         partial_batch_policy: str = "error",
         max_cached_runtimes: int | None = None,
+        calibration_batch: TaskBatch | None = None,
     ) -> None:
         if partial_batch_policy not in PARTIAL_BATCH_POLICIES:
             raise ValueError(
@@ -300,11 +326,14 @@ class AutoSplitSplitLearningClient(NumPyClient):
         self.train_data = train_data
         self.evaluate_data = evaluate_data if evaluate_data is not None else train_data
         sample_call = sample_call.map_values(lambda value: move_value(value, self.backend_adapter, device))
-        self.sample_inputs = bind_model_inputs(sample_call.args, self.backend_adapter)
+        self.sample_inputs = bind_model_inputs(sample_call.args, self.backend_adapter, model=self.model)
         self.sample_kwargs = dict(sample_call.kwargs)
         self.batch_axes = batch_axes
         self.task = task
-        self._calibration_targets = sample_inputs.targets if isinstance(sample_inputs, TaskBatch) else None
+        self._calibration_targets = (calibration_batch.targets if calibration_batch is not None
+                                     else sample_inputs.targets if isinstance(sample_inputs, TaskBatch) else None)
+        self._calibration_inputs = (calibration_batch.inputs.map_values(
+            lambda value: move_value(value, self.backend_adapter, device)) if calibration_batch is not None else None)
         self._sample_num_examples = sample_inputs.num_examples if isinstance(sample_inputs, TaskBatch) else None
         self.online_calibration_receipt = None
         self.batch_adapter = batch_adapter
@@ -321,6 +350,8 @@ class AutoSplitSplitLearningClient(NumPyClient):
         # (or repartition it) instead of tracing the model on the critical
         # path of the first fit call.
         self._prewarmed_runtime: TorchLensRuntimeHandle | None = None
+        self._calibration_runtime_cache = {}
+        self._calibration_runtime_source = None
         self._last_split_prepare_sec = 0.0
         self._context_store = PrefixContextStore()
         self._round_config: dict[str, Any] = {}
@@ -342,6 +373,8 @@ class AutoSplitSplitLearningClient(NumPyClient):
         """
 
         self.backend_adapter.set_training(self.model, True)
+        self._calibration_runtime_cache.clear()
+        self._calibration_runtime_source = None
         handle = self.autosplit_session.prepare_runtime(
             self.model,
             self.sample_inputs,
@@ -371,14 +404,36 @@ class AutoSplitSplitLearningClient(NumPyClient):
         if self.optimizer_fn is None:
             raise ValueError("training cost calibration requires an optimizer factory")
         targets = move_value(targets, self.backend_adapter, self.device)
+        boundaries = tuple(boundaries)
+        cache_native = self.backend_adapter.backend_name == 'tf' and bool(
+            getattr(self.model, '_splitfleet_tensorflow_function_forward', False))
+        if self._calibration_runtime_source is not self._prewarmed_runtime.runtime:
+            self._calibration_runtime_cache.clear()
+            self._calibration_runtime_source = self._prewarmed_runtime.runtime
+        self._calibration_runtime_cache = {
+            cut: handle for cut, handle in self._calibration_runtime_cache.items() if cut in boundaries}
+        cache_hits = 0
+
+        def calibration_handle(cut):
+            nonlocal cache_hits
+            if cache_native and cut in self._calibration_runtime_cache:
+                cache_hits += 1
+                return self._calibration_runtime_cache[cut]
+            handle = self.autosplit_session.repartition_runtime(self._prewarmed_runtime, cut)
+            if cache_native:
+                self._calibration_runtime_cache[cut] = handle
+            return handle
+
         self.online_calibration_receipt = calibrate_split(
-            self.model, ModelInputs(self.sample_inputs, self.sample_kwargs), targets,
+            self.model, self._calibration_inputs or ModelInputs(self.sample_inputs, self.sample_kwargs), targets,
             boundaries=boundaries,
-            make_handle=lambda cut: self.autosplit_session.repartition_runtime(self._prewarmed_runtime, cut),
+            make_handle=calibration_handle,
             loss_fn=self.task.loss, device=self.device,
             source="client_private_sample_current_deployment",
             optimizer_fn=self.optimizer_fn,
         )
+        if cache_native:
+            self.online_calibration_receipt['native_runtime_cache_hits'] = cache_hits
         return self.online_calibration_receipt
 
     def get_properties(self, config):
@@ -395,12 +450,21 @@ class AutoSplitSplitLearningClient(NumPyClient):
         if cuts:
             from flwr.common import parameters_to_ndarrays, serde
             from flwr.proto.transport_pb2 import Parameters
-            from splitfleet.common.model_state import tensor_state_hash
+
+            from splitfleet.common.model_state import model_state_hash
 
             payload = config.get(COSPLIT_CALIBRATION_PARAMETERS_CONFIG_KEY)
+            expected_hash = config.get(COSPLIT_CALIBRATION_MODEL_HASH_CONFIG_KEY)
+            if expected_hash is not None and payload is None:
+                if model_state_hash(self.model, self.backend_adapter) != expected_hash:
+                    # No trace, temporary SGD or state mutation before the
+                    # coordinator supplies the actual global model.
+                    return {COSPLIT_CALIBRATION_PARAMETERS_REQUIRED_KEY: True}
             if payload is not None:
                 parameters = serde.parameters_from_proto(Parameters.FromString(payload))
                 self.backend_adapter.load_ndarrays(self.model, parameters_to_ndarrays(parameters))
+                if expected_hash is not None and model_state_hash(self.model, self.backend_adapter) != expected_hash:
+                    raise ValueError("Calibration parameter payload differs from the requested global model")
             dynamic_batch = normalize_batch_window(config.get(AUTOSPLIT_DYNAMIC_BATCH_CONFIG_KEY))
             trace_batch_mode = config.get(AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY)
             reusable = self._prewarmed_runtime
@@ -416,7 +480,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
                 self.online_calibration_receipt = None
             boundaries = json.loads(cuts)
             receipt = self.online_calibration_receipt
-            current_hash = tensor_state_hash(self.model.state_dict())
+            current_hash = model_state_hash(self.model, self.backend_adapter)
             if (receipt is None or receipt["model_hash_after"] != current_hash
                     or receipt.get("schema") != "splitfleet.cosplit-calibration"
                     or {row["boundary"] for row in receipt["records"]} != set(boundaries)
@@ -426,6 +490,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
                     raise ValueError("Provide a representative TaskBatch for CoSplit-UCB calibration")
                 self.calibrate_runtime(self._calibration_targets, boundaries=boundaries)
         properties = {
+            COSPLIT_CALIBRATION_HASH_HANDSHAKE_KEY: self.backend_adapter.backend_name in {'torch', 'tf', 'paddle', 'jax'},
             "logical_client_id": f"{platform.node()}:{self.device}:{id(self)}",
             "framework_backend": self.backend_adapter.backend_name,
             "runtime_backend": "torchlens_native",
@@ -462,6 +527,29 @@ class AutoSplitSplitLearningClient(NumPyClient):
         runtime_handle = round_runtime.handle
         contract = round_runtime.contract
         prefix_optimizer = self._build_optimizer()
+        from splitfleet.runtime.auxiliary_state import supports_auxiliary_state
+        auxiliary_ownership = None
+        if supports_auxiliary_state(self.model):
+            from splitfleet.autosplit.state_ownership import (
+                read_ownership,
+                state_ownership,
+            )
+            schema = self.backend_adapter.state_manifest(self.model).schema_hash
+            auxiliary_ownership = read_ownership(config, runtime_handle, schema) or state_ownership(runtime_handle, schema)
+        resident_bindings, residency_contract = {}, None
+        functional_optimizer = getattr(self, "_owned_functional_optimizer", None)
+        if functional_optimizer is not None:
+            from splitfleet.autosplit.state_ownership import read_ownership
+            from splitfleet.runtime.functional_sgd import (
+                resident_contract,
+                resident_parameter_bindings,
+            )
+            ownership = read_ownership(config, runtime_handle, self.backend_adapter.state_manifest(self.model).schema_hash)
+            if ownership is None:
+                raise RuntimeError("Stage-owned functional SGD requires an ownership contract")
+            functional_optimizer.ownership = ownership
+            resident_bindings = resident_parameter_bindings(runtime_handle, ownership)
+            residency_contract = resident_contract(runtime_handle, ownership, resident_bindings)
         telemetry = _RoundTelemetry()
         round_id = int(config.get(AUTOSPLIT_MODEL_VERSION_CONFIG_KEY, 0))
         client_id = str(config.get(CLIENT_ID_CONFIG_KEY, ""))
@@ -472,7 +560,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
         for batch in self.train_data:
             task_batch = prepare_task_batch(batch, task=self.task, batch_adapter=self.batch_adapter, training=True)
             call = task_batch.inputs.map_values(lambda value: move_value(value, self.backend_adapter, self.device))
-            torch_inputs = bind_model_inputs(call.args, self.backend_adapter)
+            torch_inputs = bind_model_inputs(call.args, self.backend_adapter, model=self.model)
             torch_targets = move_value(task_batch.targets, self.backend_adapter, self.device)
             batch_size = task_batch.num_examples
             runtime_batch_size = runtime_input_batch_size(runtime_handle.runtime, torch_inputs, call.kwargs)
@@ -483,12 +571,15 @@ class AutoSplitSplitLearningClient(NumPyClient):
 
             _synchronize_prefix_device(self.backend_adapter.backend_name, self.device)
             prefix_started = time.perf_counter()
+            native_started_ns = time.perf_counter_ns()
             boundary = runtime_handle.backend.run_prefix(
                 *torch_inputs,
                 training=True,
                 input_kwargs=call.kwargs,
             )
             _synchronize_prefix_device(self.backend_adapter.backend_name, self.device)
+            if hasattr(self, "_quality_native_execution_intervals"):
+                self._quality_native_execution_intervals.append((native_started_ns, time.perf_counter_ns()))
             forward_sec = time.perf_counter() - prefix_started
             telemetry.prefix_compute_sec += forward_sec
             telemetry.record_component("client_forward", forward_sec * 1000.0)
@@ -505,6 +596,8 @@ class AutoSplitSplitLearningClient(NumPyClient):
                 canonical_graph_hash=contract.canonical_graph_hash,
                 boundary_schema_hash=contract.boundary_schema_hash,
                 model_version=round_id,
+                resident_tensor_ids=set(resident_bindings),
+                resident_state_contract=residency_contract,
             )
             telemetry.boundary_serialize_sec += time.perf_counter() - serialize_started
             response = self._call_tail(
@@ -529,12 +622,15 @@ class AutoSplitSplitLearningClient(NumPyClient):
             deserialize_started = time.perf_counter()
             boundary_grads = envelope_to_gradients(gradient_envelope, self.device)
             telemetry.gradient_deserialize_sec += time.perf_counter() - deserialize_started
+            native_started_ns = time.perf_counter_ns()
             prefix_result = runtime_handle.backend.backward_prefix(
                 local_boundary,
                 boundary_grads=boundary_grads,
                 optimizer=prefix_optimizer,
             )
             _synchronize_prefix_device(self.backend_adapter.backend_name, self.device)
+            if hasattr(self, "_quality_native_execution_intervals"):
+                self._quality_native_execution_intervals.append((native_started_ns, time.perf_counter_ns()))
             backward_sec = time.perf_counter() - backward_started
             telemetry.prefix_compute_sec += backward_sec
             telemetry.record_component("client_backward", backward_sec * 1000.0)
@@ -547,6 +643,22 @@ class AutoSplitSplitLearningClient(NumPyClient):
                 updated = self.functional_update_fn(update_target, prefix_result)
                 if self.backend_adapter.has_external_params and updated is not None:
                     self.backend_adapter.bind_external_params(updated)
+
+            if "auxiliary_state" in response:
+                from splitfleet.runtime.auxiliary_state import commit_auxiliary_state
+                from splitfleet.runtime.owned_auxiliary_state import (
+                    expected_statistics_names,
+                    statistics_for_stage,
+                )
+                if auxiliary_ownership is None:
+                    raise RuntimeError("Received unnegotiated auxiliary model state")
+                statistics = decode_bundle_wire(response["auxiliary_state"], self.device)
+                selected = statistics_for_stage(self.model, statistics, auxiliary_ownership, "prefix")
+                if set(selected) != set(statistics) or set(selected) != expected_statistics_names(self.model, auxiliary_ownership, "prefix"):
+                    raise RuntimeError("Suffix returned incomplete or incorrectly owned auxiliary state")
+                from splitfleet.backends.utils import native_device_scope
+                with native_device_scope(self.backend_adapter.backend_name, self.device):
+                    commit_auxiliary_state(self.model, selected)
 
             batch_examples = int(response["num_examples"])
             batch_loss = float(response["loss"])
@@ -578,7 +690,11 @@ class AutoSplitSplitLearningClient(NumPyClient):
             "precision": _model_precision(self.model),
             **telemetry.as_metrics(),
         }
-        from splitfleet.autosplit.state_ownership import read_ownership, export_owned, DIGEST_KEY
+        from splitfleet.autosplit.state_ownership import (
+            DIGEST_KEY,
+            export_owned,
+            read_ownership,
+        )
         ownership = read_ownership(config, runtime_handle, self.backend_adapter.state_manifest(self.model).schema_hash)
         export_started = time.perf_counter()
         values = export_owned(self.model, ownership, "prefix") if ownership else self.backend_adapter.export_ndarrays(self.model)
@@ -605,7 +721,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
             for batch in self.evaluate_data:
                 task_batch = prepare_task_batch(batch, task=self.task, batch_adapter=self.batch_adapter, training=False)
                 call = task_batch.inputs.map_values(lambda value: move_value(value, self.backend_adapter, self.device))
-                torch_inputs = bind_model_inputs(call.args, self.backend_adapter)
+                torch_inputs = bind_model_inputs(call.args, self.backend_adapter, model=self.model)
                 torch_targets = move_value(task_batch.targets, self.backend_adapter, self.device)
                 batch_size = task_batch.num_examples
                 runtime_batch_size = runtime_input_batch_size(runtime_handle.runtime, torch_inputs, call.kwargs)
@@ -694,6 +810,13 @@ class AutoSplitSplitLearningClient(NumPyClient):
         ])
         cached = self._runtime_cache.get(cache_key)
         if cached is not None:
+            raw_contract = config.get(AUTOSPLIT_GRAPH_CONTRACT_CONFIG_KEY)
+            if raw_contract:
+                expected = GraphContract.from_json(raw_contract)
+                if config.get(AUTOSPLIT_GRAPH_CONTRACT_DIGEST_CONFIG_KEY) != expected.digest:
+                    raise RuntimeError("Configured graph contract digest is invalid")
+                validate_contract(expected, graph_contract_for_runtime_handle(cached.handle))
+            self._validate_feature_abi(config, cached.handle)
             return cached
 
         boundary = str(config.get(AUTOSPLIT_BOUNDARY_CONFIG_KEY, "50%"))
@@ -848,7 +971,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
         boundary,
         targets,
         num_examples: int,
-        telemetry: Optional[_RoundTelemetry] = None,
+        telemetry: _RoundTelemetry | None = None,
     ):
         serialize_started = time.perf_counter()
         boundary_payload = encode_boundary(boundary)
@@ -875,6 +998,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
         client_receive_ns = time.time_ns()
         if telemetry is not None:
             rpc_elapsed_sec = time.perf_counter() - started
+            telemetry.suffix_server_queue_sec += float(response.metadata.get("suffix_server_queue_sec", 0.))
             telemetry.tail_wait_sec += rpc_elapsed_sec
             telemetry.record_component("network_roundtrip", _transport_roundtrip_ms(
                 response.metadata, rpc_elapsed_ms=rpc_elapsed_sec * 1000.0))
@@ -910,11 +1034,21 @@ class AutoSplitSplitLearningClient(NumPyClient):
             metadata["gradients"] = decode_gradients(response.data["gradients"])
             if telemetry is not None:
                 telemetry.gradient_deserialize_sec += time.perf_counter() - deserialize_started
+        if "auxiliary_state" in response.data:
+            metadata["auxiliary_state"] = response.data["auxiliary_state"]
         return metadata
 
     def _build_optimizer(self):
+        self._owned_functional_optimizer = None
         if self.optimizer_fn is not None:
-            return self.optimizer_fn(self.model)
+            value = self.optimizer_fn(self.model)
+            if self.backend_adapter.backend_name == "jax":
+                from splitfleet.runtime.functional_sgd import OwnedFunctionalSGD
+                if isinstance(value, OwnedFunctionalSGD):
+                    self._owned_functional_optimizer = value
+                    self.functional_update_fn = value.prefix_update
+                    return None
+            return value
         if self.backend_adapter.backend_name == "jax":
             if self.functional_update_fn is None:
                 raise ValueError("JAX split training requires an explicit functional_update_fn.")

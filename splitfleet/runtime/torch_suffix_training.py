@@ -37,6 +37,7 @@ def train_torch_suffix(
     loss_fn=None,
     optimizer=None,
     measurements: dict[str, float] | None = None,
+    boundary_gradients_only: bool = False,
 ):
     """Train suffix while replaying non-leaf views of leaf gradient roots.
 
@@ -46,6 +47,8 @@ def train_torch_suffix(
     """
     if loss_fn is None:
         raise ValueError("Suffix training requires an explicit loss_fn.")
+    if boundary_gradients_only and optimizer is not None:
+        raise ValueError("Boundary-only gradients cannot update a suffix optimizer")
     service_started_ns = time.perf_counter_ns()
     runtime.validate_boundary(boundary)
     roots: dict[str, torch.Tensor] = {}
@@ -74,6 +77,12 @@ def train_torch_suffix(
     if not torch.isfinite(loss).all():
         raise FloatingPointError("Split suffix loss is nonfinite; refusing the optimizer update")
     def backward_and_step():
+        if boundary_gradients_only:
+            # Client calibration updates only its prefix. Compute the same
+            # loss VJP without materializing unused suffix parameter gradients.
+            values = torch.autograd.grad(loss, tuple(roots.values()), allow_unused=True) if roots else ()
+            return {key: value.detach().clone()
+                    for key, value in zip(roots, values) if value is not None}
         loss.backward()
         gradients = {
             key: root.grad.detach().clone()

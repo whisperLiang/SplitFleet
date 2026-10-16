@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import time
+from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
-from typing import Any, Mapping
+from typing import Any
 
 import torch
+
 from splitfleet.autosplit.boundary import (
     BoundaryPayload,
     from_torchlens_boundary,
@@ -22,8 +25,8 @@ from splitfleet.autosplit.torchlens_candidate import (
 from splitfleet.autosplit.torchlens_contract import build_runtime_contract
 from splitfleet.autosplit.torchlens_runtime import (
     TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION,
-    make_split_spec,
     _point,
+    make_split_spec,
     normalize_example_inputs,
     normalize_model_call,
     prepare_split_runtime,
@@ -33,6 +36,19 @@ from splitfleet.autosplit.torchlens_runtime import (
     trace_signature,
 )
 from splitfleet.autosplit.types import SplitRuntimePlan
+from splitfleet.backends.utils import (
+    native_device_method,
+    native_device_scope,
+    paddle_model_device,
+    tensorflow_model_device,
+)
+from splitfleet.runtime.auxiliary_state import (
+    prepare_auxiliary_runtime,
+    restore_auxiliary_output,
+    snapshot_auxiliary_state,
+    supports_auxiliary_state,
+    train_jax_suffix_with_auxiliary,
+)
 from splitfleet.runtime.torch_suffix_training import train_torch_suffix
 
 
@@ -41,7 +57,7 @@ class TorchLensRuntimeHandle:
     model: torch.nn.Module
     runtime: Any
     plan: SplitRuntimePlan
-    backend: "TorchLensSplitBackend"
+    backend: TorchLensSplitBackend
 
     @property
     def feature_abi_id(self) -> str:
@@ -112,6 +128,7 @@ class TorchLensSplitBackend:
         self.trace_batch_size: int | None = None
         self.framework_backend = "torch"
         self._candidate_analysis: Any | None = None
+        self.train_suffix_auxiliary: Mapping[str, Any] | None = None
 
     def trace(
         self,
@@ -128,7 +145,7 @@ class TorchLensSplitBackend:
         trace_batch_mode: str | None = None,
         model_name: str | None = None,
         model_family: str | None = None,
-    ) -> "TorchLensSplitBackend":
+    ) -> TorchLensSplitBackend:
         if mode != "generated_eager":
             raise ValueError(f"Unsupported split execution mode {mode!r}; use 'generated_eager'.")
         self.model = model
@@ -142,9 +159,20 @@ class TorchLensSplitBackend:
         from splitfleet.backends.utils import detect_torchlens_backend
         complete_inputs = (self.trace_sample_input, self.trace_sample_kwargs)
         self.framework_backend = detect_torchlens_backend(model, complete_inputs)
-        if dynamic_batch is not None:
-            if len(dynamic_batch) != 2 or not 1 <= dynamic_batch[0] <= dynamic_batch[1]:
-                raise ValueError("dynamic_batch must be a positive inclusive (minimum, maximum) range")
+        if self.framework_backend == "paddle":
+            # Planner and public prepare helpers historically construct this
+            # facade with its CPU default. Kernel scopes must follow the actual
+            # native state, which the session has already placed and verified.
+            self.device = torch.device(paddle_model_device(model, complete_inputs))
+        elif self.framework_backend == "tf":
+            # Raw TF replay omits the original model.call device context.
+            # Derive its enclosing scope from all real state, including BN
+            # buffers/counters, or actual inputs for a stateless callable.
+            self.device = torch.device(tensorflow_model_device(model, complete_inputs))
+        if dynamic_batch is not None and (
+            len(dynamic_batch) != 2 or not 1 <= dynamic_batch[0] <= dynamic_batch[1]
+        ):
+            raise ValueError("dynamic_batch must be a positive inclusive (minimum, maximum) range")
         probe_boundary = "50%" if str(boundary) == "auto" else str(boundary)
         self.split_spec = split_spec or make_split_spec(
             probe_boundary,
@@ -152,12 +180,31 @@ class TorchLensSplitBackend:
             backend=self.framework_backend,
             batch_axes=batch_axes,
         )
-        self.runtime = prepare_split_runtime(
-            model,
-            self.trace_sample_input,
-            self.split_spec,
-            input_kwargs=self.trace_sample_kwargs,
+        prepare = (
+            prepare_auxiliary_runtime
+            if supports_auxiliary_state(model) and self.framework_backend in {"paddle", "tinygrad"}
+            else prepare_split_runtime
         )
+        capture_scope = nullcontext()
+        if self.framework_backend == 'paddle':
+            from splitfleet.runtime.paddle_device_scope import paddle_execution_scope
+            capture_scope = paddle_execution_scope(capture=True)
+        with capture_scope, native_device_scope(self.framework_backend, self.device):
+            prepare_options = {}
+            if (prepare is prepare_auxiliary_runtime and self.framework_backend == 'tinygrad'
+                    and str(boundary) == 'auto'):
+                selector = getattr(model, '_splitfleet_initial_capture_boundary', None)
+                if callable(selector):
+                    prepare_options['initial_boundary_selector'] = selector
+            self.runtime = prepare(
+                model,
+                self.trace_sample_input,
+                self.split_spec,
+                input_kwargs=self.trace_sample_kwargs,
+                **prepare_options,
+            )
+        self.split_spec = self.runtime.request
+        self._bind_native_tensorflow_execution()
         self.trace_batch_size = self.runtime.batch_spec.user_batch_size
         self.trace_batch_mode = trace_batch_mode or (
             "batch_gt1" if (self.trace_batch_size or 1) > 1 else "batch_1"
@@ -180,6 +227,11 @@ class TorchLensSplitBackend:
         if self.runtime is None:
             raise RuntimeError("TorchLens split runtime has not been traced.")
         return self.runtime
+
+    def _bind_native_tensorflow_execution(self):
+        if self.framework_backend == 'tf' and getattr(self.model, '_splitfleet_tensorflow_function_forward', False):
+            from splitfleet.runtime.tensorflow_forward import bind_tensorflow_function_suffix
+            bind_tensorflow_function_suffix(self.runtime)
 
     def _ensure_model(self) -> torch.nn.Module:
         if self.model is None:
@@ -279,11 +331,13 @@ class TorchLensSplitBackend:
             self.candidates = candidates
             self.candidate_report = SplitCandidateReport(tuple(reports)).as_dict()
 
+    @native_device_method
     def repartition(self, boundary: str) -> TorchLensRuntimeHandle:
         """Select another boundary while reusing capture and native batch semantics."""
         runtime = self._ensure_runtime()
         spec = replace(runtime.request, point=_point(boundary))
         self.runtime = repartition_split_runtime(runtime, spec)
+        self._bind_native_tensorflow_execution()
         self._candidate_analysis = None
         self.split_spec = self.runtime.request
         self.current_candidate = self._with_batch_contract(candidate_from_plan(
@@ -300,6 +354,7 @@ class TorchLensSplitBackend:
         self.current_candidate = replace(self.current_candidate, node_index=chosen.node_index, layer_index=chosen.layer_index)
         return self.current_candidate
 
+    @native_device_method
     def run_prefix(
         self, *inputs: Any, training: bool = False,
         input_kwargs: dict[str, Any] | None = None,
@@ -314,7 +369,9 @@ class TorchLensSplitBackend:
             if not low <= batch_size <= high:
                 raise ValueError(f"Input batch size {batch_size} is outside configured dynamic_batch={self.dynamic_batch}.")
         if training and self.framework_backend == "tf":
-            from splitfleet.runtime.tensorflow_prefix_training import run_tensorflow_training_prefix
+            from splitfleet.runtime.tensorflow_prefix_training import (
+                run_tensorflow_training_prefix,
+            )
 
             raw = run_tensorflow_training_prefix(runtime, *args, input_kwargs=kwargs)
         else:
@@ -324,14 +381,19 @@ class TorchLensSplitBackend:
             )
         return from_torchlens_boundary(raw)
 
+    @native_device_method
     def run_suffix(self, boundary: BoundaryPayload) -> Any:
         runtime = self._ensure_runtime()
         native = to_torchlens_boundary(boundary)
         device = _runtime_device(runtime)
         if device is not None:
             native = native.to(device)
-        return runtime.run_suffix(native)
+        output = runtime.run_suffix(native)
+        return restore_auxiliary_output(runtime.trace_graph, output) if supports_auxiliary_state(
+            self._ensure_model()
+        ) else output
 
+    @native_device_method
     def train_suffix(
         self,
         boundary: BoundaryPayload,
@@ -340,6 +402,7 @@ class TorchLensSplitBackend:
         loss_fn=None,
         optimizer=None,
         measurements: dict[str, float] | None = None,
+        boundary_gradients_only: bool = False,
     ):
         """Run the suffix training step, optionally filling ``measurements``.
 
@@ -350,30 +413,101 @@ class TorchLensSplitBackend:
         separate phases do not report a fabricated split.
         """
 
+        self.train_suffix_auxiliary = None
         if loss_fn is None:
             raise ValueError("Split training requires an explicit loss_fn.")
+        if boundary_gradients_only and self.framework_backend != "torch":
+            raise ValueError("Boundary-only suffix gradients require the Torch backend")
         runtime = self._ensure_runtime()
         native = to_torchlens_boundary(boundary)
         device = _runtime_device(runtime)
         if device is not None:
             native = native.to(device)
             targets = _move_to_device(targets, device)
+        auxiliary = supports_auxiliary_state(self._ensure_model())
+        observed = []
+        tiny_statistics_frozen = False
+
+        def freeze_tiny_statistics():
+            nonlocal tiny_statistics_frozen
+            if tiny_statistics_frozen:
+                return
+            if len(observed) != 1:
+                raise RuntimeError('Native Tinygrad training did not expose exactly one auxiliary forward')
+            observed[0] = snapshot_auxiliary_state(observed[0], backend='tinygrad')
+            tiny_statistics_frozen = True
+
+        original_loss = loss_fn
+        if auxiliary and self.framework_backend != "jax":
+            def collect_loss(output, target):
+                restored = restore_auxiliary_output(runtime.trace_graph, output)
+                observed.append(restored['batch_statistics'])
+                return original_loss(restored, target)
+
+            loss_fn = collect_loss
+            if self.framework_backend == 'tinygrad' and optimizer is not None:
+                native_optimizer = optimizer
+
+                class DeferredStatisticsOptimizer:
+                    def __getattr__(self, name):
+                        return getattr(native_optimizer, name)
+
+                    def step(self):
+                        # Native backward must build every parameter derivative
+                        # before realization replaces forward UOps with buffers.
+                        # Snapshot the same forward after backward, before SGD.
+                        freeze_tiny_statistics()
+                        return native_optimizer.step()
+
+                optimizer = DeferredStatisticsOptimizer()
         if self.framework_backend == "torch":
-            return train_torch_suffix(
+            result = train_torch_suffix(
                 runtime,
                 native,
                 targets,
                 loss_fn=loss_fn,
                 optimizer=optimizer,
                 measurements=measurements,
+                boundary_gradients_only=boundary_gradients_only,
             )
-        if measurements is not None:
-            started = time.perf_counter_ns()
-            result = runtime.train_suffix(native, targets, loss_fn=loss_fn, optimizer=optimizer)
-            measurements["server_total_ms"] = (time.perf_counter_ns() - started) / 1_000_000.0
-            return result
-        return runtime.train_suffix(native, targets, loss_fn=loss_fn, optimizer=optimizer)
+        else:
+            started = time.perf_counter_ns() if measurements is not None else None
+            if auxiliary and self.framework_backend == "jax":
+                result, statistics = train_jax_suffix_with_auxiliary(
+                    runtime, native, targets, loss_fn=loss_fn, optimizer=optimizer,
+                )
+                observed.append(statistics)
+            elif self.framework_backend in {"tf", "tensorflow"} and getattr(
+                self._ensure_model(), "_splitfleet_tensorflow_function_forward", False
+            ):
+                from splitfleet.runtime.tensorflow_forward import train_tensorflow_function_suffix
+                result, statistics = train_tensorflow_function_suffix(
+                    runtime, native, targets, loss_fn=original_loss,
+                    optimizer=optimizer, auxiliary=auxiliary,
+                )
+                if auxiliary:
+                    observed.append(statistics)
+            else:
+                if self.framework_backend in {"tf", "tensorflow"}:
+                    from splitfleet.runtime.tensorflow_joint_gradient import (
+                        bind_tensorflow_joint_gradient,
+                    )
 
+                    # Keep the public native method and all its guards on every
+                    # recut; only its private native tape-query recipe differs.
+                    bind_tensorflow_joint_gradient(runtime)
+                result = runtime.train_suffix(native, targets, loss_fn=loss_fn, optimizer=optimizer)
+            if measurements is not None:
+                measurements["server_total_ms"] = (time.perf_counter_ns() - started) / 1_000_000.0
+        if auxiliary:
+            if self.framework_backend == 'tinygrad':
+                freeze_tiny_statistics()
+            if len(observed) != 1:
+                raise RuntimeError("Native suffix training did not expose exactly one auxiliary forward")
+            self.train_suffix_auxiliary = observed[0]
+        return result
+
+    @native_device_method
     def backward_prefix(
         self,
         boundary: BoundaryPayload,

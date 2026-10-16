@@ -1,0 +1,61 @@
+runs:
+  image:
+    rounds: 2
+    seed: 233
+    batch_size: 1
+    boundary: 50%
+    virtual_clients: {total: 2, training_timeout_sec: 600}
+    resources: {max_concurrent_clients: 2, max_suffix_replicas: 1}
+    workload:
+      source: real
+      task: image_classification
+      model: resnet18
+      data_root: data
+      samples: 4
+      evaluation_samples: 4
+  text:
+    rounds: 2
+    seed: 233
+    batch_size: 1
+    boundary: 50%
+    virtual_clients: {total: 2, training_timeout_sec: 600}
+    resources: {max_concurrent_clients: 2, max_suffix_replicas: 1}
+    transport: {rpc_timeout_sec: 300}
+    workload:
+      source: real
+      task: text_classification
+      model: bert_base
+      data_root: data
+      samples: 4
+      evaluation_samples: 4
+  detection:
+    rounds: 2
+    seed: 233
+    batch_size: 1
+    boundary: 50%
+    virtual_clients: {total: 2, training_timeout_sec: 600}
+    resources: {max_concurrent_clients: 2, max_suffix_replicas: 1}
+    transport: {rpc_timeout_sec: 300}
+    workload:
+      source: real
+      task: object_detection
+      model: rfdetr_nano
+      data_root: data
+      samples: 4
+      evaluation_samples: 4
+  segmentation:
+    rounds: 2
+    seed: 233
+    learning_rate: 0.0001
+    batch_size: 1
+    boundary: 50%
+    virtual_clients: {total: 2, training_timeout_sec: 600}
+    resources: {max_concurrent_clients: 2, max_suffix_replicas: 1}
+    transport: {rpc_timeout_sec: 300}
+    workload:
+      source: real
+      task: semantic_segmentation
+      model: deeplabv3_resnet50
+      data_root: data
+      samples: 4
+      evaluation_samples: 4

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
-from typing import Any, Iterable, Mapping
-
 import math
 import re
+from collections.abc import Iterable, Mapping
+from dataclasses import asdict, dataclass, field
+from typing import Any
 
 import numpy as np
 from torchlens.split.shape_program import ShapeBinding
@@ -37,12 +37,16 @@ class SplitCandidate:
         return asdict(self)
 
 
-def payload_bytes_from_plan(runtime: Any, plan: Any, *, batch_size: int | None = None) -> int:
+def payload_bytes_from_plan(
+    runtime: Any, plan: Any, *, batch_size: int | None = None,
+    excluded_labels: Iterable[str] = (),
+) -> int:
     """Count boundary tensor bytes at the native capture batch.
 
     ABI shapes collapse expressions such as ``B * 10`` to ``B``. The shape
     program retains those expressions, and boundary bindings resolve container
-    keys to the graph values used by that program.
+    keys to the graph values used by that program. Exclusions must be audited
+    resident roots from the explicitly negotiated functional state transport.
     """
     program = runtime.trace_graph.shape_program
     if program is None:
@@ -50,12 +54,17 @@ def payload_bytes_from_plan(runtime: Any, plan: Any, *, batch_size: int | None =
     resolved_batch = program.traced_batch_size if batch_size is None else int(batch_size)
     if resolved_batch < 1:
         raise ValueError("Payload batch size must be positive")
+    excluded = set(excluded_labels)
+    if not excluded.issubset(plan.boundary_spec):
+        raise ValueError("Excluded payload labels are absent from the native boundary")
     if batch_size is not None:
         program.require_batch_resolvable(resolved_batch, set(plan.boundary_bindings.values()),
             backend="torchlens_native", split_point=f"{plan.boundary_kind}:{plan.target_node_id}")
     binding = ShapeBinding({program.batch_symbol: resolved_batch}, {})
     total = 0
     for label, spec in plan.boundary_spec.items():
+        if label in excluded:
+            continue
         shape = program.value_shapes[plan.boundary_bindings[label]].evaluate(binding)
         dtype_name = str(spec.dtype).rsplit(".", 1)[-1]
         match = re.fullmatch(r"<dtype: '([^']+)'>", dtype_name)
@@ -104,6 +113,28 @@ def feature_layout_from_specs(specs: Mapping[str, Any]) -> dict[str, dict[str, A
     return layout
 
 
+def _reference_identities(value):
+    from splitfleet.autosplit.state_ownership import _native_identities
+
+    return _native_identities(value)
+
+
+def _declared_buffer_identities(runtime):
+    """Count declared BN buffers as state storage rather than model parameters."""
+    declaration = getattr(getattr(runtime, "model", None), "state_associations", None)
+    if not callable(declaration):
+        return set()
+    from splitfleet.backends import BACKEND_ADAPTERS
+
+    adapter = BACKEND_ADAPTERS.create(str(runtime.adapter.name))
+    state = (runtime.model.state_dict(keep_vars=True) if adapter.backend_name == "torch"
+             else adapter._state(runtime.model))
+    names = declaration()
+    if not set(names).issubset(state):
+        raise ValueError("Declared buffer associations do not match native model state")
+    return set().union(*(_reference_identities(state[name]) for name in names)) if names else set()
+
+
 @dataclass
 class ParameterCountIndex:
     """Reuse captured parameter identities and sizes across candidate cuts."""
@@ -112,12 +143,15 @@ class ParameterCountIndex:
     total_count: int
 
     @classmethod
-    def from_runtime(cls, runtime: Any) -> "ParameterCountIndex":
+    def from_runtime(cls, runtime: Any) -> ParameterCountIndex:
         by_node: dict[str, tuple[tuple[int, int, bool], ...]] = {}
         all_parameters: dict[int, int] = {}
+        buffer_identities = _declared_buffer_identities(runtime)
         for node in runtime.trace_graph.nodes:
             entries: list[tuple[int, int, bool]] = []
             for parameter in node.param_refs:
+                if buffer_identities & _reference_identities(parameter):
+                    continue
                 value = parameter.handle
                 identity = id(value) if value is not None else hash((parameter.address, parameter.shape))
                 size = math.prod(value.shape if value is not None else parameter.shape)
@@ -144,11 +178,14 @@ class ParameterByteIndex:
     by_node: dict[str, tuple[tuple[int, int | None, bool], ...]]
 
     @classmethod
-    def from_runtime(cls, runtime: Any) -> "ParameterByteIndex":
+    def from_runtime(cls, runtime: Any) -> ParameterByteIndex:
         by_node = {}
+        buffer_identities = _declared_buffer_identities(runtime)
         for node in runtime.trace_graph.nodes:
             entries = []
             for parameter in node.param_refs:
+                if buffer_identities & _reference_identities(parameter):
+                    continue
                 value = parameter.handle
                 identity = id(value) if value is not None else hash((parameter.address, parameter.shape))
                 size = (int(value.numel()) * int(value.element_size())

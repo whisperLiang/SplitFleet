@@ -1,0 +1,18 @@
+rounds: 3
+batch_size: 2
+boundary: after:head
+virtual_clients:
+  total: 4
+  offline_rounds: {'1': [1]}
+  failure_rounds: {'0': [1]}
+  fail_after_batches: 1
+resources:
+  max_concurrent_clients: 4
+  mode: emulation
+profiles:
+  fast_cpu: {device: cpu, cpu_limit: 2, torch_threads: 2}
+  slow_cpu: {device: cpu, cpu_limit: 1, torch_threads: 1}
+client_profiles: {'0': slow_cpu, '1': slow_cpu}
+partition:
+  sample_counts: [4, 4, 6, 10]
+workload: {source: fixture, model: tiny, samples: 24}

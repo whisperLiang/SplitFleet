@@ -1,0 +1,18 @@
+rounds: 2
+batch_size: 2
+boundary: 50%
+virtual_clients:
+  total: 100
+  participation_fraction: 1.0
+resources:
+  max_concurrent_clients: 100
+  server_concurrency: 1
+  max_suffix_replicas: 4
+  server_memory_budget_mb: 4096
+workload:
+  source: real
+  task: image_classification
+  model: resnet18
+  data_root: data
+  samples: 200
+  evaluation_samples: 16

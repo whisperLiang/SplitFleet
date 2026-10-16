@@ -24,6 +24,7 @@ from splitfleet.common.constants import CLIENT_ID_CONFIG_KEY
 from splitfleet.client.client import Client
 from splitfleet.proto.server_model_pb2_grpc import ServerModelStub
 from splitfleet.server.server_model.proxy.grpc_server_model_proxy import GrpcServerModelProxy
+from splitfleet.runtime.client_execution import server_model_binding
 
 
 def handle_message(
@@ -41,9 +42,12 @@ def handle_message(
     client = client_fn(cid).to_client()
 
     server_model_proxy = GrpcServerModelProxy(stub=server_model_stub, cid=server_cid)
-    client.set_server_model_proxy(
-        server_model_proxy
-    )
+    with server_model_binding(client, server_model_proxy):
+        out_recordset = _dispatch(client, message)
+    return message.create_reply(out_recordset)
+
+
+def _dispatch(client, message):
     message_type = message.metadata.message_type
 
     # Handle GetPropertiesIns
@@ -79,7 +83,4 @@ def handle_message(
     else:
         raise ValueError(f"Invalid message type: {message_type}")
 
-    server_model_proxy.close_stream()
-
-    # Return Message
-    return message.create_reply(out_recordset)
+    return out_recordset

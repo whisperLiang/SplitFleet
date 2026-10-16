@@ -9,6 +9,10 @@ from flwr.server.client_proxy import ClientProxy
 
 def state_exchange_duration(metrics):
     """Subtract durations, not timestamps; handler includes batch RPC and queue."""
+    if "virtual_handler_ms" in metrics:
+        # Flower/Ray actor queue is not a model-state exchange observation.
+        value = metrics.get("virtual_state_exchange_ms")
+        return float(value) if value is not None and math.isfinite(float(value)) and float(value) >= 0 else None
     rpc, handler = metrics.get("coordinator_fit_rpc_ms"), metrics.get("client_fit_handler_ms")
     if rpc is None or handler is None:
         return None

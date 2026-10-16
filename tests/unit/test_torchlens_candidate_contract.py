@@ -516,6 +516,10 @@ def test_feature_abi_is_batch_symbolic_and_runtime_identity_tolerant() -> None:
         runtime_version="2.34.1",
         trace_batch_size=1,
     )
+    # Existing wire identifiers must survive serialization optimizations.
+    assert edge_contract["feature_abi_id"] == "1c3247e2be696b05e40d9b22a4c704f80b377343"
+    assert edge_contract["runtime_identity_id"] == "3b780f6dbf35b80905c49b4aa46431246f194338"
+    assert edge_contract["runtime_contract_digest"] == "16faf3386f525bcc1414f7670fd716cfd5c26d7c"
     cloud_contract = build_runtime_contract(
         model_family="toy",
         model_name="ToyNet",
@@ -532,6 +536,17 @@ def test_feature_abi_is_batch_symbolic_and_runtime_identity_tolerant() -> None:
     assert compatibility["compatible"] is True
     assert compatibility["reason"] == "runtime_identity_changed_but_feature_abi_compatible"
     assert edge_contract["torchlens_version"] == "2.34.1"
+
+
+def test_json_scalar_fast_path_preserves_subclass_serialization():
+    import json
+
+    class TaggedString(str):
+        def to_dict(self):
+            return {"tag": str(self)}
+
+    encoded = stable_json({"plain": ["value", 4, 1.25, True, None], "custom": TaggedString("value")})
+    assert json.loads(encoded) == {"plain": ["value", 4, 1.25, True, None], "custom": {"tag": "value"}}
 
 
 def test_feature_abi_rejects_label_order_dtype_and_shape_changes() -> None:

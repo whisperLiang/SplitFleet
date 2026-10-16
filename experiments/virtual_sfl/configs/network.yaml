@@ -1,0 +1,31 @@
+rounds: 3
+batch_size: 2
+boundary: after:head
+placement: cosplit_ucb
+virtual_clients:
+  total: 4
+resources:
+  max_concurrent_clients: 4
+profiles:
+  cpu:
+    device: cpu
+    torch_threads: 1
+networks:
+  '0':
+    upload_mbps: 2
+    download_mbps: 4
+    rtt_ms: 10
+network_by_round:
+  2:
+    '0':
+      upload_mbps: 20
+      download_mbps: 20
+      rtt_ms: 2
+    '1':
+      upload_mbps: 1
+      download_mbps: 2
+      rtt_ms: 15
+workload:
+  source: fixture
+  model: tiny
+  samples: 16

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 from splitfleet.autosplit import TorchLensRuntimeHandle
 from splitfleet.autosplit.runtime import AutoSplitSession
 from splitfleet.autosplit.torchlens_clone import clone_runtime_handle
@@ -24,12 +22,18 @@ class StageRuntimeManager(ServerModelManager):
         self,
         *,
         init_server_model_fn=None,
-        autosplit_session: Optional[AutoSplitSession] = None,
+        autosplit_session: AutoSplitSession | None = None,
+        replica_capacity: int | None = None,
+        state_store=None,
+        reuse_completed_replicas: bool = False,
+        per_client_models: bool = False,
+        model_capacity: int | None = None,
     ) -> None:
         super().__init__()
         self.autosplit_session = autosplit_session or AutoSplitSession()
-        self._placement_plan: Optional[SplitPlacementPlan] = None
-        self._runtime_handle: Optional[TorchLensRuntimeHandle] = None
+        self.before_collect = None
+        self._placement_plan: SplitPlacementPlan | None = None
+        self._runtime_handle: TorchLensRuntimeHandle | None = None
         self._placement_plans: dict[str, SplitPlacementPlan] = {}
         self._runtime_handles_by_plan_id: dict[str, TorchLensRuntimeHandle] = {}
         self._clone_runtime_cache: dict[str, TorchLensRuntimeHandle] = {}
@@ -41,6 +45,66 @@ class StageRuntimeManager(ServerModelManager):
             if init_server_model_fn is not None
             else None
         )
+        if replica_capacity is not None:
+            if init_server_model_fn is None or state_store is None or replica_capacity < 1:
+                raise ValueError("Leased replicas require a factory, state store and positive capacity")
+            from .leased_manager import LeasedServerModelManager
+            self._delegate = LeasedServerModelManager(
+                init_server_model_fn, capacity=replica_capacity,
+                state_store=state_store, release_model=(
+                    self.offload_client_model if per_client_models else self.release_model_runtime),
+                retire_model=self.retire_model_task if reuse_completed_replicas else None,
+                per_client_models=per_client_models, model_capacity=model_capacity)
+
+    def offload_client_model(self, model):
+        self.release_model_runtime(model)
+        model.offload_model()
+
+    def retire_model_task(self, model):
+        """Detach a completed task while retaining one private execution slot."""
+        if getattr(model, "_inflight_steps", ()):
+            raise RuntimeError("Cannot retire a suffix with an in-flight step")
+        model.optimizer = None
+        model.sid = ""
+        model.model_version = 0
+        model.plan_id = ""
+        model.num_examples = 0
+        model.loss_total = 0.0
+        model._processed_steps.clear()
+        model.state_ownership = None
+        model.graph_contract = None
+        model.batch_window = None
+
+    def release_model_runtime(self, model):
+        """Remove every manager/session reference to one inactive replica."""
+        handles = tuple(getattr(model, "_runtime_cache", {}).values())
+        owned_ids = {id(h) for h in handles}
+        for key, handle in list(self._clone_runtime_cache.items()):
+            if id(handle) in owned_ids:
+                self._clone_runtime_cache.pop(key, None)
+        for key, handle in list(self.autosplit_session._runtime_handles.items()):
+            if id(handle) in owned_ids:
+                self.autosplit_session._runtime_handles.pop(key, None)
+        if hasattr(model, "_runtime_cache"):
+            model._runtime_cache.clear()
+        model.runtime_handle = None
+        model.optimizer = None
+
+    def acquire_replica(self, sid):
+        return self._require_delegate().acquire(sid)
+
+    def finish_replica(self, sid, *, success, reason=""):
+        return self._require_delegate().finish(sid, success=success, reason=reason)
+
+    def release_placement_runtimes(self):
+        """Only inactive managers may release placement templates between rounds."""
+        if self._require_delegate().get_server_model_ids():
+            raise RuntimeError("Cannot discard placement runtimes while suffix models are live")
+        self._placement_plan = self._runtime_handle = None
+        self._placement_plans.clear()
+        self._runtime_handles_by_plan_id.clear()
+        self._clone_runtime_cache.clear()
+        self.autosplit_session.discard_runtime_handles()
 
     def set_placement_plan(self, placement_plan: SplitPlacementPlan) -> None:
         self._placement_plan = placement_plan
@@ -63,7 +127,7 @@ class StageRuntimeManager(ServerModelManager):
                 make_default=make_default,
             )
 
-    def get_placement_plan(self, plan_id: str | None = None) -> Optional[SplitPlacementPlan]:
+    def get_placement_plan(self, plan_id: str | None = None) -> SplitPlacementPlan | None:
         if plan_id is None:
             return self._placement_plan
         return self._placement_plans.get(str(plan_id))
@@ -111,9 +175,21 @@ class StageRuntimeManager(ServerModelManager):
                     "TorchLens runtime cannot bind this model replica to the captured graph."
                 )
         else:
+            handle = None
+            if base.backend.framework_backend == 'tf':
+                from splitfleet.autosplit.tensorflow_clone import clone_tensorflow_runtime_handle
+                from splitfleet.runtime.tensorflow_capture_scope import tensorflow_execution_scope
+                with tensorflow_execution_scope():
+                    handle = clone_tensorflow_runtime_handle(base, model)
+            elif base.backend.framework_backend == 'tinygrad':
+                from splitfleet.autosplit.tinygrad_clone import clone_tinygrad_runtime_handle
+                handle = clone_tinygrad_runtime_handle(base, model)
+        if handle is None:
             sample_inputs = base.plan.metadata.get("_example_inputs")
             if sample_inputs is None:
                 raise RuntimeError("The active TorchLens runtime does not retain sample inputs.")
+            if base.backend.framework_backend == "jax" and hasattr(model, "params"):
+                sample_inputs = (model.params, *sample_inputs[1:])
             handle = self.autosplit_session.prepare_runtime(
                 model,
                 sample_inputs,
@@ -128,8 +204,7 @@ class StageRuntimeManager(ServerModelManager):
         from splitfleet.split_engine import graph_contract_for_runtime_handle
         from splitfleet.split_engine.contracts import validate_contract
 
-        if base.backend.framework_backend == "torch":
-            validate_contract(graph_contract_for_runtime_handle(base), graph_contract_for_runtime_handle(handle))
+        validate_contract(graph_contract_for_runtime_handle(base), graph_contract_for_runtime_handle(handle))
         compatibility = classify_contract_compatibility(
             base.plan.runtime_contract,
             handle.plan.runtime_contract,
@@ -180,6 +255,8 @@ class StageRuntimeManager(ServerModelManager):
         return self._require_delegate().get_server_model(sid)
 
     def collect_server_fit_results(self):
+        if self.before_collect is not None:
+            self.before_collect()
         return self._require_delegate().collect_server_fit_results()
 
     def initialize_server_models(self, configs):

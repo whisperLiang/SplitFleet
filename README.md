@@ -1,5 +1,11 @@
 # SplitFleet
 
+SplitFleet also supports real virtual split learning through Flower/Ray. See
+[Virtual SFL Runtime](experiments/virtual_sfl/README.md) for the CPU smoke entry,
+100-client real-data training, state isolation, bounded suffix replicas, network
+constraints and CoSplit-UCB integration. The current PyTorch ResNet50 comparison (50 virtual clients, 100 rounds; SplitFleet vs FedAvg)
+is documented in [the experiment entry](experiments/resnet50_quality/README.md).
+
 SplitFleet combines a unified split federated learning (SFL) abstraction, SFL-grade fine-grained partitioning, and CoSplit-UCB fleet-wide adaptive placement. Built on [Flower](https://flower.ai/), it separates backend, task, partition, aggregation, and placement contracts. Five backend adapters implement the same SFL execution contract.
 
 The unified task interface covers image classification, text classification, object detection, semantic segmentation, and instance segmentation.

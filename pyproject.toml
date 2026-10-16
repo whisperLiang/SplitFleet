@@ -26,6 +26,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+simulation = [
+    "flwr[simulation]==1.29.0",
+]
+
 dev = [
     "pytest>=8.3.0",
     "grpcio-tools>=1.62.0",
@@ -33,6 +37,8 @@ dev = [
 
 experiment = [
     "torchvision>=0.26.0",
+    "scipy>=1.15.3",
+    "matplotlib>=3.10.0",
 ]
 
 integration = [
@@ -66,4 +72,5 @@ testpaths = ["tests"]
 addopts = "-q"
 markers = [
     "integration: real-model or optional-dependency integration checks",
+    "simulation: executes the native Flower/Ray simulation runtime",
 ]

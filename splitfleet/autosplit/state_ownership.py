@@ -3,39 +3,255 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import defaultdict
+from collections.abc import Mapping
+
 import numpy as np
 
 OWNERSHIP_KEY = "autosplit_state_ownership"
 DIGEST_KEY = "state_ownership_digest"
 
 
-def state_ownership(handle, schema_hash: str) -> dict:
-    runtime = handle.runtime
-    from torchlens.split._torch_compact import compact_torch_graph
-    graph = compact_torch_graph(runtime.trace_graph) if runtime.retains_trace else runtime.trace_graph
-    state = runtime.model.state_dict(keep_vars=True)
-    names = list(state)
-    prefix, suffix = set(runtime.plan.prefix_node_ids), set(runtime.plan.suffix_node_ids)
-    used = {"prefix": set(), "suffix": set()}
+def _attribute(value, name, default=None):
+    try:
+        return getattr(value, name, default)
+    except (AttributeError, KeyError):
+        return default
+
+
+def _native_identities(value):
+    """Include a Keras wrapper, its native variable and its resource handle."""
+    values, identities = [value], set()
+    for _ in range(3):
+        following = []
+        for item in values:
+            if item is None or id(item) in identities:
+                continue
+            identities.add(id(item))
+            for name in ("value", "handle", "_param_ref", "_buffer_ref"):
+                native = _attribute(item, name)
+                if native is not None and not callable(native):
+                    following.append(native)
+        values = following
+    return identities
+
+
+def _runtime_adapter(handle):
+    from splitfleet.backends import BACKEND_ADAPTERS
+
+    backend = str(handle.backend.framework_backend)
+    adapter = BACKEND_ADAPTERS.create(backend)
+    if adapter.backend_name == "jax" and not hasattr(handle.runtime.model, "params"):
+        inputs = handle.backend.trace_sample_input
+        if not inputs:
+            raise ValueError("Functional JAX ownership requires the captured params argument")
+        adapter.bind_external_params(inputs[0])
+    return adapter
+
+
+def _jax_parameter_bindings(adapter, model, state=None):
+    """Map native parameter addresses to pytree paths and adapter state names."""
+    import jax
+
+    state = adapter._state(model) if state is None else state
+    bindings = {}
+    for path, value in jax.tree_util.tree_flatten_with_path(adapter._params(model))[0]:
+        parts = [str(getattr(key, "key", getattr(key, "idx", getattr(key, "name", key)))) for key in path]
+        address = ".".join(parts) or "root"
+        key = jax.tree_util.keystr(path)
+        name = address if address in state else key
+        if name not in state or state[name] is not value:
+            raise ValueError(f"JAX parameter {address!r} is not bound to declared native state")
+        if address in bindings:
+            raise ValueError(f"Ambiguous JAX parameter address {address!r}")
+        bindings[address] = (path, name, value)
+    return bindings
+
+
+def _jax_bindings(adapter, model, state, graph):
+    """Bind parameter addresses to their captured input purpose.
+
+    Immutable parameter roots can lie in the prefix while their consuming
+    equations lie in either stage. Paths survive replacement of array objects.
+    """
+    address_names = {address: name for address, (_, name, _) in
+                     _jax_parameter_bindings(adapter, model, state).items()}
+    program = _attribute(graph, "shape_program")
+    input_paths = {} if program is None else dict(zip(program.input_node_ids, program.input_paths, strict=True))
+    source_names = {}
     for node in graph.nodes:
-        refs = list(node.param_refs) + list(node.buffer_refs)
-        # Module buffer bindings can be used without a standalone buffer node.
-        for ref in node.param_refs:
-            module = getattr(ref, "module", None)
-            if module is not None:
-                refs.extend(module.buffers.values())
-        identities = {id(ref.handle) for ref in refs if ref.handle is not None}
-        for stage, nodes in (("prefix", prefix), ("suffix", suffix)):
-            if node.canonical_id in nodes:
-                used[stage].update(identities)
-    owners = []
+        if not node.is_input:
+            continue
+        addresses = set()
+        annotation = (_attribute(node.op, "annotations", {}) or {}).get("jax_container_path")
+        if isinstance(annotation, str) and annotation.startswith("0."):
+            addresses.add(annotation[2:])
+        pointer = input_paths.get(node.canonical_id, "")
+        if pointer == "/args/0":
+            addresses.add("root")
+        elif pointer.startswith("/args/0/"):
+            addresses.add(".".join(part.replace("~1", "/").replace("~0", "~")
+                                   for part in pointer[len("/args/0/"):].split("/")))
+        names = {address_names[address] for address in addresses if address in address_names}
+        if len(names) > 1:
+            raise ValueError(f"Conflicting JAX parameter input bindings at {node.canonical_id}")
+        if names:
+            name = next(iter(names))
+            value = state[name]
+            if tuple(node.output_shape or ()) != tuple(value.shape) or str(node.dtype) != str(value.dtype):
+                raise ValueError(f"JAX parameter input schema differs at {name!r}")
+            source_names[node.canonical_id] = names
+    bound_names = set().union(*source_names.values()) if source_names else set()
+    if set(address_names.values()) - bound_names:
+        raise ValueError("JAX parameter input bindings are missing from the native capture")
+    return address_names, source_names
+
+
+def _is_state_source(node):
+    kind = str(node.op_type).lower().replace("_", "")
+    return bool(node.is_input or node.is_param_source or node.is_buffer_only_source
+                or kind in {"buffer", "parameter", "getattr", "readvariableop"})
+
+
+def state_ownership(handle, schema_hash: str, *, native_plan=None) -> dict:
+    """Prove disjoint ownership from native consumers and declared associations."""
+    runtime = handle.runtime
+    plan = runtime.plan if native_plan is None else native_plan
+    adapter = _runtime_adapter(handle)
+    backend = adapter.backend_name
+    graph = runtime.trace_graph
+    if backend == "torch" and runtime.retains_trace:
+        from torchlens.split._torch_compact import compact_torch_graph
+
+        graph = compact_torch_graph(graph)
+    state = (runtime.model.state_dict(keep_vars=True) if backend == "torch"
+             else adapter._state(runtime.model))
+    names = list(state)
+    identities = defaultdict(set)
     for name, value in state.items():
-        stages = [stage for stage in used if id(value) in used[stage]]
-        if len(stages) > 1:
+        for identity in _native_identities(value):
+            identities[identity].add(name)
+    address_names, source_names = ({}, {})
+    if backend == "jax":
+        address_names, source_names = _jax_bindings(adapter, runtime.model, state, graph)
+        trainables = set(address_names.values())
+    elif backend == "torch":
+        trainables = {name for name, parameter in runtime.model.named_parameters(remove_duplicate=False)
+                      if parameter.requires_grad}
+    else:
+        trainables = {name for name, value in state.items() if (
+            bool(_attribute(value, "trainable", False)) if backend == "tf"
+            else not bool(_attribute(value, "stop_gradient", True)) if backend == "paddle"
+            else bool(_attribute(value, "requires_grad", _attribute(value, "is_param", False)))
+        )}
+    if backend == "tinygrad":
+        # Tinygrad param_refs describes the complete ancestral UOp graph,
+        # including weights already consumed in the other split stage.  Only
+        # exact captured live parameter occurrences prove fresh consumption.
+        for node in graph.nodes:
+            live = _attribute(node.target, "live_tensor")
+            matched = set().union(*(identities.get(identity, set()) for identity in _native_identities(live)))
+            matched.intersection_update(trainables)
+            if matched:
+                source_names[node.canonical_id] = matched
+        bound = set().union(*source_names.values()) if source_names else set()
+    stages = {"prefix": set(plan.prefix_node_ids), "suffix": set(plan.suffix_node_ids)}
+    if stages["prefix"] & stages["suffix"]:
+        raise ValueError("Native split plan has overlapping stage nodes")
+    used = {name: set() for name in names}
+    children = defaultdict(set)
+    alias_nodes = defaultdict(set)
+    for node in graph.nodes:
+        for alias in (node.canonical_id, node.label, node.raw_label):
+            if alias is not None:
+                alias_nodes[alias].add(node.canonical_id)
+    aliases = {alias: next(iter(node_ids)) for alias, node_ids in alias_nodes.items() if len(node_ids) == 1}
+    for node in graph.nodes:
+        for parent in node.parents:
+            if parent not in aliases:
+                raise ValueError(f"Native ownership has an unresolved graph parent {parent!r}")
+            children[aliases[parent]].add(node.canonical_id)
+
+    def consume(referenced, node_id):
+        for stage, node_ids in stages.items():
+            if node_id in node_ids:
+                for name in referenced:
+                    used[name].add(stage)
+
+    for node in graph.nodes:
+        referenced = set(source_names.get(node.canonical_id, ()))
+        refs = list(node.param_refs) + list(node.buffer_refs)
+        # Torch module buffers are explicit live declarations even when the
+        # batch counter lacks a standalone captured arithmetic source node.
+        for ref in node.param_refs:
+            module = _attribute(ref, "module")
+            refs.extend((_attribute(module, "buffers", {}) or {}).values())
+        for ref in refs:
+            matched = set().union(*(identities.get(identity, set()) for identity in _native_identities(ref)))
+            if backend == "jax":
+                address = _attribute(ref, "address")
+                if address in address_names:
+                    matched.add(address_names[address])
+                    parent_bindings = set().union(*(source_names.get(aliases[parent], set()) for parent in node.parents))
+                    if address_names[address] not in parent_bindings:
+                        raise ValueError(f"JAX parameter {address!r} has no proven consuming input binding")
+            if not matched and bool(_attribute(ref, "is_trainable", False)):
+                raise ValueError("Native trainable parameter reference cannot be bound to model state")
+            if backend == "tinygrad":
+                if bool(_attribute(ref, "is_trainable", False)) and not matched.issubset(bound):
+                    raise ValueError("Tinygrad parameter has no captured native live source binding")
+            else:
+                referenced.update(matched)
+        # TF primitive capture can expose only ReadVariableOp resource inputs.
+        for value in _attribute(node.target, "inputs", ()) or ():
+            if _attribute(value, "source_kind") == "resource":
+                for identity in _native_identities(_attribute(value, "tensor")):
+                    referenced.update(identities.get(identity, ()))
+        if _is_state_source(node) or node.canonical_id in source_names:
+            frontier, visited = list(children[node.canonical_id]), set()
+            while frontier:
+                child_id = frontier.pop()
+                if child_id in visited:
+                    continue
+                visited.add(child_id)
+                child = graph.node_by_id[child_id]
+                if _is_state_source(child) or child_id in source_names:
+                    frontier.extend(children[child_id])
+                else:
+                    consume(referenced, child_id)
+        else:
+            consume(referenced, node.canonical_id)
+    owner_by_name = {}
+    for name, consumed in used.items():
+        if len(consumed) > 1:
             raise ValueError(f"State {name!r} is shared across split stages; disjoint ownership required")
-        owners.append(stages[0] if stages else "initial")
-    result = {"version": 1, "schema_hash": schema_hash,
-              "split_id": handle.plan.split_id, "names": names, "owners": owners}
+        owner_by_name[name] = next(iter(consumed), "initial")
+    declaration = _attribute(runtime.model, "state_associations")
+    declared = set()
+    if callable(declaration):
+        associations = declaration()
+        if not isinstance(associations, Mapping):
+            raise TypeError("state_associations() must map buffer names to trainable names")
+        for name, anchors in associations.items():
+            anchors = (anchors,) if isinstance(anchors, str) else tuple(anchors)
+            if name not in state or name in trainables or not anchors or not set(anchors).issubset(trainables):
+                raise ValueError(f"Invalid declared state association for {name!r}")
+            owners = {owner_by_name[anchor] for anchor in anchors}
+            if len(owners) != 1:
+                raise ValueError(f"Declared state {name!r} has ambiguous ownership")
+            owner = next(iter(owners))
+            if owner_by_name[name] not in {"initial", owner}:
+                raise ValueError(f"Declared state {name!r} contradicts native ownership")
+            owner_by_name[name] = owner
+            declared.add(name)
+    if callable(_attribute(runtime.model, "apply_statistics")) and bool(_attribute(runtime.model, "defer_statistics", True)):
+        unproven = {name for name in names if name not in trainables and name not in declared
+                    and owner_by_name[name] == "initial"}
+        if unproven:
+            raise ValueError(f"Deferred state has no declared ownership association: {sorted(unproven)}")
+    result = {"version": 1, "schema_hash": schema_hash, "backend": backend,
+              "split_id": handle.plan.split_id, "names": names,
+              "owners": [owner_by_name[name] for name in names]}
     result[DIGEST_KEY] = ownership_digest(result)
     return result
 
@@ -56,6 +272,19 @@ def read_ownership(config, handle, schema_hash: str):
 
 
 def export_owned(model, manifest: dict, stage: str) -> list[np.ndarray]:
+    from splitfleet.backends import BACKEND_ADAPTERS
+    from splitfleet.backends.utils import adapter_for
+
+    backend = manifest.get("backend")
+    adapter = BACKEND_ADAPTERS.create(backend) if backend is not None else adapter_for(
+        model, (_attribute(model, "params", {}),),
+    )
+    if adapter.backend_name != "torch":
+        state = adapter._state(model)
+        if set(state) != set(manifest["names"]):
+            raise RuntimeError("Owned state names differ from model state")
+        return [adapter._to_numpy(state[name])
+                for name, owner in zip(manifest["names"], manifest["owners"], strict=True) if owner == stage]
     state = model.state_dict()
     # CPU exports are views. Flower serializes them before the next model
     # mutation; local suffix replicas remain idle through aggregation.
@@ -64,6 +293,9 @@ def export_owned(model, manifest: dict, stage: str) -> list[np.ndarray]:
 
 
 def validate_owned(values, manifest, stage, initial):
+    if (len(manifest["names"]) != len(initial) or len(manifest["owners"]) != len(initial)
+            or any(owner not in {"prefix", "suffix", "initial"} for owner in manifest["owners"])):
+        raise RuntimeError("Incorrect state ownership schema")
     indices = [i for i, owner in enumerate(manifest["owners"]) if owner == stage]
     if len(values) != len(indices):
         raise RuntimeError(f"Incorrect {stage} state tensor count")
@@ -73,38 +305,45 @@ def validate_owned(values, manifest, stage, initial):
     return dict(zip(indices, values))
 
 
-def aggregate_owned(initial, updates):
+def aggregate_owned(initial, updates, *, integer_policy="weighted_round"):
     """One output and one scratch tensor per state; no reconstructed replicas.
 
     updates contains (manifest, prefix arrays, suffix arrays, weight).
     Validation checks metadata, shapes and dtypes, never parameter values.
     """
-    if not updates:
+    if integer_policy not in {"weighted_round", "maximum"}:
+        raise ValueError(f"Unsupported integer aggregation policy {integer_policy!r}")
+    result, total = None, 0.
+    for manifest, prefix_values, suffix_values, raw_weight in updates:
+        prefix = validate_owned(prefix_values, manifest, "prefix", initial)
+        suffix = validate_owned(suffix_values, manifest, "suffix", initial)
+        weight = float(raw_weight)
+        if not np.isfinite(weight) or weight <= 0:
+            raise RuntimeError("State aggregation requires finite positive weights")
+        if result is None:
+            result = [np.array(base, dtype=base.dtype if base.dtype.kind in "fc" or integer_policy == "maximum" else np.float64,
+                               copy=True) for base in initial]
+            for index, accumulator in enumerate(result):
+                value = prefix.get(index, suffix.get(index, initial[index]))
+                if integer_policy == "maximum" and initial[index].dtype.kind not in "fc":
+                    np.copyto(accumulator, value)
+                else:
+                    np.multiply(value, weight, out=accumulator)
+        else:
+            for index, accumulator in enumerate(result):
+                value = prefix.get(index, suffix.get(index, initial[index]))
+                if integer_policy == "maximum" and initial[index].dtype.kind not in "fc":
+                    np.maximum(accumulator, value, out=accumulator)
+                else:
+                    scratch = np.multiply(np.asarray(value, dtype=accumulator.dtype), weight)
+                    np.add(accumulator, scratch, out=accumulator)
+        total += weight
+    if result is None:
         raise RuntimeError("No matching prefix/suffix update")
-    decoded = [(validate_owned(p, m, "prefix", initial),
-                validate_owned(s, m, "suffix", initial), float(w)) for m, p, s, w in updates]
-    if any(not np.isfinite(w) or w <= 0 for _, _, w in decoded):
-        raise RuntimeError("State aggregation requires finite positive weights")
-    total = sum(w for _, _, w in decoded)
-    if total <= 0:
-        raise RuntimeError("State aggregation requires positive weights")
-    result = []
-    for index, base in enumerate(initial):
-        first_p, first_s, weight = decoded[0]
-        value = first_p.get(index, first_s.get(index, base))
-        # Multiplication can turn a zero-dimensional ndarray into a NumPy
-        # scalar, which cannot be an ufunc output. Preserve ndarray rank and
-        # the model schema; integer buffers use a floating accumulator.
-        working_dtype = base.dtype if base.dtype.kind in "fc" else np.float64
-        accumulator = np.array(value, dtype=working_dtype, copy=True)
-        np.multiply(accumulator, weight, out=accumulator)
-        scratch = np.empty_like(accumulator) if len(decoded) > 1 else None
-        for prefix, suffix, weight in decoded[1:]:
-            value = prefix.get(index, suffix.get(index, base))
-            np.multiply(value, weight, out=scratch)
-            np.add(accumulator, scratch, out=accumulator)
+    for base, accumulator in zip(initial, result):
+        if integer_policy == "maximum" and base.dtype.kind not in "fc":
+            continue
         np.divide(accumulator, total, out=accumulator)
         if base.dtype.kind not in "fc":
             np.rint(accumulator, out=accumulator)
-        result.append(accumulator.astype(base.dtype, copy=False))
-    return result
+    return [value.astype(base.dtype, copy=False) for base, value in zip(initial, result)]

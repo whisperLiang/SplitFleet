@@ -10,21 +10,29 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-from pathlib import Path
 import signal
 import time
+from pathlib import Path
 
 
 class DirectionPacer:
-    def __init__(self, control):
-        self.control = Path(control)
+    def __init__(self, control, direction=None):
+        self.control = control if callable(control) else Path(control)
+        self.direction = direction
         self.lock = asyncio.Lock()
         self.next_due = 0.
         self.last_rate = None
 
     async def wait(self, count):
-        state = json.loads(self.control.read_text())
-        rate = state.get("cap_mbps")
+        state, due = await self.reserve(count)
+        delay = max(0., due - time.perf_counter())
+        if delay:
+            await asyncio.sleep(delay)
+        return state, delay
+
+    async def reserve(self, count):
+        state = self.control() if callable(self.control) else json.loads(self.control.read_text())
+        rate = state.get(f"{self.direction}_mbps", state.get("cap_mbps"))
         if rate is not None and (isinstance(rate, bool) or rate <= 0):
             raise ValueError("TCP cap must be positive or null")
         async with self.lock:
@@ -37,17 +45,17 @@ class DirectionPacer:
             else:
                 due = max(now, self.next_due) + count * 8 / (rate * 1_000_000)
             self.next_due = due
-        delay = max(0., due - time.perf_counter())
-        if delay:
-            await asyncio.sleep(delay)
-        return state, delay
+        latency = float(state.get("rtt_ms", 0.)) / 2000.
+        if latency < 0:
+            raise ValueError("TCP RTT must be nonnegative")
+        return state, due + latency
 
 
 class PacedProxy:
     def __init__(self, *, target, control, output):
         self.target = target
         self.output = Path(output)
-        self.pacers = {name: DirectionPacer(control) for name in ("upload", "download")}
+        self.pacers = {name: DirectionPacer(control, name) for name in ("upload", "download")}
         self.counts = {}
         self.errors = []
         self.connections = 0
@@ -67,6 +75,8 @@ class PacedProxy:
         tmp.replace(self.output)
 
     async def pump(self, reader, writer, direction):
+        if callable(self.pacers[direction].control):
+            return await self._pipeline_pump(reader, writer, direction)
         while True:
             block = await reader.read(16 * 1024)
             if not block:
@@ -84,6 +94,77 @@ class PacedProxy:
             writer.write_eof()
         except (OSError, AttributeError):
             pass
+
+    async def _pipeline_pump(self, reader, writer, direction):
+        """Pipeline propagation delay without imposing another bandwidth cap.
+
+        Rate-limited streams retain a bandwidth-delay product plus four blocks
+        in flight. Uncapped streams have no artificial queue-size limit: their
+        in-flight bytes reflect the actual source rate and propagation delay.
+        """
+        block_size = 16 * 1024
+        queue = asyncio.Queue()
+        space = asyncio.Event()
+        writable = asyncio.Event()
+        writable.set()
+        buffered_bytes = 0
+
+        async def producer():
+            nonlocal buffered_bytes
+            while True:
+                # Propagation can retain a flight of uncapped traffic, but a
+                # blocked destination must still apply TCP backpressure.
+                await writable.wait()
+                block = await reader.read(block_size)
+                if not block:
+                    break
+                state, due = await self.pacers[direction].reserve(len(block))
+                rate = state.get(f"{direction}_mbps", state.get("cap_mbps"))
+                if rate is not None:
+                    latency = float(state.get("rtt_ms", 0.)) / 2000.
+                    window_bytes = rate * 1_000_000 / 8 * latency + 4 * block_size
+                    while buffered_bytes + len(block) > window_bytes:
+                        space.clear()
+                        await space.wait()
+                buffered_bytes += len(block)
+                queue.put_nowait((block, state, due))
+                # In an uncapped direction read()/put_nowait() may both finish
+                # immediately; let the consumer deliver bytes whose delay ended.
+                await asyncio.sleep(0)
+            queue.put_nowait(None)
+
+        async def consumer():
+            nonlocal buffered_bytes
+            while (item := await queue.get()) is not None:
+                block, state, due = item
+                delay = max(0., due - time.perf_counter())
+                if delay:
+                    await asyncio.sleep(delay)
+                writer.write(block)
+                writable.clear()
+                await writer.drain()
+                writable.set()
+                row = self.counts.setdefault(str(state.get("round_id", 0)), {
+                    "upload_mbps": state.get("upload_mbps"), "download_mbps": state.get("download_mbps"),
+                    "rtt_ms": state.get("rtt_ms", 0.), "upload_bytes": 0, "download_bytes": 0,
+                    "upload_pacing_wait_sec": 0., "download_pacing_wait_sec": 0.})
+                row[direction + "_bytes"] += len(block)
+                row[direction + "_pacing_wait_sec"] += delay
+                buffered_bytes -= len(block)
+                space.set()
+
+        producer_task = asyncio.create_task(producer())
+        consumer_task = asyncio.create_task(consumer())
+        try:
+            await asyncio.gather(producer_task, consumer_task)
+        finally:
+            producer_task.cancel()
+            consumer_task.cancel()
+            await asyncio.gather(producer_task, consumer_task, return_exceptions=True)
+            try:
+                writer.write_eof()
+            except (OSError, AttributeError):
+                pass
 
     async def handle(self, reader, writer):
         task = asyncio.current_task()
@@ -120,7 +201,7 @@ class PacedProxy:
                 self.save()
                 try:
                     await asyncio.wait_for(stopped.wait(), timeout=1)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
         reporting = asyncio.create_task(periodic())
         await stopped.wait()

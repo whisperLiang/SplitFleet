@@ -1,0 +1,14 @@
+rounds: 2
+seed: 233
+batch_size: 2
+boundary: after:head
+virtual_clients:
+  total: 2
+resources:
+  worker_count_policy: pooled
+  max_concurrent_clients: 1
+  server_concurrency: 1
+workload:
+  source: fixture
+  model: tiny
+  samples: 8

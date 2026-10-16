@@ -129,12 +129,15 @@ class AutoSplitStrategy(PlainSlStrategy):
         loss_fn=None,
         optimizer_fn=None,
         runtime_device: str = "cpu",
+        defer_server_models: bool = False,
         placement_policy: Optional[RoundPlacementPolicy] = None,
         tied_weight_update_mode: str = "reject",
         owned_state_exchange: bool = False,
+        integer_aggregation_policy: str = "weighted_round",
         client_selection: str | None = "flower_default",
         client_selector: Optional[ClientSelector] = None,
         oort_config: Optional[OortSelectorConfig] = None,
+        round_state_store=None,
         **kwargs,
     ) -> None:
         validate_stage_counts(
@@ -142,6 +145,10 @@ class AutoSplitStrategy(PlainSlStrategy):
             client_stage_count=client_stage_count,
         )
         self.model = model
+        if integer_aggregation_policy not in {"weighted_round", "maximum"}:
+            raise ValueError("Unknown integer state aggregation policy")
+        self.integer_aggregation_policy = integer_aggregation_policy
+        self.round_state_store = round_state_store
         sample_call = ModelInputs.from_value(sample_inputs.inputs if isinstance(sample_inputs, TaskBatch) else sample_inputs)
         if sample_kwargs is not None:
             if sample_call.kwargs:
@@ -187,6 +194,7 @@ class AutoSplitStrategy(PlainSlStrategy):
             )
         self.execution_schedule_policy = execution_schedule_policy or ExecutionSchedulePolicy()
         self.client_stage_count = int(client_stage_count)
+        self.defer_server_models = defer_server_models
         self.boundary = boundary
         # The dynamic batch window is part of the feature ABI, so it is planned
         # once here and broadcast to every device instead of being re-derived
@@ -268,6 +276,19 @@ class AutoSplitStrategy(PlainSlStrategy):
         for placement in (*self._placement_plans.values(), *self._evaluation_placement_plans.values()):
             if placement is not self._placement_plan:
                 runtime_manager.register_placement_plan(placement)
+
+    def release_placement_runtimes(self):
+        """Retain algorithm/candidate state while evicting inactive execution views."""
+        if self._runtime_manager is not None:
+            self._runtime_manager.release_placement_runtimes()
+        self._placement_plan = None
+        self._placement_plans.clear()
+        self._evaluation_placement_plans.clear()
+        self._autosplit_config_cache.clear()
+        provider = getattr(self.placement_policy, "candidate_provider", None)
+        release = getattr(provider, "release_prepared_handles", None)
+        if release is not None:
+            release()
 
     def initialize_parameters(self, client_manager):
         _ = client_manager
@@ -432,6 +453,7 @@ class AutoSplitStrategy(PlainSlStrategy):
             boundary=self.boundary,
             mode=self.mode,
             device=self.runtime_device,
+            defer_model=self.defer_server_models,
         )
 
     def _autosplit_config(
@@ -519,7 +541,7 @@ class AutoSplitStrategy(PlainSlStrategy):
         if hasattr(self.placement_policy, "state_download_bytes"):
             self.placement_policy.state_download_bytes = sum(len(value) for value in parameters.tensors)
         prepare_calibration = getattr(self.placement_policy, "prepare_calibration", None)
-        if (prepare_calibration is not None and self.backend_adapter.backend_name == "torch"
+        if (prepare_calibration is not None and self.backend_adapter.backend_name in {'torch', 'tf', 'paddle', 'jax'}
                 and hasattr(self.placement_policy.candidate_provider, "model")):
             prepare_calibration(
                 ModelInputs(self.sample_inputs, self.sample_kwargs),
@@ -734,7 +756,8 @@ class AutoSplitStrategy(PlainSlStrategy):
                         raise RuntimeError("Prefix state ownership digest mismatch")
             self._pending_client_updates[int(server_round)] = {
                 str(getattr(client, "cid")): (
-                    parameters_to_ndarrays(fit_res.parameters),
+                    (self.round_state_store.put(parameters_to_ndarrays(fit_res.parameters))
+                     if self.round_state_store is not None else parameters_to_ndarrays(fit_res.parameters)),
                     float(weight),
                 )
                 for (client, fit_res), weight in zip(results, weights)
@@ -948,7 +971,8 @@ class AutoSplitStrategy(PlainSlStrategy):
                     if suffix.config.get(DIGEST_KEY) != manifest[DIGEST_KEY]:
                         raise RuntimeError("Suffix state ownership digest mismatch")
                     owned_updates.append((manifest, prefix, suffix.parameters, weight))
-                aggregated = aggregate_owned(initial_client, owned_updates)
+                aggregated = aggregate_owned(initial_client, owned_updates,
+                                             integer_policy=self.integer_aggregation_policy)
                 self._reassembled_client_states[round_id] = aggregated
                 return aggregated
             names = self._logical_state_name_list()

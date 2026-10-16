@@ -316,7 +316,8 @@ class PlainSlStrategy(Strategy):
         request_group = ClientRequestGroup(sid)
         request_id = str(uuid.uuid4())[:8]
         self.requests_state[request_key][request_id] = request_group
-        callback_fn = lambda: self.requests_state[request_key].pop(request_id)
+        groups = self.requests_state[request_key]
+        callback_fn = lambda: groups.pop(request_id, None)
         return request_group, callback_fn
 
     def mark_ready_requests(self):

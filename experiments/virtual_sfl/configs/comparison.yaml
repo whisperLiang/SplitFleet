@@ -1,0 +1,19 @@
+runs:
+  static:
+    rounds: 3
+    seed: 233
+    batch_size: 2
+    boundary: after:head
+    placement: static
+    virtual_clients: {total: 4}
+    resources: {max_concurrent_clients: 4}
+    workload: {source: fixture, model: tiny, samples: 16}
+  cosplit_ucb:
+    rounds: 3
+    seed: 233
+    batch_size: 2
+    boundary: after:head
+    placement: cosplit_ucb
+    virtual_clients: {total: 4}
+    resources: {max_concurrent_clients: 4}
+    workload: {source: fixture, model: tiny, samples: 16}

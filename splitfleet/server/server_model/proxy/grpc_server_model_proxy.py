@@ -29,25 +29,30 @@ class FutureResponse:
 # pylint: disable=no-member
 class GrpcServerModelProxy(ServerModelProxy):
 
-    """
-    In all server invokations the timeout parameter is currently ignored. This is because there is
-    currently no way to set a timeout for streaming requests. See:
-    - https://github.com/grpc/grpc/issues/20562
-    """
+    """Existing split RPC protocol, with optional deadlines and call credentials."""
     def __init__(
         self,
         *,
         stub: server_model_pb2_grpc.ServerModelStub,
-        cid: str
+        cid: str,
+        default_timeout: Optional[float] = None,
+        metadata=(),
     ) -> None:
         super().__init__(cid=cid)
         log(DEBUG, "Initializing proxy for CID %s", cid)
         self.stub = stub
         self.request_queue = None
+        self.default_timeout = default_timeout
+        self.call_metadata = tuple(metadata)
 
     def _initialize_stream(self):
         self.request_queue = Queue(maxsize=20)
-        self.response_stream = self.stub.StreamRequest(iter(self.request_queue.get, None))
+        kwargs = {}
+        if self.default_timeout is not None:
+            kwargs["timeout"] = self.default_timeout
+        if self.call_metadata:
+            kwargs["metadata"] = self.call_metadata
+        self.response_stream = self.stub.StreamRequest(iter(self.request_queue.get, None), **kwargs)
         self.request_queue.put(server_model_pb2.BatchData(
             control_code=control_code_to_proto(ControlCode.INIT_STREAM),
             cid=self.cid,
@@ -89,7 +94,12 @@ class GrpcServerModelProxy(ServerModelProxy):
             self.request_queue.put(ins)
             res = next(self.response_stream)
         else:
-
+            kwargs = {}
+            timeout = _timeout_ if _timeout_ is not None else self.default_timeout
+            if timeout is not None:
+                kwargs["timeout"] = timeout
+            if self.call_metadata:
+                kwargs["metadata"] = self.call_metadata
             res = self.stub.UnaryRequest(
                 server_model_pb2.BatchData(
                     method=method,
@@ -97,7 +107,8 @@ class GrpcServerModelProxy(ServerModelProxy):
                     control_code=control_code_to_proto(batch_data.control_code),
                     cid=self.cid,
                     metadata=batch_data.metadata,
-                )
+                ),
+                **kwargs,
             )
         return BatchData(
             data=from_grpc_format(res.data),
@@ -148,3 +159,15 @@ class GrpcServerModelProxy(ServerModelProxy):
         ))
         res = next(self.response_stream)
         assert control_code_from_proto(res.control_code) == ControlCode.STREAM_CLOSED_OK
+
+    def cancel(self):
+        """Release a failed/cancelled streaming call without waiting for a reply."""
+        stream = self.__dict__.get("response_stream")
+        if stream is not None:
+            stream.cancel()
+        if self.request_queue is not None:
+            try:
+                self.request_queue.put_nowait(None)
+            except Exception:
+                pass
+        self.request_queue = None

@@ -1,0 +1,22 @@
+# Dedicated Ray cluster: head node --num-cpus=0; two worker nodes --num-cpus=8.
+# Replace addresses and PEM paths for your private cluster before execution.
+rounds: 2
+batch_size: 2
+boundary: after:head
+virtual_clients: {total: 16}
+resources:
+  ray_address: 192.0.2.10:6379
+  max_concurrent_clients: 16
+  client_cpus_per_worker: 1
+  max_suffix_replicas: 4
+  server_concurrency: 1
+transport:
+  bind_host: 0.0.0.0
+  advertise_host: 192.0.2.10
+  port: 8443
+  ca_cert: /etc/splitfleet/ca.pem
+  server_cert: /etc/splitfleet/server.pem
+  server_key: /etc/splitfleet/server.key
+  client_cert: /etc/splitfleet/client.pem
+  client_key: /etc/splitfleet/client.key
+workload: {source: fixture, model: tiny, samples: 64}

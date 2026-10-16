@@ -3,6 +3,7 @@
 import copy
 import json
 import random
+from threading import Barrier, Lock
 from types import SimpleNamespace
 
 import numpy as np
@@ -11,8 +12,14 @@ import torch
 from torch import nn
 
 from experiments.common.identity import tensor_state_hash
+from splitfleet.common.constants import (
+    COSPLIT_CALIBRATION_HASH_HANDSHAKE_KEY,
+    COSPLIT_CALIBRATION_MODEL_HASH_CONFIG_KEY,
+    COSPLIT_CALIBRATION_PARAMETERS_CONFIG_KEY,
+    COSPLIT_CALIBRATION_PARAMETERS_REQUIRED_KEY,
+)
 from splitfleet.server.placement.cosplit_ucb.calibration import (
-    CalibratedTelemetry, calibrate_split, calibration_boundaries, provider_handle,
+    CalibratedTelemetry, ClientTelemetry, calibrate_split, calibration_boundaries, provider_handle,
 )
 from experiments.physical_multitask import _make_candidate_provider, _make_placement_policy
 from splitfleet.tasks import ModelInputs
@@ -20,6 +27,47 @@ from splitfleet.server.placement import PlacementFeedback, StaticCandidateProvid
 from splitfleet.server.placement.cosplit_ucb import GlobalPlacementSolver, SafeExplorationController, TorchLensCandidateProvider
 from tests.unit.test_cosplit_exploration import _estimate
 from tests.unit.test_cosplit_policy import _candidate
+
+
+def test_virtual_calibration_rpcs_use_the_admitted_pool_without_sharing_receipts():
+    barrier, lock = Barrier(2), Lock()
+    active, peak = 0, 0
+
+    class Client:
+        def __init__(self, cid):
+            self.cid = str(cid)
+
+        def get_properties(self, ins, timeout, group_id):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            barrier.wait(timeout=5)
+            with lock:
+                active -= 1
+            return SimpleNamespace(properties={'logical_client_id': self.cid,
+                'num_batches': 3, 'batch_size': 16, 'private_receipt': self.cid})
+
+    telemetry = ClientTelemetry(policy=SimpleNamespace(solver=SimpleNamespace(client_concurrency=2)))
+    telemetry.bind_clients([Client(cid) for cid in range(4)], round_id=1)
+    assert peak == 2
+    assert {cid: props['private_receipt'] for cid, props in telemetry.clients.items()} == {
+        str(cid): str(cid) for cid in range(4)}
+
+
+def test_failed_calibration_metadata_does_not_partially_update_bound_clients():
+    class Client:
+        def __init__(self, cid, batches):
+            self.cid, self.batches = cid, batches
+
+        def get_properties(self, *args, **kwargs):
+            return SimpleNamespace(properties={'logical_client_id': self.cid,
+                'num_batches': self.batches, 'batch_size': 16})
+
+    telemetry = ClientTelemetry(policy=SimpleNamespace(solver=SimpleNamespace(client_concurrency=2)))
+    with pytest.raises(ValueError, match='positive num_batches'):
+        telemetry.bind_clients([Client('good', 1), Client('bad', 0)], round_id=1)
+    assert telemetry.clients == {}
 
 
 class CalibrationNet(nn.Module):
@@ -86,6 +134,66 @@ def test_actual_split_calibration_restores_weights_buffers_gradients_modes_and_r
     np.testing.assert_array_equal(restored[1], numpy_rng[1])
 
 
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda:0", marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA unavailable"))])
+def test_boundary_only_calibration_matches_full_backward_and_prefix_sgd(device):
+    from splitfleet.autosplit.state_ownership import state_ownership
+
+    torch.set_num_threads(1)
+    model = CalibrationNet().to(device).train()
+    inputs = ModelInputs(args=(torch.randn(2, 4, device=device),))
+    labels = torch.randn(2, 2, device=device)
+    provider = TorchLensCandidateProvider(model=model, sample_inputs=inputs,
+        batch_axes={"/args/0": 0}, dynamic_batch=(2, 2), require_trainable_prefix=True)
+    cuts = calibration_boundaries(provider.get_candidates(training=True))
+    initial = copy.deepcopy(model.state_dict())
+    cpu_rng = torch.get_rng_state().clone()
+    cuda_rng = torch.cuda.get_rng_state(device).clone() if device.startswith("cuda") else None
+    for cut in cuts:
+        handle = provider_handle(provider, cut)
+        ownership = state_ownership(handle, "calibration")
+        prefix = {name for name, stage in zip(ownership["names"], ownership["owners"])
+                  if stage == "prefix"}
+        parameters = [p for name, p in model.named_parameters() if name in prefix]
+        reference = None
+        for only_boundary in (False, True):
+            model.load_state_dict(initial)
+            torch.set_rng_state(cpu_rng)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state(cuda_rng, device)
+            optimizer = torch.optim.SGD(parameters, lr=.01, momentum=.9)
+            steps = []
+            for _ in range(2):
+                model.zero_grad(set_to_none=True)
+                boundary = handle.backend.run_prefix(*inputs.args, training=True)
+                loss, gradients = handle.backend.train_suffix(boundary, labels,
+                    loss_fn=nn.functional.mse_loss, boundary_gradients_only=only_boundary)
+                if only_boundary:
+                    assert all(p.grad is None for p in model.parameters())
+                handle.backend.backward_prefix(boundary, boundary_grads=gradients, optimizer=optimizer)
+                steps.append((loss.detach().clone(), {name: value.clone() for name, value in gradients.items()},
+                    {name: p.grad.detach().clone() for name, p in model.named_parameters() if name in prefix}))
+            actual = (steps, copy.deepcopy(model.state_dict()))
+            if reference is None:
+                reference = actual
+            else:
+                torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
+def test_boundary_only_calibration_cannot_silently_skip_suffix_updates():
+    model = CalibrationNet().train()
+    inputs = ModelInputs(args=(torch.randn(2, 4),))
+    provider = TorchLensCandidateProvider(model=model, sample_inputs=inputs,
+        batch_axes={"/args/0": 0}, dynamic_batch=(2, 2), require_trainable_prefix=True)
+    handle = provider_handle(provider, calibration_boundaries(provider.get_candidates(training=True))[0])
+    boundary = handle.backend.run_prefix(*inputs.args, training=True)
+    initial = tensor_state_hash(model.state_dict())
+    with pytest.raises(ValueError, match="cannot update a suffix optimizer"):
+        handle.backend.train_suffix(boundary, torch.randn(2, 2), loss_fn=nn.functional.mse_loss,
+            optimizer=torch.optim.SGD(model.parameters(), lr=.01), boundary_gradients_only=True)
+    assert tensor_state_hash(model.state_dict()) == initial
+
+
 def _receipt(catalog, *, server=False):
     return dict(schema="splitfleet.cosplit-calibration", device="cpu",
         source="server_shape_matched_current_deployment" if server else "client_private_sample_current_deployment",
@@ -120,6 +228,73 @@ def _bootstrap_policy(tmp_path, model_id="rfdetr_nano"):
         return SimpleNamespace(properties=props)
     worker = SimpleNamespace(cid="a", get_properties=properties)
     return policy, worker, props
+
+
+def test_transport_bootstrap_parallelizes_clients_but_keeps_each_connection_serial(tmp_path):
+    policy, _, props = _bootstrap_policy(tmp_path)
+    policy.solver.client_concurrency = 2
+    barrier, lock = Barrier(2), Lock()
+    active, peak = 0, 0
+    per_client, calls = {}, {}
+
+    def properties(cid, ins, **kwargs):
+        nonlocal active, peak
+        config = ins.config
+        if 'cosplit_probe_payload' not in config:
+            return SimpleNamespace(properties={**props, 'logical_client_id': cid})
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            per_client[cid] = per_client.get(cid, 0) + 1
+            assert per_client[cid] == 1
+            calls.setdefault(cid, []).append((len(config['cosplit_probe_payload']),
+                                             config.get('cosplit_probe_reply_bytes')))
+        barrier.wait(timeout=5)
+        with lock:
+            active -= 1
+            per_client[cid] -= 1
+        payload = config['cosplit_probe_payload']
+        reply_size = config.get('cosplit_probe_reply_bytes', len(payload))
+        return SimpleNamespace(properties={'cosplit_probe_payload':
+            payload if reply_size == len(payload) else bytes(reply_size)})
+
+    clients = [SimpleNamespace(cid=str(i), get_properties=lambda ins, _cid=str(i), **kw:
+                               properties(_cid, ins, **kw)) for i in range(4)]
+    policy.bind_clients(clients, 1)
+    assert peak == 2 and active == 0
+    expected = [(65536, None)] * 4 + [(2097152, None)] * 2 + [
+        (65536, 65536)] * 2 + [(2097152, 65536)] * 2 + [(65536, 2097152)] * 2
+    assert all(sequence == expected for sequence in calls.values())
+    receipt = policy.telemetry_provider.receipt
+    assert receipt['timing']['client_concurrency_limit'] == 2
+    assert len(receipt['transport_bootstrap']['warmup_samples']) == 8
+    assert [row['logical_client_id'] for row in receipt['transport_bootstrap']['samples']] == [
+        str(cid) for cid in range(4) for _ in range(4)]
+    assert [row['logical_client_id'] for row in receipt['state_exchange_bootstrap']['samples']] == [
+        str(cid) for cid in range(4) for _ in range(6)]
+    assert all(policy.learners.network.update_count(str(cid)) == 4 for cid in range(4))
+    assert all(policy.learners.network.exchange_update_count(str(cid)) == 6 for cid in range(4))
+    assert policy.learners.server.model.num_updates == 3
+
+
+def test_failed_parallel_transport_probe_does_not_initialize_any_learner(tmp_path):
+    policy, _, props = _bootstrap_policy(tmp_path)
+    policy.solver.client_concurrency = 2
+
+    def properties(cid, ins, **kwargs):
+        if 'cosplit_probe_payload' not in ins.config:
+            return SimpleNamespace(properties={**props, 'logical_client_id': cid})
+        payload = ins.config['cosplit_probe_payload']
+        reply = bytes(ins.config.get('cosplit_probe_reply_bytes', len(payload)))
+        return SimpleNamespace(properties={'cosplit_probe_payload': b'bad' if cid == 'bad' else reply})
+
+    clients = [SimpleNamespace(cid=cid, get_properties=lambda ins, _cid=cid, **kw:
+                               properties(_cid, ins, **kw)) for cid in ('good', 'bad')]
+    with pytest.raises(ValueError, match='transport probe failed'):
+        policy.bind_clients(clients, 1)
+    assert not policy.telemetry_provider.initialized
+    assert policy.telemetry_provider.receipt is None
+    assert not policy.learners.has_observations
 
 
 @pytest.mark.parametrize("model_id", ["rfdetr_nano", "resnet50_pretrained", "bert_base", "deeplabv3_resnet50"])
@@ -262,7 +437,8 @@ def test_native_strategy_calibrates_before_placement_and_trains_without_experime
         client.calibrate_runtime(client_sample.targets,
             boundaries=calibration_boundaries(provider.get_candidates(training=True)))
         assert client._prewarmed_runtime.plan.trace_batch_mode == "batch_1"
-    worker = SimpleNamespace(cid="a", get_properties=lambda ins, **kw: SimpleNamespace(
+    worker = SimpleNamespace(cid="a", properties={COSPLIT_CALIBRATION_HASH_HANDSHAKE_KEY: True},
+        get_properties=lambda ins, **kw: SimpleNamespace(
         properties=client.get_properties(ins.config)))
     client_manager = SimpleNamespace(num_available=lambda: 1, sample=lambda **kw: [worker])
     initial = [value.detach().cpu().numpy().copy() for value in global_model.state_dict().values()]
@@ -413,6 +589,65 @@ def _execute_instruction(cohort, worker, instruction, *, training, round_id):
             expected = cohort.task.loss(server.model(*cohort.inputs.args), cohort.targets)
         assert loss == pytest.approx(float(expected), rel=1e-5, abs=1e-6)
     assert examples == 2 and metrics["num_batches"] == 1
+
+
+@pytest.mark.parametrize('matching', [True, False])
+def test_hash_handshake_uses_local_state_or_loads_the_full_model_before_native_calibration(matching):
+    from flwr.common import ndarrays_to_parameters, serde
+
+    cohort = _native_cohort()
+    client, worker = cohort.clients['a'], cohort.workers[0]
+    worker.properties = {COSPLIT_CALIBRATION_HASH_HANDSHAKE_KEY: True}
+    if matching:
+        client.model.load_state_dict(cohort.strategy.model.state_dict())
+    original = tensor_state_hash(client.model.state_dict())
+    global_hash = tensor_state_hash(cohort.strategy.model.state_dict())
+    real_properties = worker.get_properties
+
+    def properties(ins, **kwargs):
+        cpu_rng = torch.get_rng_state().clone()
+        result = real_properties(ins, **kwargs)
+        if result.properties.get(COSPLIT_CALIBRATION_PARAMETERS_REQUIRED_KEY):
+            assert tensor_state_hash(client.model.state_dict()) == original
+            assert client._prewarmed_runtime is None
+            assert torch.equal(cpu_rng, torch.get_rng_state())
+        return result
+
+    worker.get_properties = properties
+    parameters = ndarrays_to_parameters(cohort.initial)
+    size = len(serde.parameters_to_proto(parameters).SerializeToString())
+    instructions = cohort.strategy.configure_fit(1, parameters, cohort.client_manager)
+    calibration = [request for request in cohort.requests['a'] if request.get('cosplit_calibration_boundaries')]
+    assert len(calibration) == (1 if matching else 2)
+    assert calibration[0][COSPLIT_CALIBRATION_MODEL_HASH_CONFIG_KEY] == global_hash
+    assert COSPLIT_CALIBRATION_PARAMETERS_CONFIG_KEY not in calibration[0]
+    if not matching:
+        assert len(calibration[1][COSPLIT_CALIBRATION_PARAMETERS_CONFIG_KEY]) == size
+    assert client.online_calibration_receipt['model_hash_before'] == global_hash
+    assert client.online_calibration_receipt['model_hash_after'] == global_hash
+    assert tensor_state_hash(client.model.state_dict()) == global_hash
+    transfer = cohort.policy.telemetry_provider.receipt['parameter_handshake']
+    assert transfer['requests'] == (1 if matching else 2)
+    assert transfer['hash_matched_clients'] == int(matching)
+    assert transfer['fallback_clients'] == int(not matching)
+    assert transfer['parameter_payload_bytes'] == (0 if matching else size)
+    assert transfer['avoided_parameter_payload_bytes'] == (size if matching else 0)
+    _execute_instruction(cohort, *instructions[0], training=True, round_id=1)
+
+
+def test_hash_handshake_rejects_wrong_global_payload_before_tracing_or_calibration():
+    from flwr.common import ndarrays_to_parameters, serde
+
+    cohort = _native_cohort()
+    client = cohort.clients['a']
+    payload = serde.parameters_to_proto(ndarrays_to_parameters(cohort.initial)).SerializeToString()
+    with pytest.raises(ValueError, match='payload differs'):
+        client.get_properties({'cosplit_calibration_boundaries': '["unused"]',
+            COSPLIT_CALIBRATION_MODEL_HASH_CONFIG_KEY: 'wrong-hash',
+            COSPLIT_CALIBRATION_PARAMETERS_CONFIG_KEY: payload})
+    assert client._prewarmed_runtime is None
+    assert client.online_calibration_receipt is None
+    assert not cohort.policy.learners.has_observations
 
 
 @pytest.mark.parametrize("initial_evaluation", [False, True])

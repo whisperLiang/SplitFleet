@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
-from dataclasses import dataclass, replace
 import heapq
+import math
+from collections import OrderedDict, deque
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from types import MappingProxyType
-from typing import Mapping, Sequence
 
 from .types import CandidateEstimate
 
@@ -20,6 +21,7 @@ class ClientTimeline:
     server_finish_ms: float
     queue_ms: float
     completion_ms: float
+    worker_start_ms: float = 0.
 
 
 @dataclass(frozen=True)
@@ -43,6 +45,7 @@ class GlobalPlacementSolver:
     def __init__(
         self, *, server_concurrency: int = 1, max_coordinate_passes: int = 3,
         simulation_cache_size: int = 8192,
+        client_concurrency: int | None = None,
     ) -> None:
         if server_concurrency < 1 or max_coordinate_passes < 0 or simulation_cache_size < 0:
             raise ValueError("invalid solver parameters")
@@ -52,6 +55,12 @@ class GlobalPlacementSolver:
         self._simulation_cache: OrderedDict[tuple, PlacementSimulation] = OrderedDict()
         self.simulation_cache_hits = 0
         self.simulation_cache_misses = 0
+        if client_concurrency is not None and client_concurrency < 1:
+            raise ValueError("client_concurrency must be positive")
+        self.client_concurrency = client_concurrency
+        self.dispatch_order: tuple[str, ...] = ()
+        self.startup_costs_ms: Mapping[str, float] = {}
+        self.cold_prepare_costs_ms: Mapping[str, float] = {}
 
     def clear_cache(self) -> None:
         """Release simulations and reset per-plan diagnostic counters."""
@@ -59,6 +68,51 @@ class GlobalPlacementSolver:
         self._simulation_cache.clear()
         self.simulation_cache_hits = 0
         self.simulation_cache_misses = 0
+
+    def _simulate_without_queue(self, assignment, counts, components, ordered):
+        """Use independent client cycles when every active worker has a lane."""
+        pending = deque(ordered)
+        releases = []
+        timelines = {}
+
+        def start_client(cid, worker_start):
+            switch, forward, upload, service, download, backward, roundtrip, exchange = components[cid]
+            startup = max(float(self.startup_costs_ms.get(cid, 0.)), 0.)
+            prepare = max(switch, float(self.cold_prepare_costs_ms.get(cid, 0.)))
+            first_arrival = worker_start + startup + prepare + forward + upload
+            arrival = first_arrival
+            # Keep the original per-batch arithmetic order. Multiplying a
+            # cycle duration changes floating-point ties in placement search.
+            for _ in range(counts[cid] - 1):
+                finish = arrival + service
+                completion = finish + download + backward + roundtrip
+                arrival = completion + forward + upload
+            finish = arrival + service
+            completion = finish + download + backward + roundtrip
+            completion += exchange
+            # A zero-duration final batch can release a worker at the same
+            # instant as its arrival. Preserve the event-level tie handling
+            # of the general simulator for that case and nonfinite sums.
+            if not math.isfinite(completion) or completion <= arrival:
+                return False
+            timelines[cid] = ClientTimeline(cid, assignment[cid].boundary,
+                first_arrival, first_arrival, finish, 0., completion, worker_start)
+            heapq.heappush(releases, (completion, cid))
+            return True
+
+        for _ in range(min(len(ordered), self.client_concurrency or len(ordered))):
+            if not start_client(pending.popleft(), 0.):
+                return None
+        while pending:
+            worker_finish, _ = heapq.heappop(releases)
+            if not start_client(pending.popleft(), worker_finish):
+                return None
+        # The original simulator inserts records at their first batch arrival.
+        # Retain that order, including the summation order of the objective.
+        timelines = dict(sorted(timelines.items(), key=lambda row: (row[1].arrival_ms, row[0])))
+        completions = [row.completion_ms for row in timelines.values()]
+        return PlacementSimulation(MappingProxyType(timelines),
+            max(completions, default=0.), sum(completions))
 
     def simulate(
         self,
@@ -93,7 +147,9 @@ class GlobalPlacementSolver:
             # Timings depend on component costs, not boundary names. Preserve
             # all six components and their arithmetic order; do not combine
             # forward/upload or backward/download and change rounding.
-            key = (self.server_concurrency, bool(use_upper), tuple(sorted(
+            key = (self.server_concurrency, self.client_concurrency, self.dispatch_order,
+                   tuple(sorted(self.startup_costs_ms.items())), tuple(sorted(self.cold_prepare_costs_ms.items())),
+                   bool(use_upper), tuple(sorted(
                 (cid, counts[cid], values) for cid, values in components.items()
             )))
             cached = self._simulation_cache.get(key)
@@ -111,25 +167,61 @@ class GlobalPlacementSolver:
                     sum_client_completion_ms=cached.sum_client_completion_ms,
                 )
         self.simulation_cache_misses += 1
-        lanes = [0.0] * self.server_concurrency
+        # The heap orders equal availability by lane index, matching the
+        # original scan without visiting every lane for every simulated batch.
+        lanes = [(0.0, index) for index in range(self.server_concurrency)]
         jobs: list[tuple[float, str, int, CandidateEstimate, float, float, float, float, float, float]] = []
-        for client_id, estimate in assignment.items():
+        worker_starts = {}
+        priority = {cid: i for i, cid in enumerate(self.dispatch_order)}
+        ordered = sorted(assignment, key=lambda cid: (priority.get(cid, len(priority)), str(cid)))
+        active_clients = min(len(ordered), self.client_concurrency or len(ordered))
+        if self.server_concurrency >= active_clients:
+            simulation = self._simulate_without_queue(assignment, counts, components, ordered)
+            if simulation is not None:
+                if self.simulation_cache_size:
+                    self._simulation_cache[key] = simulation
+                    if len(self._simulation_cache) > self.simulation_cache_size:
+                        self._simulation_cache.popitem(last=False)
+                return simulation
+        pending = deque(
+            ordered[self.client_concurrency:]
+            if self.client_concurrency is not None else []
+        )
+        initial_clients = ordered[:self.client_concurrency] if self.client_concurrency is not None else assignment
+        worker_completions: list[tuple[float, str]] = []
+
+        def enqueue(client_id, worker_start):
+            estimate = assignment[client_id]
             switch, forward, upload, service, download, backward, roundtrip, _exchange = components[str(client_id)]
-            jobs.append((switch + forward + upload, str(client_id), 0, estimate, forward, upload, service, download, backward, roundtrip))
+            worker_starts[str(client_id)] = worker_start
+            startup = max(float(self.startup_costs_ms.get(str(client_id), 0.)), 0.)
+            prepare = max(switch, float(self.cold_prepare_costs_ms.get(str(client_id), 0.)))
+            heapq.heappush(jobs, (worker_start + startup + prepare + forward + upload,
+                str(client_id), 0, estimate, forward, upload, service, download, backward, roundtrip))
+
+        for client_id in initial_clients:
+            enqueue(client_id, 0.)
         heapq.heapify(jobs)
 
         # Keep scalar accumulators during scheduling; constructing an immutable
         # timeline for every batch adds no information to the final result.
         records: dict[str, list[float]] = {}
-        while jobs:
+        while jobs or worker_completions:
+            # A client can finish downloading/backward/state exchange before
+            # an earlier suffix request's client releases its Worker. Process
+            # those releases alongside batch arrivals in chronological order.
+            if worker_completions and (
+                not jobs or worker_completions[0][0] <= jobs[0][0]
+            ):
+                worker_finish, _ = heapq.heappop(worker_completions)
+                if pending:
+                    enqueue(pending.popleft(), worker_finish)
+                continue
             arrival, client_id, batch_index, estimate, forward, upload, service, download, backward, roundtrip = heapq.heappop(jobs)
-            lane_index = (
-                0 if len(lanes) == 1
-                else min(range(len(lanes)), key=lambda index: (lanes[index], index))
-            )
-            start = max(arrival, lanes[lane_index])
+            available, lane_index = lanes[0]
+            start = max(arrival, available)
             finish = start + service
-            lanes[lane_index] = finish
+            heapq.heapreplace(lanes, (finish, lane_index))
             # Combined transport overhead is client think time; it is not
             # divided into unmeasured one-way network phases.
             completion = finish + download + backward + roundtrip
@@ -145,13 +237,12 @@ class GlobalPlacementSolver:
                     jobs,
                     (completion + forward + upload, client_id, batch_index + 1, estimate, forward, upload, service, download, backward, roundtrip),
                 )
-        # Round state transfer/codec costs and measured state preparation/export
-        # happen once. This additive approximation leaves server batch queues
-        # unchanged; it does not model the ordering of download and upload.
-        for cid, values in records.items():
-            values[4] += components[cid][7]
+            else:
+                records[client_id][4] += components[client_id][7]
+                if pending:
+                    heapq.heappush(worker_completions, (records[client_id][4], client_id))
         timelines = {
-            cid: ClientTimeline(cid, assignment[cid].boundary, *values)
+            cid: ClientTimeline(cid, assignment[cid].boundary, *values, worker_starts.get(cid, 0.))
             for cid, values in records.items()
         }
         completions = [item.completion_ms for item in timelines.values()]

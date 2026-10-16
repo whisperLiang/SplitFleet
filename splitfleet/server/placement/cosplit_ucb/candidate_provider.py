@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import copy
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import Any, Protocol, Sequence
+from typing import Any, Protocol
 
 from .types import SplitCandidateDescriptor
 
@@ -45,6 +46,7 @@ class TorchLensCandidateProvider:
         trace_batch_mode: str | None = None,
         kinds: tuple[str, ...] = ("before", "after"),
         require_trainable_prefix: bool = False,
+        resident_parameter_transport: bool = False,
     ) -> None:
         self.model = model
         self.sample_inputs = sample_inputs
@@ -55,6 +57,7 @@ class TorchLensCandidateProvider:
         self.trace_batch_mode = trace_batch_mode
         self.kinds = kinds
         self.require_trainable_prefix = bool(require_trainable_prefix)
+        self.resident_parameter_transport = bool(resident_parameter_transport)
         self.framework_backend = "unknown"
         self.runtime_backend = "torchlens_native"
         self._catalogs: dict[bool, tuple[SplitCandidateDescriptor, ...]] = {}
@@ -99,6 +102,12 @@ class TorchLensCandidateProvider:
             self.dynamic_batch = backend.dynamic_batch
             self.trace_batch_mode = backend.trace_batch_mode
         self.framework_backend = str(backend.framework_backend)
+        resident_transport = bool(training and self.resident_parameter_transport)
+        residency_schema = None
+        if resident_transport:
+            if self.framework_backend != "jax" or not hasattr(model, "params"):
+                raise TypeError("Resident parameter transport requires a declared JAX model")
+            residency_schema = adapter_for(model, call.args).state_manifest(model).schema_hash
         cross_stage_spans = ()
         if self.framework_backend == "torch":
             from torchlens.split._torch_compact import compact_torch_graph
@@ -120,10 +129,24 @@ class TorchLensCandidateProvider:
         pre_rejected: dict[str, str] = {}
         parameter_bytes = {}
         payload_sizes = {}
+        native_state_bytes = None
+        if training and self.framework_backend in {'tf', 'paddle'}:
+            native_adapter = adapter_for(model, call.args if call.args else call.kwargs)
+            native_state_bytes = dict(zip(native_adapter._state(model),
+                (value.nbytes for value in native_adapter.export_ndarrays(model)), strict=True))
         if self.framework_backend == "torch":
-            from splitfleet.autosplit.torchlens_candidate import ParameterCountIndex, ParameterByteIndex, payload_bytes_from_plan
-            from torchlens.split.errors import SplitRequestError, SplitUnsupportedError, SplitBoundaryError
+            from torchlens.split.errors import (
+                SplitBoundaryError,
+                SplitRequestError,
+                SplitUnsupportedError,
+            )
             from torchlens.split.planner import plan_split
+
+            from splitfleet.autosplit.torchlens_candidate import (
+                ParameterByteIndex,
+                ParameterCountIndex,
+                payload_bytes_from_plan,
+            )
 
             runtime = backend.runtime
             parameter_index = ParameterCountIndex.from_runtime(runtime)
@@ -203,6 +226,35 @@ class TorchLensCandidateProvider:
                 "error": None,
             }
             runtime_plan = backend.make_plan()
+            if native_state_bytes is not None:
+                from splitfleet.autosplit.state_ownership import state_ownership
+                from splitfleet.autosplit.torchlens_backend import TorchLensRuntimeHandle
+                handle = TorchLensRuntimeHandle(backend.model, backend.runtime, runtime_plan, backend)
+                try:
+                    ownership = state_ownership(handle, 'catalog', native_plan=backend._candidate_analysis.plan)
+                except (ValueError, RuntimeError) as error:
+                    rejected[candidate.boundary] = f'native_state_ownership: {error}'
+                    continue
+                owners = dict(zip(ownership['names'], ownership['owners'], strict=True))
+                trainable = {name for name, value in native_adapter._state(model).items()
+                             if (value.trainable if self.framework_backend == 'tf' else not value.stop_gradient)}
+                parameter_bytes[candidate.boundary] = tuple(
+                    sum(native_state_bytes[name] for name in trainable if owners[name] == stage)
+                    for stage in ('prefix', 'suffix'))
+                prefix_bytes, suffix_bytes = parameter_bytes[candidate.boundary]
+                if not suffix_bytes or (self.require_trainable_prefix and not prefix_bytes):
+                    rejected[candidate.boundary] = 'no_owned_trainable_suffix' if not suffix_bytes else 'no_owned_trainable_prefix'
+                    continue
+            if resident_transport:
+                try:
+                    candidate, sizes = self._resident_candidate(backend, candidate, runtime_plan, residency_schema)
+                except (ValueError, RuntimeError) as error:
+                    rejected[candidate.boundary] = f"resident_state_ownership: {error}"
+                    continue
+                payload_sizes[candidate.boundary] = sizes
+                parameter_bytes[candidate.boundary] = (
+                    candidate.descriptor['optimizer_prefix_parameter_bytes'],
+                    candidate.descriptor['optimizer_suffix_parameter_bytes'])
             accepted_candidates[candidate.boundary] = candidate
             validations[candidate.boundary] = dict(validation)
             total_nodes = max(
@@ -245,6 +297,9 @@ class TorchLensCandidateProvider:
                         "candidate_id": candidate.candidate_id,
                         "node_index": candidate.node_index,
                         "boundary_tensor_labels": tuple(candidate.boundary_tensor_labels),
+                        "resident_parameter_transport": candidate.descriptor.get("resident_parameter_transport"),
+                        "native_boundary_bytes": candidate.descriptor.get("native_boundary_bytes", candidate.estimated_payload_bytes),
+                        "resident_parameter_count": candidate.descriptor.get("resident_parameter_count", 0),
                         "prefix_trainable_parameter_count": (
                             int(candidate.descriptor["trainable_prefix_parameter_count"])
                             if training and self.require_trainable_prefix else None
@@ -289,6 +344,65 @@ class TorchLensCandidateProvider:
         }
         return catalog
 
+    def _resident_candidate(self, backend, candidate, runtime_plan, schema):
+        """Audit a native catalog plan without constructing executable segments.
+
+        Only the explicit functional transport omits owned suffix roots. The
+        complete native ABI and its shapes remain the hydration contract.
+        """
+        from splitfleet.autosplit.state_ownership import (
+            _jax_parameter_bindings,
+            _runtime_adapter,
+            state_ownership,
+        )
+        from splitfleet.autosplit.torchlens_backend import TorchLensRuntimeHandle
+        from splitfleet.autosplit.torchlens_candidate import payload_bytes_from_plan
+        from splitfleet.runtime.functional_sgd import (
+            resident_contract,
+            resident_parameter_bindings,
+        )
+
+        native_plan = backend._candidate_analysis.plan
+        handle = TorchLensRuntimeHandle(backend.model, backend.runtime, runtime_plan, backend)
+        ownership = state_ownership(handle, schema, native_plan=native_plan)
+        owners = dict(zip(ownership['names'], ownership['owners'], strict=True))
+        parameters = _jax_parameter_bindings(_runtime_adapter(handle), handle.model)
+        byte_counts = tuple(sum(value.nbytes for _, name, value in parameters.values() if owners[name] == stage)
+                            for stage in ('prefix', 'suffix'))
+        if not byte_counts[1] or (self.require_trainable_prefix and not byte_counts[0]):
+            raise ValueError('Resident native training requires owned parameters in both requested stages')
+        bindings = resident_parameter_bindings(handle, ownership, native_plan=native_plan)
+        low, high = self.dynamic_batch or (backend.runtime.traced_batch_size,) * 2
+        batches = set(range(low, high + 1)) if high - low < 64 else {low, high}
+        capture_batch = backend.runtime.traced_batch_size
+        batches.add(capture_batch)
+        sizes = {batch: payload_bytes_from_plan(backend.runtime, native_plan, batch_size=batch,
+                                               excluded_labels=bindings) for batch in sorted(batches)}
+        descriptor = dict(candidate.descriptor)
+        descriptor.update(resident_parameter_transport="splitfleet.functional-state.v1",
+                          native_boundary_bytes=candidate.estimated_payload_bytes,
+                          resident_parameter_count=len(bindings),
+                          optimizer_prefix_parameter_bytes=byte_counts[0],
+                          optimizer_suffix_parameter_bytes=byte_counts[1],
+                          resident_state_contract=resident_contract(handle, ownership, bindings))
+        return replace(candidate, estimated_payload_bytes=sizes[capture_batch], descriptor=descriptor), sizes
+
+    def _validate_resident_candidate(self, candidate, handle):
+        from splitfleet.autosplit.state_ownership import state_ownership
+        from splitfleet.backends.utils import adapter_for
+        from splitfleet.runtime.functional_sgd import (
+            resident_contract,
+            resident_parameter_bindings,
+        )
+
+        schema = adapter_for(handle.model, (handle.model.params,)).state_manifest(handle.model).schema_hash
+        ownership = state_ownership(handle, schema)
+        bindings = resident_parameter_bindings(handle, ownership)
+        if resident_contract(handle, ownership, bindings) != candidate.descriptor["resident_state_contract"]:
+            raise RuntimeError("Selected runtime differs from the audited resident parameter contract")
+        handle.plan.metadata["wire_boundary_bytes"] = candidate.estimated_payload_bytes
+        handle.plan.metadata["resident_parameter_transport"] = "splitfleet.functional-state.v1"
+
     def get_placement_plan(
         self,
         boundary: str,
@@ -319,10 +433,14 @@ class TorchLensCandidateProvider:
             handle = backend.make_handle()
             self._prepared_handles[cache_key] = handle
         from splitfleet.autosplit.planner import (
-            _build_placement, _candidate_satisfies_constraints, _rejection_reason,
+            _build_placement,
+            _candidate_satisfies_constraints,
+            _rejection_reason,
         )
 
         effective_constraints = constraints if key else replace(constraints, require_trainable_tail=False)
+        if candidate.descriptor.get("resident_parameter_transport"):
+            self._validate_resident_candidate(candidate, handle)
         validation = self._validations[key][requested]
         if not _candidate_satisfies_constraints(candidate, validation, effective_constraints):
             reason = _rejection_reason(candidate, validation, effective_constraints)
@@ -337,6 +455,10 @@ class TorchLensCandidateProvider:
             objective=objective,
             model_name=model_name or self.model.__class__.__name__,
         )
+
+    def release_prepared_handles(self):
+        """Release inactive executable views, retaining the complete admitted catalog."""
+        self._prepared_handles.clear()
 
 
 __all__ = ["CandidateProvider", "StaticCandidateProvider", "TorchLensCandidateProvider"]
