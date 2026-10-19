@@ -57,10 +57,10 @@ from splitfleet.common.constants import (
     AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY,
     AUTOSPLIT_TRAINABLE_CONFIG_KEY,
     CLIENT_ID_CONFIG_KEY,
-    COSPLIT_CALIBRATION_HASH_HANDSHAKE_KEY,
-    COSPLIT_CALIBRATION_MODEL_HASH_CONFIG_KEY,
-    COSPLIT_CALIBRATION_PARAMETERS_CONFIG_KEY,
-    COSPLIT_CALIBRATION_PARAMETERS_REQUIRED_KEY,
+    PLACEMENT_CALIBRATION_HASH_HANDSHAKE_KEY,
+    PLACEMENT_CALIBRATION_MODEL_HASH_CONFIG_KEY,
+    PLACEMENT_CALIBRATION_PARAMETERS_CONFIG_KEY,
+    PLACEMENT_CALIBRATION_PARAMETERS_REQUIRED_KEY,
     TRANSPORT_CLIENT_SEND_NS_METADATA_KEY,
     TRANSPORT_SERVER_ELAPSED_NS_METADATA_KEY,
     TRANSPORT_SERVER_RECEIVE_NS_METADATA_KEY,
@@ -223,9 +223,11 @@ class _RoundTelemetry:
     _server_loss_samples_ms: list[float] = field(default_factory=list, repr=False)
     _server_backward_samples_ms: list[float] = field(default_factory=list, repr=False)
     _server_service_samples_ms: list[float] = field(default_factory=list, repr=False)
+    _server_resource_service_samples_ms: list[float] = field(default_factory=list, repr=False)
     _network_upload_samples_ms: list[float] = field(default_factory=list, repr=False)
     _network_download_samples_ms: list[float] = field(default_factory=list, repr=False)
     _network_roundtrip_samples_ms: list[float] = field(default_factory=list, repr=False)
+    _server_load_samples: dict[str, list[float]] = field(default_factory=dict, repr=False)
 
     def record_batch(self, batch_size: int) -> None:
         self.num_batches += 1
@@ -267,6 +269,9 @@ class _RoundTelemetry:
             "min_batch_size": self.min_batch_size,
             "max_batch_size": self.max_batch_size,
         }
+        for name, samples in self._server_load_samples.items():
+            if samples:
+                metrics[f"server_load_{name}"] = float(fmean(samples))
         for name in (
             "client_forward",
             "client_backward",
@@ -274,6 +279,7 @@ class _RoundTelemetry:
             "server_loss",
             "server_backward",
             "server_service",
+            "server_resource_service",
             "network_upload",
             "network_download",
             "network_roundtrip",
@@ -356,6 +362,143 @@ class AutoSplitSplitLearningClient(NumPyClient):
         self._context_store = PrefixContextStore()
         self._round_config: dict[str, Any] = {}
 
+    # These methods are the public lifecycle boundary used by ClientApp
+    # adapters and worker reuse.  Runtime caches, TorchLens metadata and the
+    # prefix context store remain implementation details of this executor.
+    def bind_execution_context(
+        self,
+        *,
+        train_data,
+        sample_inputs,
+        sample_kwargs=None,
+        sample_num_examples=None,
+        calibration_inputs=None,
+        calibration_targets=None,
+        evaluate_data=None,
+        optimizer_fn=None,
+    ) -> None:
+        """Bind one logical task to this reusable native executor."""
+        if len(self._context_store):
+            raise RuntimeError("Cannot bind a new task with an unconsumed prefix context")
+        self.server_model_proxy = None
+        self.train_data = train_data
+        self.evaluate_data = evaluate_data if evaluate_data is not None else train_data
+        self.sample_inputs = sample_inputs
+        self.sample_kwargs = dict(sample_kwargs or {})
+        if sample_num_examples is not None:
+            self._sample_num_examples = int(sample_num_examples)
+        self._calibration_inputs = calibration_inputs
+        self._calibration_targets = calibration_targets
+        self.optimizer_fn = optimizer_fn
+        self._round_config = {}
+        self.online_calibration_receipt = None
+        self._quality_rpc_spans = []
+        self._quality_native_execution_intervals = []
+        self._call_tail = type(self)._call_tail.__get__(self, type(self))
+        self._clear_runtime_sample_bindings()
+        handles = [row.handle for row in self._runtime_cache.values()]
+        handles.extend(self._calibration_runtime_cache.values())
+        if self._prewarmed_runtime is not None:
+            handles.append(self._prewarmed_runtime)
+        for handle in handles:
+            handle.backend.trace_sample_input = self.sample_inputs
+            handle.backend.trace_sample_kwargs = self.sample_kwargs
+            handle.plan.metadata["_example_inputs"] = self.sample_inputs
+            handle.plan.metadata["_example_kwargs"] = self.sample_kwargs
+
+    def retire_execution(self) -> None:
+        """Finish a task while retaining only reusable native graph capacity."""
+        if len(self._context_store):
+            raise RuntimeError("A completed execution retains an unconsumed prefix context")
+        self.server_model_proxy = None
+        self._owned_functional_optimizer = None
+        self.online_calibration_receipt = None
+        self._round_config = {}
+        self.train_data = self.evaluate_data = ()
+        self.sample_inputs, self.sample_kwargs = (), {}
+        self._sample_num_examples = None
+        self._calibration_inputs = self._calibration_targets = None
+        self._quality_rpc_spans = []
+        self._quality_native_execution_intervals = []
+        self._call_tail = type(self)._call_tail.__get__(self, type(self))
+        self._clear_runtime_sample_bindings()
+        self._clear_model_gradients()
+
+    def close_execution(self) -> None:
+        """Release all graph/runtime resources owned by this executor."""
+        self.retire_execution()
+        self._runtime_cache.clear()
+        self._calibration_runtime_cache.clear()
+        self._calibration_runtime_source = None
+        self._prewarmed_runtime = None
+        self.autosplit_session.discard_runtime_handles()
+
+    # Short lifecycle aliases for integrations that treat the executor as a
+    # reusable resource rather than a Flower NumPyClient.
+    reset_runtime = retire_execution
+    close = close_execution
+
+    def set_server_model_proxy(self, proxy) -> None:
+        self.server_model_proxy = proxy
+
+    def discard_round_context(self, round_id: int | None = None) -> None:
+        """Discard uncommitted prefix activations after cancellation."""
+        if round_id is None:
+            self._context_store.clear()
+        else:
+            self._context_store.discard_round(int(round_id))
+
+    @property
+    def pending_context_count(self) -> int:
+        return len(self._context_store)
+
+    @property
+    def current_round_id(self) -> int:
+        return int(self._round_config.get(AUTOSPLIT_MODEL_VERSION_CONFIG_KEY, 0))
+
+    def quality_measurements(self) -> tuple[list[float], list[tuple[int, int]]]:
+        return list(getattr(self, "_quality_rpc_spans", ())), list(
+            getattr(self, "_quality_native_execution_intervals", ())
+        )
+
+    def enable_quality_measurement(self) -> None:
+        """Record real suffix RPC and native execution intervals for evidence."""
+        original_tail_call = type(self)._call_tail.__get__(self, type(self))
+
+        def measured_tail_call(**kwargs):
+            began = time.perf_counter()
+            try:
+                return original_tail_call(**kwargs)
+            finally:
+                self._quality_rpc_spans.append(time.perf_counter() - began)
+
+        self._quality_rpc_spans = []
+        self._quality_native_execution_intervals = []
+        self._call_tail = measured_tail_call
+
+    def set_previous_plan_hint(self, plan_id: str) -> None:
+        """Tell round preparation which prior deployment should be reused."""
+        self._round_config["autosplit_plan_id"] = str(plan_id)
+
+    def _clear_runtime_sample_bindings(self) -> None:
+        handles = [row.handle for row in self._runtime_cache.values()]
+        handles.extend(self._calibration_runtime_cache.values())
+        if self._prewarmed_runtime is not None:
+            handles.append(self._prewarmed_runtime)
+        for handle in handles:
+            handle.backend.trace_sample_input = ()
+            handle.backend.trace_sample_kwargs = {}
+            handle.plan.metadata["_example_inputs"] = ()
+            handle.plan.metadata["_example_kwargs"] = {}
+
+    def _clear_model_gradients(self) -> None:
+        if self.backend_adapter.backend_name == "torch":
+            for parameter in self.model.parameters():
+                parameter.grad = None
+        elif self.backend_adapter.backend_name == "tinygrad":
+            for parameter in self.backend_adapter._state(self.model).values():
+                parameter.grad = None
+
     def prewarm_runtime(
         self,
         *,
@@ -395,12 +538,12 @@ class AutoSplitSplitLearningClient(NumPyClient):
 
     def calibrate_runtime(self, targets, *, boundaries) -> dict:
         """Measure the captured model, restoring state after temporary calibration."""
-        from splitfleet.server.placement.cosplit_ucb.calibration import calibrate_split
+        from splitfleet.server.placement.greedy.calibration import calibrate_split
 
         if self._prewarmed_runtime is None:
             raise ValueError("Prepare the runtime before measuring calibration anchors")
         if self.task is None:
-            raise ValueError("CoSplit-UCB calibration requires a task loss")
+            raise ValueError("Greedy calibration requires a task loss")
         if self.optimizer_fn is None:
             raise ValueError("training cost calibration requires an optimizer factory")
         targets = move_value(targets, self.backend_adapter, self.device)
@@ -437,29 +580,33 @@ class AutoSplitSplitLearningClient(NumPyClient):
         return self.online_calibration_receipt
 
     def get_properties(self, config):
-        if "cosplit_probe_payload" in config:
-            payload = config["cosplit_probe_payload"]
+        from splitfleet.common.network_probe import PROBE_CONFIG_KEY, PROBE_RESULT_KEY, measure_network
+        if PROBE_CONFIG_KEY in config:
+            receipt = measure_network(self._require_server_model_proxy(), round_id=config[PROBE_CONFIG_KEY])
+            return {PROBE_RESULT_KEY: json.dumps(receipt, allow_nan=False)}
+        if "splitfleet_probe_payload" in config:
+            payload = config["splitfleet_probe_payload"]
             if not isinstance(payload, bytes) or not 1 <= len(payload) <= 2097152:
-                raise ValueError("Invalid CoSplit transport probe")
-            reply_size = config.get("cosplit_probe_reply_bytes", len(payload))
+                raise ValueError("Invalid Greedy transport probe")
+            reply_size = config.get("splitfleet_probe_reply_bytes", len(payload))
             if type(reply_size) is not int or not 1 <= reply_size <= 2097152:
-                raise ValueError("Invalid CoSplit transport reply size")
+                raise ValueError("Invalid Greedy transport reply size")
             # This echo changes no model, optimizer or random generator state.
-            return {"cosplit_probe_payload": (payload if reply_size == len(payload) else bytes(reply_size))}
-        cuts = config.get("cosplit_calibration_boundaries")
+            return {"splitfleet_probe_payload": (payload if reply_size == len(payload) else bytes(reply_size))}
+        cuts = config.get("splitfleet_calibration_boundaries")
         if cuts:
             from flwr.common import parameters_to_ndarrays, serde
             from flwr.proto.transport_pb2 import Parameters
 
             from splitfleet.common.model_state import model_state_hash
 
-            payload = config.get(COSPLIT_CALIBRATION_PARAMETERS_CONFIG_KEY)
-            expected_hash = config.get(COSPLIT_CALIBRATION_MODEL_HASH_CONFIG_KEY)
+            payload = config.get(PLACEMENT_CALIBRATION_PARAMETERS_CONFIG_KEY)
+            expected_hash = config.get(PLACEMENT_CALIBRATION_MODEL_HASH_CONFIG_KEY)
             if expected_hash is not None and payload is None:
                 if model_state_hash(self.model, self.backend_adapter) != expected_hash:
                     # No trace, temporary SGD or state mutation before the
                     # coordinator supplies the actual global model.
-                    return {COSPLIT_CALIBRATION_PARAMETERS_REQUIRED_KEY: True}
+                    return {PLACEMENT_CALIBRATION_PARAMETERS_REQUIRED_KEY: True}
             if payload is not None:
                 parameters = serde.parameters_from_proto(Parameters.FromString(payload))
                 self.backend_adapter.load_ndarrays(self.model, parameters_to_ndarrays(parameters))
@@ -482,15 +629,15 @@ class AutoSplitSplitLearningClient(NumPyClient):
             receipt = self.online_calibration_receipt
             current_hash = model_state_hash(self.model, self.backend_adapter)
             if (receipt is None or receipt["model_hash_after"] != current_hash
-                    or receipt.get("schema") != "splitfleet.cosplit-calibration"
+                    or receipt.get("schema") != "splitfleet.training-calibration"
                     or {row["boundary"] for row in receipt["records"]} != set(boundaries)
                     or any(row["graph_signature"] != self._prewarmed_runtime.plan.graph_signature
                            for row in receipt["records"])):
                 if self._calibration_targets is None:
-                    raise ValueError("Provide a representative TaskBatch for CoSplit-UCB calibration")
+                    raise ValueError("Provide a representative TaskBatch for Greedy calibration")
                 self.calibrate_runtime(self._calibration_targets, boundaries=boundaries)
         properties = {
-            COSPLIT_CALIBRATION_HASH_HANDSHAKE_KEY: self.backend_adapter.backend_name in {'torch', 'tf', 'paddle', 'jax'},
+            PLACEMENT_CALIBRATION_HASH_HANDSHAKE_KEY: self.backend_adapter.backend_name in {'torch', 'tf', 'paddle', 'jax'},
             "logical_client_id": f"{platform.node()}:{self.device}:{id(self)}",
             "framework_backend": self.backend_adapter.backend_name,
             "runtime_backend": "torchlens_native",
@@ -999,6 +1146,20 @@ class AutoSplitSplitLearningClient(NumPyClient):
         if telemetry is not None:
             rpc_elapsed_sec = time.perf_counter() - started
             telemetry.suffix_server_queue_sec += float(response.metadata.get("suffix_server_queue_sec", 0.))
+            try:
+                server_span_ms = int(response.metadata[TRANSPORT_SERVER_ELAPSED_NS_METADATA_KEY]) / 1e6
+                resource_ms = server_span_ms - float(response.metadata.get("suffix_server_queue_sec", 0.)) * 1000.
+            except (KeyError, TypeError, ValueError):
+                resource_ms = None
+            if resource_ms is not None and math.isfinite(resource_ms) and resource_ms >= 0:
+                telemetry.record_component("server_resource_service", resource_ms)
+            from splitfleet.server.telemetry import SERVER_LOAD_FIELDS
+            load = json.loads(response.metadata.get("splitfleet_server_load", "{}"))
+            for name in SERVER_LOAD_FIELDS:
+                if name in load:
+                    value = float(load[name])
+                    if math.isfinite(value) and value >= 0:
+                        telemetry._server_load_samples.setdefault(name, []).append(value)
             telemetry.tail_wait_sec += rpc_elapsed_sec
             telemetry.record_component("network_roundtrip", _transport_roundtrip_ms(
                 response.metadata, rpc_elapsed_ms=rpc_elapsed_sec * 1000.0))

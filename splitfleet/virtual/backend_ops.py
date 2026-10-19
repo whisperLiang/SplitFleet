@@ -27,7 +27,8 @@ from splitfleet.backends.utils import adapter_for, bind_model_inputs, move_value
 def isolate_unused_tensorflow():
     """Keep Flower's unused optional TensorFlow out of a native worker.
 
-    Flower 1.29 imports TensorFlow for its optional GPU-growth helper.  Its
+    Flower's Ray simulation backend imports TensorFlow for its optional
+    GPU-growth helper.  Its
     exported LLVM symbols conflict with Paddle 3.3's CINN library at load time.
     A process dedicated to another backend does not use that helper; Python's explicit
     absent-module sentinel lets Flower take its documented optional-import

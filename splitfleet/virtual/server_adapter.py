@@ -20,6 +20,7 @@ from flwr.server.client_proxy import ClientProxy
 
 from splitfleet.server.server import Server
 from splitfleet.server.strategy import AutoSplitStrategy
+from splitfleet.common.network_probe import PROBE_CONFIG_KEY
 
 from .resources import peak_rss_mb
 from .backend_ops import FrameworkOps
@@ -33,29 +34,23 @@ class VirtualClientFailure(RuntimeError):
 
 
 class RuntimeConditions:
-    """Applied resource/network conditions, separate from calibrated timing priors."""
+    """Server runtime conditions; network context comes from active probes."""
 
     def __init__(self, strategy):
         self.strategy = strategy
         self.round_id = 1
 
     def client_context(self, cid):
-        pid = self.strategy.client_properties[cid]["virtual_partition_id"]
-        network = self.strategy.virtual_config.network(pid, self.round_id)
-        return {
-            "uplink_mbps": network.upload_mbps,
-            "downlink_mbps": network.download_mbps,
-            "rtt_ms": network.rtt_ms if network.constrained else None,
-            "network_constraint_source": "emulated"
-            if network.constrained
-            else "measured",
-        }
+        return {}
 
     def server_context(self):
         servicer = self.strategy.service.servicer
         return {
             "active_jobs": servicer.active_executions,
             "queue_length": servicer.queued_executions,
+            "execution_concurrency": servicer.concurrency,
+            "effective_worker_capacity": self.strategy.virtual_config.resources.effective_worker_capacity,
+            "effective_suffix_slots": self.strategy.virtual_config.resources.effective_suffix_slots,
         }
 
 
@@ -128,6 +123,10 @@ class VirtualDispatchProxy(ClientProxy):
         self.state_store, self.service = state_store, service
 
     def get_properties(self, ins, timeout=None, group_id=None):
+        if PROBE_CONFIG_KEY in ins.config:
+            ins = GetPropertiesIns(config={**ins.config,
+                "virtual_suffix_address": self.service.address,
+                "virtual_network_probe_token": self.service.servicer.network_probe_tokens[self.cid]})
         return self.delegate.get_properties(ins, timeout, group_id)
 
     def get_parameters(self, ins, timeout=None, group_id=None):
@@ -196,13 +195,30 @@ class VirtualStrategy(AutoSplitStrategy):
         self.identity_lookup_sec = 0.0
         self.observed_startup_ms = {}
         self.observed_prepare_ms = {}
+        self.actual_task_start_order = {}
         super().__init__(**kwargs)
 
     def _identify_clients(self, client_manager):
         available = client_manager.all()
-        if len(available) != self.virtual_config.virtual_clients.total:
+        # Flower's modern Grid adapter updates the compatibility ClientManager
+        # from a background thread.  The first `all()` call can therefore see
+        # only the first actor batch even though the Simulation Runtime has
+        # already declared the full logical population.  Wait for registration
+        # to settle; this does not create workers or change Ray capacity.
+        expected = self.virtual_config.virtual_clients.total
+        registration_timeout = getattr(
+            self.virtual_config.virtual_clients, "training_timeout_sec", 30.0
+        )
+        deadline = time.monotonic() + max(
+            5.0, min(30.0, registration_timeout)
+        )
+        while len(available) < expected and time.monotonic() < deadline:
+            time.sleep(0.05)
+            available = client_manager.all()
+        if len(available) != expected:
             raise RuntimeError(
-                "Flower registered a different logical population than declared"
+                "Flower registered a different logical population than declared: "
+                f"expected {expected}, observed {len(available)}"
             )
         pending = [(cid, proxy) for cid, proxy in available.items() if str(cid) not in self.client_properties]
 
@@ -213,7 +229,7 @@ class VirtualStrategy(AutoSplitStrategy):
             return str(cid), dict(result.properties)
 
         started = time.perf_counter()
-        workers = min(len(pending), self.virtual_config.resources.max_concurrent_clients)
+        workers = min(len(pending), self.virtual_config.resources.effective_worker_capacity)
         if workers <= 1:
             results = [identify(entry) for entry in pending]
         else:
@@ -280,16 +296,12 @@ class VirtualStrategy(AutoSplitStrategy):
             "not_selected": sorted(set(online) - set(selected)),
         }
         if self.placement_policy is not None:
-            self.placement_policy.solver.client_concurrency = (
-                self.virtual_config.resources.max_concurrent_clients
+            self.placement_policy.client_concurrency = (
+                self.virtual_config.resources.effective_worker_capacity
             )
-            self.placement_policy.solver.dispatch_order = tuple(selected)
-            self.placement_policy.solver.startup_costs_ms = dict(
-                self.observed_startup_ms
-            )
-            self.placement_policy.solver.cold_prepare_costs_ms = dict(
-                self.observed_prepare_ms
-            )
+            self.placement_policy.dispatch_order = tuple(selected)
+            if getattr(self.placement_policy, "uses_active_network_probes", False):
+                self.service.servicer.prepare_network_probes(selected, server_round)
         return [
             VirtualDispatchProxy(
                 available[cid],
@@ -322,7 +334,10 @@ class VirtualStrategy(AutoSplitStrategy):
                 "not_selected": [],
             }
             return []
-        instructions = super().configure_fit(server_round, parameters, client_manager)
+        try:
+            instructions = super().configure_fit(server_round, parameters, client_manager)
+        finally:
+            self.service.servicer.network_probe_tokens.clear()
         self.service.servicer.prepare_round(
             [proxy.cid for proxy, _ in instructions], server_round
         )
@@ -373,11 +388,23 @@ class VirtualStrategy(AutoSplitStrategy):
 
     def configure_server_fit(self, server_round, parameters, cids):
         configs = super().configure_server_fit(server_round, parameters, cids)
-        for config in configs:
-            config.config["virtual_partition_id"] = self.client_properties[config.sid][
-                "virtual_partition_id"
-            ]
+        self._configure_suffix_rng(configs, server_round)
         return configs
+
+    def configure_server_evaluate(self, server_round, parameters, cids):
+        configs = super().configure_server_evaluate(server_round, parameters, cids)
+        self._configure_suffix_rng(configs, server_round)
+        return configs
+
+    def _configure_suffix_rng(self, configs, server_round):
+        from splitfleet.common.constants import AUTOSPLIT_REPLICA_RNG_SEED_CONFIG_KEY
+
+        for config in configs:
+            partition = self.client_properties[config.sid]["virtual_partition_id"]
+            config.config["virtual_partition_id"] = partition
+            config.config[AUTOSPLIT_REPLICA_RNG_SEED_CONFIG_KEY] = client_seed(
+                self.virtual_config.seed, partition, f"suffix:{server_round}"
+            )
 
     def aggregate_fit(self, server_round, results, failures):
         started = time.perf_counter()
@@ -409,6 +436,23 @@ class VirtualStrategy(AutoSplitStrategy):
                     "metrics": dict(result.metrics),
                 },
             )
+        domains = {
+            (result.metrics.get("worker_boot_id"), result.metrics.get("worker_host"))
+            for _, result in results
+            if result.metrics.get("worker_task_start_ns") is not None
+        }
+        self.actual_task_start_order[int(server_round)] = (
+            [
+                str(proxy.cid)
+                for proxy, result in sorted(
+                    results,
+                    key=lambda item: int(item[1].metrics.get("worker_task_start_ns", 0)),
+                )
+                if result.metrics.get("worker_task_start_ns") is not None
+            ]
+            if len(domains) == 1 and domains != {(None, None)}
+            else []
+        )
         for failure in failures:
             cid = self._failure_cid(failure)
             props = self.client_properties.get(cid, {})
@@ -461,13 +505,20 @@ class VirtualStrategy(AutoSplitStrategy):
         )
         policy = self.placement_policy
         if policy is not None:
+            diagnostics = dict(policy.round_diagnostics[server_round])
+            diagnostics["predicted_arrival_order"] = list(
+                getattr(policy, "dispatch_order", ())
+            )
+            diagnostics["actual_task_start_order"] = list(
+                self.actual_task_start_order.get(int(server_round), ())
+            )
             self.evidence.append(
                 "placement_trace.jsonl",
                 {
                     "round_id": server_round,
-                    "source": "estimated",
-                    "policy": getattr(policy, "name", "cosplit_ucb"),
-                    "diagnostics": policy.round_diagnostics[server_round],
+                    "source": "measured",
+                    "policy": getattr(policy, "name", "greedy"),
+                    "diagnostics": diagnostics,
                 },
             )
         else:
@@ -525,15 +576,12 @@ class VirtualServer(Server):
             service = self.strategy.service
             concurrency = int(
                 config.resources.server_concurrency_by_round.get(
-                    server_round, config.resources.server_concurrency
+                    server_round, config.resources.effective_server_concurrency
                 )
             )
 
             async def change_capacity():
-                import asyncio
-
-                service.servicer._execution_slots = asyncio.Semaphore(concurrency)
-                service.servicer.concurrency = concurrency
+                service.servicer.set_execution_concurrency(concurrency)
 
             import asyncio
 
@@ -542,7 +590,7 @@ class VirtualServer(Server):
             )
             policy = self.strategy.placement_policy
             if policy is not None:
-                policy.solver.server_concurrency = concurrency
+                policy.execution_concurrency = concurrency
                 policy.runtime_context_provider.round_id = server_round
             timeout = self.strategy.spec.round_timeout_sec or timeout
             result = super().fit_round(server_round, timeout)
@@ -580,6 +628,13 @@ class VirtualServer(Server):
                         self.strategy.client_properties[cid]["virtual_partition_id"]
                         for cid in selected["selected"]
                     ],
+                    "predicted_arrival_order": list(
+                        getattr(self.strategy.placement_policy, "dispatch_order", ())
+                        if self.strategy.placement_policy is not None else selected["selected"]
+                    ),
+                    "actual_task_start_order": list(
+                        self.strategy.actual_task_start_order.get(server_round, ())
+                    ),
                     "round_wall_sec": time.perf_counter() - started,
                     "train_loss": loss,
                     "round_wall_scope": "fit configuration/placement/calibration, training and aggregation; evaluation reported separately",
@@ -591,9 +646,15 @@ class VirtualServer(Server):
                     ),
                     "model_version": server_round,
                     "model_hash": model_hash,
-                    "worker_limit": config.resources.max_concurrent_clients,
+                    "worker_limit": config.resources.effective_worker_capacity,
+                    "worker_target_count": config.resources.worker_target_count,
                     "server_concurrency": concurrency,
-                    "suffix_model_count": self.server_model_manager._delegate.peak_client_models,
+                    # ``suffix_model_count`` is the logical round population;
+                    # native instances are separately bounded by the leased
+                    # manager's measured resident peak.
+                    "suffix_model_count": self.server_model_manager._delegate.logical_model_count,
+                    "resident_suffix_model_peak": self.server_model_manager._delegate.peak_client_models,
+                    "logical_suffix_model_count": config.resources.logical_suffix_models,
                     "resident_suffix_limit": config.resources.resident_suffix_capacity,
                     "worker_processes_observed": len(
                         {(m["worker_host"], m["worker_pid"]) for m in metrics}

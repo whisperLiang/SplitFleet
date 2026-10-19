@@ -8,10 +8,13 @@ import numpy as np
 import pytest
 
 from splitfleet.backends.utils import native_device_scope, paddle_tensor_device
+from tests.integration.test_torchlens_optional_frameworks import _run_isolated
 
 
 @pytest.mark.parametrize('device', ['cpu', 'cuda:0', 'cuda:1'])
-def test_same_device_training_overlaps_and_matches_serial_native_sgd(device):
+def test_same_device_training_overlaps_and_matches_serial_native_sgd(request, device):
+    if _run_isolated(request, python=os.environ.get("SPLITFLEET_PADDLE_PYTHON")):
+        return
     paddle = pytest.importorskip('paddle')
     if device.startswith('cuda') and (
         not paddle.is_compiled_with_cuda() or paddle.device.cuda.device_count() <= int(device[-1])
@@ -59,7 +62,9 @@ def test_same_device_training_overlaps_and_matches_serial_native_sgd(device):
     assert paddle.device.get_device() == 'cpu'
 
 
-def test_other_device_waits_for_current_operations_and_restores_default():
+def test_other_device_waits_for_current_operations_and_restores_default(request):
+    if _run_isolated(request, python=os.environ.get("SPLITFLEET_PADDLE_PYTHON")):
+        return
     paddle = pytest.importorskip('paddle')
     if not paddle.is_compiled_with_cuda() or paddle.device.cuda.device_count() < 2:
         pytest.skip('Two GPUs are required')
@@ -93,7 +98,9 @@ def test_other_device_waits_for_current_operations_and_restores_default():
 @pytest.mark.integration
 @pytest.mark.skipif(os.environ.get('SPLITFLEET_FULL_PADDLE_CONTROL') != '1',
                     reason='Enable the dedicated full ResNet50 native control')
-def test_parallel_resnet_suffixes_match_complete_native_gradients_and_state():
+def test_parallel_resnet_suffixes_match_complete_native_gradients_and_state(request):
+    if _run_isolated(request, python=os.environ.get("SPLITFLEET_PADDLE_PYTHON")):
+        return
     paddle = pytest.importorskip('paddle')
     if not paddle.is_compiled_with_cuda() or paddle.device.cuda.device_count() < 2:
         pytest.skip('Two GPUs are required')

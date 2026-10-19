@@ -45,6 +45,13 @@ class PrefixContextStore:
                 del self._contexts[key]
             return len(keys)
 
+    def clear(self) -> int:
+        """Discard every unconsumed context during task cancellation/close."""
+        with self._lock:
+            count = len(self._contexts)
+            self._contexts.clear()
+            return count
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._contexts)

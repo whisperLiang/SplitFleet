@@ -65,7 +65,7 @@ class PacedProxy:
     def receipt(self):
         return {"schema": "splitfleet.measured-tcp-pacing.v1", "physical_transfer": True,
                 "counter_domain": "forwarded TCP application stream including gRPC framing; excludes SSH/TCP/IP/NIC overhead",
-                "direction_rate_sharing": "one aggregate pacer per direction and physical host",
+                "direction_rate_sharing": "one aggregate pacer per direction across all connections to this proxy",
                 "started_monotonic_ns": self.started, "checked_monotonic_ns": time.perf_counter_ns(),
                 "connections": self.connections, "round_counters": self.counts, "errors": self.errors}
 
@@ -220,9 +220,11 @@ def main():
     parser.add_argument("--target", required=True)
     parser.add_argument("--control", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--pipeline", action="store_true", help="Pipeline propagation delay without a per-block RTT penalty")
     args = parser.parse_args()
     address = lambda value: (value.rsplit(":", 1)[0], int(value.rsplit(":", 1)[1]))
-    asyncio.run(PacedProxy(target=address(args.target), control=args.control, output=args.output).run(address(args.bind)))
+    control = (lambda: json.loads(args.control.read_text())) if args.pipeline else args.control
+    asyncio.run(PacedProxy(target=address(args.target), control=control, output=args.output).run(address(args.bind)))
 
 
 if __name__ == "__main__":

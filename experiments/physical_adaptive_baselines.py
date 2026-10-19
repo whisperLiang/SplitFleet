@@ -1,22 +1,12 @@
-"""Actual-device comparison of four split-placement controllers."""
+"""Greedy (SplitFleet) and L2S physical controls using one shared runtime."""
 
-from __future__ import annotations
-
-import argparse
-from dataclasses import replace
 from pathlib import Path
 import time
+from splitfleet.server.placement.greedy import PlacementFeedback
+from splitfleet.server.placement.greedy.rpc_timing import state_exchange_duration
+from experiments.physical_multitask import RecordingSplit
 
-from experiments.baselines.adaptive_reference import AdaptiveReference
-from experiments.physical_multitask import _make_placement_policy, run_client, run_server
-from experiments.physical_placement import MeasuredRecordingSplit, PhysicalIndependentUCB
-from splitfleet.server.placement.cosplit_ucb import CoSplitUCBPlacementPolicy
-from splitfleet.server.placement.cosplit_ucb.types import PlacementFeedback
-from splitfleet.server.placement.cosplit_ucb.rpc_timing import state_exchange_duration
-
-
-POLICIES = ("CoSplit-UCB", "Independent-UCB", "Greedy", "L2S")
-
+POLICIES = ("Greedy", "L2S")
 
 def reference_feedback(round_id, results):
     """Retain actual whole-fit RPC costs, including model-state transport."""
@@ -34,6 +24,9 @@ def reference_feedback(round_id, results):
             switch_ms=float(metrics.get('switch_ms', 0)),
             state_exchange_ms=state_exchange_duration(metrics),
             completion_ms=float(metrics['coordinator_fit_rpc_ms']),
+            completion_scope="coordinator_fit_rpc",
+            server_load=({key.removeprefix("server_load_"): float(value)
+                          for key, value in metrics.items() if key.startswith("server_load_")} or None),
             num_examples=response.num_examples, num_batches=int(metrics['num_batches'])))
     return observations
 
@@ -47,35 +40,16 @@ def initial_admitted_boundary(policy, boundary):
         abs(candidate.graph_position_ratio - .5), candidate.boundary)).boundary
 
 
-class AdaptiveRecordingSplit(MeasuredRecordingSplit):
+class AdaptiveRecordingSplit(RecordingSplit):
     def __init__(self, *, experiment_args, **kwargs):
-        kwargs['boundary'] = initial_admitted_boundary(kwargs['placement_policy'], kwargs['boundary'])
-        super().__init__(experiment_args=experiment_args, **kwargs)
-
-    def configure_fit(self, server_round, parameters, client_manager):
-        instructions = super().configure_fit(server_round, parameters, client_manager)
-        return [(CoordinatorObservedFitProxy(client), instruction) for client, instruction in instructions]
-
-    def _update_placement_policy_after_fit(self, server_round, results, failures):
-        if not isinstance(self.placement_policy, AdaptiveReference):
-            return super()._update_placement_policy_after_fit(server_round, results, failures)
-        if failures:
-            raise RuntimeError("Reference physical arm has failed fits; preserve and stop")
-        self.placement_policy.observe_round(round_id=server_round,
-            feedback=reference_feedback(server_round, results))
+        kwargs["boundary"] = initial_admitted_boundary(kwargs["placement_policy"], kwargs["boundary"])
+        self.experiment_args = experiment_args
+        super().__init__(**kwargs)
 
     def experiment_result(self):
-        result = super().experiment_result()
-        policy = getattr(self, "placement_policy", None)
-        # The base strategy may use a private attribute in some versions.
-        if policy is None:
-            policy = getattr(self, "_placement_policy", None)
-        if isinstance(policy, AdaptiveReference):
-            result["reference_controller"] = {"algorithm": policy.algorithm,
-                "decision_receipts": policy.decision_receipts,
-                "decision_granularity": "federated_round", "fully_local_escape_available": False,
-                "gradient_volume_features": "captured differentiable frontier proxy; actual buffers logged separately"}
-        return result
+        return {"policy": self.placement_policy.algorithm,
+                "reference_controller": {"decision_receipts": self.placement_policy.decision_receipts},
+                "shared_sfl_pipeline": True}
 
 
 class CoordinatorObservedFitProxy:
@@ -97,50 +71,19 @@ class CoordinatorObservedFitProxy:
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("role", choices=("server", "client"))
-    parser.add_argument("--bundle", type=Path, required=True)
-    parser.add_argument("--device", required=True)
-    parser.add_argument("--policy", choices=POLICIES, required=True)
-    parser.add_argument("--boundary", default="50%")
-    parser.add_argument("--optimizer", choices=("sgd", "adam"), default="sgd")
-    parser.add_argument("--learning-rate", type=float, default=.005)
-    parser.add_argument("--min-residence-rounds", type=int, default=2)
-    parser.add_argument("--output", type=Path)
-    parser.add_argument("--save-model", action="store_true", help="Retain full final task weights")
-    parser.add_argument("--bind")
-    parser.add_argument("--rounds", type=int)
-    parser.add_argument("--network-control", type=Path)
-    parser.add_argument("--change-round", type=int, default=6)
-    parser.add_argument("--degraded-mbps", type=float, default=50)
-    parser.add_argument("--server")
-    parser.add_argument("--client-id")
-    parser.add_argument("--client-index", type=int)
-    parser.add_argument("--barrier")
-    args = parser.parse_args()
-    args.method = "splitfleet"
-    args.fixed_boundary = args.boundary
-    args.split_state_exchange = "owned"
-    if args.role == "client":
-        run_client(args)
-        return
-    if not args.output or not args.bind or not args.rounds or not args.network_control:
-        raise ValueError("Server requires output, bind, rounds and network-control")
-    if args.change_round < 1 or args.degraded_mbps <= 0:
-        raise ValueError("Invalid actual network schedule")
-
-    def factory(**kwargs):
-        provider = kwargs["provider"]
-        config = _make_placement_policy(**kwargs).config
-        if args.policy == "CoSplit-UCB":
-            return CoSplitUCBPlacementPolicy(candidate_provider=provider, config=config)
-        if args.policy == "Independent-UCB":
-            return PhysicalIndependentUCB(candidate_provider=provider, config=config)
-        return AdaptiveReference(candidate_provider=provider, config=config,
-            algorithm=args.policy, horizon=args.rounds, output=args.output)
-
-    run_server(args, placement_policy_factory=factory,
-        recording_strategy_class=lambda **kwargs: AdaptiveRecordingSplit(experiment_args=args, **kwargs))
+    import sys
+    from experiments.physical_multitask import main as run
+    args = list(sys.argv[1:])
+    if "--policy" in args:
+        index = args.index("--policy")
+        if args[0] == "client":
+            del args[index:index + 2]
+        else:
+            args[index] = "--placement-controller"
+    if "--method" not in args:
+        args.extend(["--method", "splitfleet"])
+    sys.argv[1:] = args
+    run()
 
 
 if __name__ == "__main__":

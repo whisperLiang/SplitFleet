@@ -277,11 +277,23 @@ def analyze(plan: dict, root: Path) -> dict:
                             raise ValueError("aggregation order differs from the matched protocol")
                         if result["method"] == "splitfleet":
                             if result.get("online_cost_learning") is not True:
-                                raise ValueError("CoSplit-UCB online learning receipt is missing")
-                            actual_config = result.get("cosplit_config") or {}
-                            validate_cosplit_config(actual_config, plan.get("cosplit_hyperparameters", {}),
-                                seed=seed, result_path=run_dir / "result.json", correction=run_metadata_correction,
-                                require_run_identity=plan.get("cosplit_identity_policy") == "derive_and_verify_per_run")
+                                raise ValueError("Placement feedback receipt is missing")
+                            if "greedy_config" in result:
+                                actual_config = result["greedy_config"]
+                                expected = plan.get("greedy_hyperparameters", {})
+                                if result.get("placement_controller") != "Greedy":
+                                    raise ValueError("Default placement controller differs")
+                                for key, value in expected.items():
+                                    if actual_config.get(key) != value:
+                                        raise ValueError(f"Greedy parameter {key} differs from the frozen plan")
+                                if actual_config.get("seed") != seed:
+                                    raise ValueError("Greedy seed differs from the paired seed")
+                            else:
+                                # Historical audits retain the recorded policy identity.
+                                actual_config = result.get("cosplit_config") or {}
+                                validate_cosplit_config(actual_config, plan.get("cosplit_hyperparameters", {}),
+                                    seed=seed, result_path=run_dir / "result.json", correction=run_metadata_correction,
+                                    require_run_identity=plan.get("cosplit_identity_policy") == "derive_and_verify_per_run")
                         worker_ids = stage.get("worker_ids", plan.get("worker_ids"))
                         if worker_ids and (
                                 result.get("worker_ids") != worker_ids or

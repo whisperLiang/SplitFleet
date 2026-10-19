@@ -18,14 +18,14 @@ from flwr.common import ndarrays_to_parameters, parameters_to_ndarrays
 
 from splitfleet.client.autosplit_split_client import AutoSplitSplitLearningClient
 from splitfleet.common import BatchData, ControlCode
+from splitfleet.common.network_probe import PROBE_CONFIG_KEY, PROBE_RESULT_KEY, measure_network
 from splitfleet.common.constants import (
     AUTOSPLIT_MODEL_VERSION_CONFIG_KEY,
     CLIENT_ID_CONFIG_KEY,
-    COSPLIT_CALIBRATION_HASH_HANDSHAKE_KEY,
-    COSPLIT_CALIBRATION_PARAMETERS_REQUIRED_KEY,
+    PLACEMENT_CALIBRATION_HASH_HANDSHAKE_KEY,
+    PLACEMENT_CALIBRATION_PARAMETERS_REQUIRED_KEY,
 )
 from splitfleet.runtime.client_execution import server_model_binding
-from splitfleet.runtime.prefix_context_store import PrefixContextStore
 
 from .backend_ops import FrameworkOps
 from .network import TaskNetwork
@@ -51,14 +51,13 @@ class ClientFactory:
     config: object
     spec: object
     partitions: dict
-    run_scope: str = ""
 
     def __call__(self, context):
         return VirtualClientAdapter(context=context, factory=self)
 
 
 class VirtualClientAdapter(NumPyClient):
-    """Logical Context holds identity/progress/RNG; bounded slots hold execution."""
+    """Bind one Flower Context to the shared SFL executor for one task."""
 
     def __init__(self, *, context, factory):
         self.entered_ns = time.perf_counter_ns()
@@ -71,8 +70,6 @@ class VirtualClientAdapter(NumPyClient):
         self.indices = factory.partitions[str(partition_id)]
         self.state = logical_state(context, partition_id, partition_hash(self.indices))
         self.profile = factory.config.profile(partition_id)
-        self._slot_pool = None
-        self._slot_key = None
         if self.profile.device.startswith("cuda"):
             # Resource telemetry runs before constructing the first CUDA model.
             self.ops.admit_device(self.profile.device)
@@ -128,90 +125,73 @@ class VirtualClientAdapter(NumPyClient):
                     calibration_batch=self.ops.prepare_batch(model, calibration, self.profile.device),
                 )
 
-            capacity = config.resources.client_runtime_slots
-            if capacity:
-                if self.ops.backend not in {"torch", "tf", "tinygrad"}:
-                    raise ValueError("Persistent client slots require native Torch, TensorFlow or Tinygrad state reload proofs")
-                from .worker_slots import worker_slots
-
-                self._slot_pool = worker_slots(scope=self.factory.run_scope, capacity=capacity)
-                self._slot_key = ("splitfleet", self.ops.backend, str(self.profile.device))
-                client, reused = self._slot_pool.acquire(self._slot_key, construct, _release_client)
-            else:
-                client, reused = construct(), False
-            # This task's data and loss/optimizer configuration replace all
-            # previous logical-client references before any native execution.
+            # Flower owns Worker process reuse.  The executor is task-local so
+            # model, optimizer, graph and RNG state cannot leak between Contexts.
+            client = construct()
+            # The shared executor owns its runtime/cache lifecycle.  The
+            # virtual adapter only supplies this task's data and public state.
             call = self.ops.prepare_batch(client.model, sample, self.profile.device)
             private_calibration = self.ops.prepare_batch(client.model, calibration, self.profile.device)
-            client.train_data = client.evaluate_data = source
-            client.sample_inputs, client.sample_kwargs = call.inputs.args, dict(call.inputs.kwargs)
-            client._sample_num_examples = call.num_examples
-            client._calibration_inputs, client._calibration_targets = private_calibration.inputs, private_calibration.targets
-            client.optimizer_fn = optimizer_factory
-            client._worker_execution_reused = reused
-            handles = [row.handle for row in client._runtime_cache.values()]
-            if client._prewarmed_runtime is not None:
-                handles.append(client._prewarmed_runtime)
-            handles.extend(client._calibration_runtime_cache.values())
-            for handle in handles:
-                handle.backend.trace_sample_input = client.sample_inputs
-                handle.backend.trace_sample_kwargs = client.sample_kwargs
-                handle.plan.metadata["_example_inputs"] = client.sample_inputs
-                handle.plan.metadata["_example_kwargs"] = client.sample_kwargs
+            client.bind_execution_context(
+                train_data=source,
+                evaluate_data=source,
+                sample_inputs=call.inputs.args,
+                sample_kwargs=call.inputs.kwargs,
+                sample_num_examples=call.num_examples,
+                calibration_inputs=private_calibration.inputs,
+                calibration_targets=private_calibration.targets,
+                optimizer_fn=optimizer_factory,
+            )
             if self.ops.backend != "torch":
                 self.ops.reset_peak_memory(self.profile.device)
             if spec.trainer is not None:
-                client._quality_rpc_spans = []
-                client._quality_native_execution_intervals = []
-                original_tail_call = type(client)._call_tail.__get__(client, type(client))
-
-                def measured_tail_call(**kwargs):
-                    began = time.perf_counter()
-                    try:
-                        return original_tail_call(**kwargs)
-                    finally:
-                        client._quality_rpc_spans.append(time.perf_counter() - began)
-
-                client._call_tail = measured_tail_call
+                client.enable_quality_measurement()
         return client, source
 
     @contextmanager
     def _client_scope(self, round_id, **options):
         client = None
-        success = False
         try:
             client, source = self._build_client(round_id, **options)
             yield client, source
-            if len(client._context_store):
-                raise RuntimeError("A completed client slot retains an unconsumed prefix context")
-            success = True
+            if client.pending_context_count:
+                raise RuntimeError("A completed client execution retains an unconsumed prefix context")
         finally:
-            if self._slot_pool is not None and self._slot_key in self._slot_pool.active:
-                actual = self._slot_pool.active[self._slot_key][0]
-                if success:
-                    try:
-                        _retire_client(actual)
-                    except BaseException:
-                        self._slot_pool.finish(self._slot_key, actual, success=False)
-                        raise
-                self._slot_pool.finish(self._slot_key, actual, success=success)
-            elif client is not None:
-                _release_client(client)
+            if client is not None:
+                client.close_execution()
 
     def get_properties(self, config):
-        if "cosplit_probe_payload" in config:
+        if PROBE_CONFIG_KEY in config:
+            # Emulation applies the plant's constraints here. Only observed
+            # RPC durations leave this handler; no configured rate is returned.
+            round_id = config[PROBE_CONFIG_KEY]
+            runtime = self.factory.config
+            network = runtime.network(self.partition_id, round_id)
+            credentials = runtime.transport.credentials("client")
+            address = config["virtual_suffix_address"]
+            with TaskNetwork(address, network, round_id=round_id) as path:
+                tls_name = address.rsplit(":", 1)[0].strip("[]") if credentials and network.constrained else None
+                with suffix_connection(path.address, self.context.node_id,
+                        timeout=runtime.transport.rpc_timeout_sec, certificates=credentials,
+                        tls_server_name=tls_name,
+                        metadata=(("authorization", f"Bearer {config['virtual_network_probe_token']}"),)) as proxy:
+                    receipt = measure_network(proxy, round_id=round_id,
+                                              timeout=runtime.transport.rpc_timeout_sec)
+                    receipt["tcp_counters"] = path.metrics()
+            return {PROBE_RESULT_KEY: json.dumps(receipt, allow_nan=False)}
+        if "splitfleet_probe_payload" in config:
             # This is a real Flower control RPC. Its stateless echo must not
             # include model construction, data access or RNG initialization.
-            payload = config["cosplit_probe_payload"]
+            payload = config["splitfleet_probe_payload"]
             if not isinstance(payload, bytes) or not 1 <= len(payload) <= 2_097_152:
-                raise ValueError("Invalid CoSplit transport probe")
-            reply_size = config.get("cosplit_probe_reply_bytes", len(payload))
+                raise ValueError("Invalid Greedy transport probe")
+            reply_size = config.get("splitfleet_probe_reply_bytes", len(payload))
             if type(reply_size) is not int or not 1 <= reply_size <= 2_097_152:
-                raise ValueError("Invalid CoSplit transport reply size")
-            return {"cosplit_probe_payload": payload if reply_size == len(payload) else bytes(reply_size)}
+                raise ValueError("Invalid Greedy transport reply size")
+            return {"splitfleet_probe_payload": payload if reply_size == len(payload) else bytes(reply_size)}
         runtime = self.factory.config
         properties = {
-            COSPLIT_CALIBRATION_HASH_HANDSHAKE_KEY: self.ops.backend in {'torch', 'tf', 'paddle', 'jax'},
+            PLACEMENT_CALIBRATION_HASH_HANDSHAKE_KEY: self.ops.backend in {'torch', 'tf', 'paddle', 'jax'},
             "logical_client_id": self.state["logical_client_id"],
             "virtual_partition_id": self.partition_id,
             "partition_hash": self.state["partition_hash"],
@@ -236,8 +216,8 @@ class VirtualClientAdapter(NumPyClient):
             self._client_scope(int(self.state["last_round"]) + 1) as (client, _),
         ):
             result = client.get_properties(config)
-            if ("cosplit_probe_payload" in result
-                    or result.get(COSPLIT_CALIBRATION_PARAMETERS_REQUIRED_KEY) is True):
+            if ("splitfleet_probe_payload" in result
+                    or result.get(PLACEMENT_CALIBRATION_PARAMETERS_REQUIRED_KEY) is True):
                 # A hash mismatch asks the coordinator for weights before
                 # calibration. That control reply has no hardware properties.
                 return result
@@ -376,7 +356,7 @@ class VirtualClientAdapter(NumPyClient):
                             != config["autosplit_boundary"]
                         )
                         if self.state["last_boundary"]:
-                            client._round_config["autosplit_plan_id"] = (
+                            client.set_previous_plan_hint(
                                 "previous-boundary:" + self.state["last_boundary"]
                                 if changed
                                 else config["autosplit_plan_id"]
@@ -479,9 +459,7 @@ class VirtualClientAdapter(NumPyClient):
                     "rng_state_hash": hashlib.sha256(self.state["rng"]).hexdigest(),
                     "rng_state_hash_scope": self.ops.rng_scope_description,
                     "virtual_client_build_sec": build_sec,
-                    "worker_execution_slot_reused": client._worker_execution_reused,
-                    "worker_execution_slot_capacity": runtime.resources.client_runtime_slots,
-                    "worker_execution_process_peak_slots": self._slot_pool.peak_resident if self._slot_pool else 1,
+                    "worker_capacity": runtime.resources.effective_worker_capacity or 1,
                     "virtual_handler_ms": (time.perf_counter() - started) * 1000,
                     "virtual_state_via_rpc": network.constrained,
                     "client_peak_memory_mb": peak_rss_mb(),
@@ -509,55 +487,14 @@ class VirtualClientAdapter(NumPyClient):
             if hasattr(source, "batch_hash"):
                 metrics["data_batch_hash"] = source.batch_hash
                 metrics["data_examples_seen"] = source.samples_seen
-                metrics["quality_rpc_calls"] = len(client._quality_rpc_spans)
-                metrics["quality_rpc_max_sec"] = max(client._quality_rpc_spans, default=0.0)
+                rpc_spans, native_intervals = client.quality_measurements()
+                metrics["quality_rpc_calls"] = len(rpc_spans)
+                metrics["quality_rpc_max_sec"] = max(rpc_spans, default=0.0)
                 metrics["native_training_intervals_ns"] = json.dumps(
-                    getattr(client, "_quality_native_execution_intervals", []))
+                    native_intervals)
             if queue_sec is not None:
                 metrics["virtual_worker_queue_sec"] = queue_sec
             return values, count, metrics
-
-
-def _retire_client(client):
-    client.server_model_proxy = None
-    client._context_store = PrefixContextStore()
-    client._round_config = {}
-    client._owned_functional_optimizer = None
-    client.online_calibration_receipt = None
-    client.train_data = client.evaluate_data = ()
-    client.sample_inputs, client.sample_kwargs = (), {}
-    client._calibration_inputs = client._calibration_targets = None
-    client._call_tail = type(client)._call_tail.__get__(client, type(client))
-    client._quality_rpc_spans = []
-    if hasattr(client, "_quality_native_execution_intervals"):
-        client._quality_native_execution_intervals = []
-    if client.backend_adapter.backend_name == "torch":
-        for parameter in client.model.parameters():
-            parameter.grad = None
-    elif client.backend_adapter.backend_name == 'tinygrad':
-        for parameter in client.backend_adapter._state(client.model).values():
-            parameter.grad = None
-    handles = [row.handle for row in client._runtime_cache.values()]
-    handles.extend(client._calibration_runtime_cache.values())
-    for handle in handles:
-        handle.backend.trace_sample_input = ()
-        handle.backend.trace_sample_kwargs = {}
-        handle.plan.metadata["_example_inputs"] = ()
-        handle.plan.metadata["_example_kwargs"] = {}
-    if client._prewarmed_runtime is not None:
-        client._prewarmed_runtime.backend.trace_sample_input = ()
-        client._prewarmed_runtime.backend.trace_sample_kwargs = {}
-        client._prewarmed_runtime.plan.metadata["_example_inputs"] = ()
-        client._prewarmed_runtime.plan.metadata["_example_kwargs"] = {}
-
-
-def _release_client(client):
-    _retire_client(client)
-    client._runtime_cache.clear()
-    client._calibration_runtime_cache.clear()
-    client._calibration_runtime_source = None
-    client._prewarmed_runtime = None
-    client.autosplit_session.discard_runtime_handles()
 
 
 def grpc_error_types():

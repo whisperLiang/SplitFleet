@@ -1,10 +1,10 @@
 # SplitFleet experiments
 
-The physical runner uses the canonical CoSplit-UCB implementation by default. Four structural anchors, nearest 0%, 25%, 75% and 100% of the admitted catalog, initialize current-device costs. Each uses one warmup and one measured batch with temporary stage-owned optimizers. Calibration restores weights, buffers, gradients, module modes and random streams; temporary optimizer state is discarded.
+The physical runner defaults to **Greedy** with **`--server-concurrency 1`**. Greedy independently minimizes each client's predicted complete-round cost. Four restored training anchors initialize computation estimates; measured bootstrap RPCs initialize affine communication costs. Actual training feedback updates private cost tables. State exchange is counted once per round, and calibration is included in complete server job time. See [Greedy](GREEDY.md).
 
-The `cosplit_context` schema uses actual owned parameter bytes and actual payload sizes for each batch size. Edge and server contexts have 13 features, network contexts 14, switching contexts 9 and state exchange contexts 5. Current-deployment echo probes initialize transport priors; actual split-RPC and fit-RPC feedback continue updating them during training. State exchange is modeled once per client round with nonnegative coefficients.
+The active adaptive implementations are Greedy and the optional L2S reference. Retired UCB controllers are absent from active code and command-line choices. Frozen result directories retain their original labels and source snapshots for provenance.
 
-Both predicted mean and confidence-upper round time must fit within 105% of the baseline mean before a probe is admitted. The joint solver searches the full admitted catalog from the first round. Prediction and queue-simulation caches remain enabled. Decisions remain per round; batch observations are aggregated and weighted by the actual batch count. See the [algorithm guide](COSPLIT_UCB.md).
+The [current paper](../paper/README.md) reports 120 fixed-ten-round endpoints across six methods, including 20 measured Greedy C=1 runs. It also retains the original 160-endpoint common-budget comparison with FedAsync, FedBuff and FedCompass. That cohort's SplitFleet arm uses the original frozen CoSplit-UCB controller and is labelled accordingly; it is not a measurement of the current Greedy default. The separate six-round dynamic-network check retains its own protocol. The concurrency-capacity experiment is removed from the current paper.
 
 ## Training
 
@@ -34,7 +34,7 @@ Use a common wall-clock budget when comparing FedCompass with synchronous method
 .venv/bin/python -m experiments.orchestrate_physical_multitask \
   --deployment PATH_TO_DEPLOYMENT.json --run-id resnet-fedcompass-pilot \
   --model resnet50_pretrained --pretrain-weights PATH_TO_CHECKPOINT.pth \
-  --tasks image_classification --methods fedavg fedcompass splitfed_fixed splitfleet \
+  --tasks image_classification --methods fedavg fedasync fedbuff fedcompass splitfed_fixed splitfleet \
   --data-root data --train-samples 240 --test-samples 200 --batch-size 4 \
   --optimizer adam --learning-rate 1e-4 --dirichlet-alpha 10 \
   --time-budget-sec 600 --evaluation-interval-sec 30 \
@@ -86,14 +86,14 @@ See `dependency_patches/DEEPLAB_INTERPOLATION_NOTICE.md` for attribution.
 | `physical_multitask` | Prepare task bundles; run FL/SFL clients and servers |
 | `orchestrate_physical_multitask` | Execute a physical training matrix and validate its records |
 | `www2027_study` | Freeze source and plans; execute and analyze paired seed blocks |
-| `physical_adaptive_baselines` | CoSplit-UCB, Independent-UCB, Greedy and L2S physical controls |
+| `physical_adaptive_baselines` | Greedy and L2S physical controls |
 | `analysis.execution_coverage` | Capture and validate the seven PyTorch model architectures |
 | `edge_model_admission` | Full-model and native split numerical/resource checks |
 | `summarize_physical_multitask` | Validate and summarize completed physical runs |
 
-Calibration and exploration live in `splitfleet/server/placement/cosplit_ucb/`, shared by the native strategy and the physical runner. Core code does not import experiment modules.
+Calibration and measured feedback live in `splitfleet/server/placement/greedy/`, shared by the native strategy and the physical runner. Core code does not import experiment modules.
 
-`baselines/` retains the physical Independent-UCB/Greedy/L2S controls and the FedAsync/FedBuff/FedCompass mechanisms used by the current manuscript. Their calibration, training, model-state exchange and evaluation share the physical task runtime. Unused profile simulations, oracle/ablation experiments and separate five-backend performance runners have been removed; backend adapters and their functional regression tests remain maintained.
+`baselines/` retains the physical Greedy/L2S controls and the FedAsync/FedBuff/FedCompass mechanisms used by the current manuscript. Their calibration, training, model-state exchange and evaluation share the physical task runtime. Unused profile simulations, oracle/ablation experiments and separate five-backend performance runners have been removed; backend adapters and their functional regression tests remain maintained.
 
 ## Reproducible execution evidence
 
@@ -105,7 +105,7 @@ The seven-model PyTorch suite requires a fresh output directory and records sour
   --output results/execution_coverage_new_run --steps 10
 ```
 
-The four original client-0 inputs named by the bundle catalog remain available. Capture coverage and numerical training equivalence are distinct; the current manuscript's Figure 5 reports computational topology. Core multi-backend correctness can still be exercised with `python -m splitfleet.validation` and the functional tests.
+The four original client-0 inputs named by the bundle catalog remain available. Capture coverage and numerical training equivalence are distinct; the current manuscript's Figure 6 reports computational topology. Core multi-backend correctness can still be exercised with `python -m splitfleet.validation` and the functional tests.
 
 ## Quality and communication analysis
 
@@ -115,7 +115,7 @@ The frozen TTQ metric may differ from the final quality comparison metric. For e
 
 New physical records distinguish activation, target, request metadata, gradient, response metadata, and actual serialized Flower model-state upload/download buffers. A total requires every declared client round and every category. The accounting domain is training client application buffers; initialization, calibration, evaluation, Flower config/metrics, protobuf headers, TLS and retries are outside it. Coordinator-local suffix replicas are not client network traffic. Historical records retain unknown categories and totals.
 
-For historical reports, call `analyze(frozen_plan, OLD_ROOT)` read-only and `write_report(report, NEW_EXPORT_ROOT)`. The CLI `analyze --root` writes reports into that root, so do not point it at an immutable historical run. Older source cohorts without online-learning receipts are historical context, not evidence for the current CoSplit-UCB implementation.
+For historical reports, call `analyze(frozen_plan, OLD_ROOT)` read-only and `write_report(report, NEW_EXPORT_ROOT)`. The CLI `analyze --root` writes reports into that root, so do not point it at an immutable historical run. Older source cohorts without online-learning receipts are historical context, not evidence for the current Greedy implementation.
 
 The current manuscript cohorts are indexed in [results/README.md](../results/README.md). Only M01, P08, P09, P10 and E01 remain, together with their required inputs, source snapshots and protocol support files. Unused older cohorts, experimental entry points and their regression cases are removed.
 

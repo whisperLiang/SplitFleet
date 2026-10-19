@@ -9,7 +9,7 @@ import subprocess
 import sys
 
 
-def _run_isolated(request, *, extra_env=None) -> bool:
+def _run_isolated(request, *, extra_env=None, python=None) -> bool:
     if os.environ.get("SPLITFLEET_OPTIONAL_BACKEND_CHILD") == "1":
         return False
     env = os.environ.copy()
@@ -19,8 +19,10 @@ def _run_isolated(request, *, extra_env=None) -> bool:
     env["SPLITFLEET_OPTIONAL_BACKEND_CHILD"] = "1"
     env.update(extra_env or {})
     result = subprocess.run(
-        [sys.executable, "-m", "pytest", request.node.nodeid, "-q"],
-        cwd=os.getcwd(), env=env, text=True, capture_output=True,
+        [python or sys.executable, "-m", "pytest", request.node.nodeid,
+         "-o", "addopts=", "-q", "-rs", "--capture=sys"],
+        cwd=request.config.rootpath, env=env, text=True, capture_output=True,
+        timeout=300,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     if " skipped" in result.stdout:
@@ -175,8 +177,8 @@ def test_tinygrad_split_training_optional(request) -> None:
 def test_cosplit_payload_context_matches_optional_backend_capture(request, backend):
     if _run_isolated(request, extra_env={"CUDA_VISIBLE_DEVICES": "", "DEV": "CPU", "DEBUG": "0"}):
         return
-    from splitfleet.server.placement.cosplit_ucb import ContextEncoder, TorchLensCandidateProvider
-    from splitfleet.server.placement.cosplit_ucb.calibration import provider_handle
+    from splitfleet.server.placement.greedy import TorchLensCandidateProvider
+    from splitfleet.server.placement.greedy.calibration import provider_handle
 
     if backend == "tf":
         tf = pytest.importorskip("tensorflow")
@@ -215,7 +217,6 @@ def test_cosplit_payload_context_matches_optional_backend_capture(request, backe
         batch_axes={f"/args/{batch_argument}": 0}, dynamic_batch=(1, 4))
     catalog = provider.get_candidates(training=True)
     selected = {catalog[index].boundary: catalog[index] for index in (0, len(catalog) // 2, -1)}
-    encoder = ContextEncoder()
     for candidate in selected.values():
         batch = candidate.metadata["payload_batch_size"]
         call = list(inputs)
@@ -223,9 +224,5 @@ def test_cosplit_payload_context_matches_optional_backend_capture(request, backe
         payload = provider_handle(provider, candidate.boundary).backend.run_prefix(*call)
         actual = sum(np.asarray(value.numpy() if hasattr(value, "numpy") else value).nbytes
                      for value in payload.tensors.values())
-        context = encoder.network_context(candidate, {"batch_size": batch}, direction="upload")
-        assert context[1] * 1048576 == actual == candidate.boundary_forward_bytes
-        assert context[2] == context[-1] == 0
-        other_batch = 1 if batch != 1 else 2
-        unknown = encoder.network_context(candidate, {"batch_size": other_batch}, direction="upload")
-        assert unknown[1] == 0 and unknown[2] == unknown[-1] == 1
+        assert actual == candidate.boundary_forward_bytes
+        assert candidate.metadata["boundary_forward_bytes_by_batch_size"][batch] == actual

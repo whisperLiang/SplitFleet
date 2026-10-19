@@ -20,7 +20,8 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def _environment(*, gpu=True):
     environment = os.environ.copy()
-    environment["CUDA_VISIBLE_DEVICES"] = "0" if gpu else ""
+    if not gpu:
+        environment["CUDA_VISIBLE_DEVICES"] = ""
     environment["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
         environment[name] = "1"

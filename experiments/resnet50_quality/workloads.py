@@ -14,10 +14,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from splitfleet.server.placement.cosplit_ucb import (
-    CoSplitUCBPlacementPolicy,
+from splitfleet.server.placement.greedy import (
+    GreedyPlacementPolicy,
 )
-from splitfleet.server.placement.cosplit_ucb.candidate_provider import (
+from splitfleet.server.placement.greedy.candidate_provider import (
     TorchLensCandidateProvider,
 )
 from splitfleet.tasks import TASK_SPECS
@@ -258,7 +258,7 @@ def quality_spec(config):
         frozen_partitions=partitions, batch_factory=QualityBatches, learning_rate_fn=learning_rate,
         trainer=partial(full_model_trainer, backend=backend),
         candidate_provider_factory=partial(StageCandidateProvider, backend=backend),
-        placement_policy_factory=CoSplitUCBPlacementPolicy,
+        placement_policy_factory=GreedyPlacementPolicy,
         evaluate_fn=QualityEvaluation(factory.data_root, backend=backend),
         round_callback=RoundCheckpoints(backend), integer_aggregation_policy="maximum", source="real",
         framework_backend="torch",

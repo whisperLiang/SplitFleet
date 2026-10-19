@@ -1,5 +1,6 @@
 import copy
 import json
+from dataclasses import replace
 
 import pytest
 import torch
@@ -14,6 +15,15 @@ from splitfleet.virtual import VirtualConfig, run_virtual
 from splitfleet.virtual.config import ClientPopulation, Resources
 from splitfleet.virtual.partitions import ClientBatches, partition_dataset
 from splitfleet.virtual.state import rng_scope
+
+
+class StochasticTinyClassifier(TinyClassifier):
+    def __init__(self):
+        super().__init__()
+        self.dropout = torch.nn.Dropout(.4)
+
+    def forward(self, value):
+        return self.tail(self.dropout(self.middle(self.head(value).relu()).relu()))
 
 
 def read_rows(path, filename):
@@ -65,7 +75,7 @@ def test_real_prefix_suffix_updates_match_direct_sgd_and_worker_reuse(tmp_path):
         batch_size=2,
         boundary="after:head",
         virtual_clients=ClientPopulation(total=2),
-        resources=Resources(max_concurrent_clients=1, worker_count_policy="pooled"),
+        resources=Resources(max_concurrent_clients=1, worker_count_policy="max_concurrency"),
     )
     output = tmp_path / "real-training"
     summary = run_virtual(config, fixture_spec(samples=8), output=output)
@@ -92,6 +102,27 @@ def test_real_prefix_suffix_updates_match_direct_sgd_and_worker_reuse(tmp_path):
 
 
 @pytest.mark.simulation
+@pytest.mark.parametrize("workers,persistent", [(1, False), (2, False), (2, True)])
+def test_stochastic_suffix_repeats_across_new_flower_node_ids(tmp_path, workers, persistent):
+    pytest.importorskip("ray")
+    spec = replace(fixture_spec(samples=12), model_factory=StochasticTinyClassifier)
+    final_states = []
+    for attempt in range(2):
+        config = VirtualConfig(
+            rounds=2, batch_size=2, boundary="after:head",
+            virtual_clients=ClientPopulation(total=2),
+            resources=Resources(max_concurrent_clients=workers,
+                                per_client_suffix_models=persistent),
+        )
+        output = tmp_path / f"repeat-{attempt}"
+        result = run_virtual(config, spec, output=output)
+        assert result["optimization_steps"] == 12
+        final_states.append(torch.load(output / "final_model.pt", weights_only=True))
+    for name in final_states[0]:
+        torch.testing.assert_close(final_states[0][name], final_states[1][name], rtol=0, atol=0)
+
+
+@pytest.mark.simulation
 def test_failed_partial_suffix_is_discarded_and_client_recovers(tmp_path):
     pytest.importorskip("ray")
     config = VirtualConfig(
@@ -101,7 +132,7 @@ def test_failed_partial_suffix_is_discarded_and_client_recovers(tmp_path):
         virtual_clients=ClientPopulation(
             total=2, failure_rounds={"0": [1]}, fail_after_batches=1
         ),
-        resources=Resources(max_concurrent_clients=1, worker_count_policy="pooled"),
+        resources=Resources(max_concurrent_clients=1, worker_count_policy="max_concurrency"),
     )
     output = tmp_path / "recover"
     summary = run_virtual(config, fixture_spec(samples=8), output=output)
@@ -132,7 +163,7 @@ def test_many_real_clients_on_four_native_workers_finish_two_rounds(tmp_path, to
         batch_size=2,
         boundary="after:head",
         virtual_clients=ClientPopulation(total=total),
-        resources=Resources(max_concurrent_clients=4, worker_count_policy="pooled"),
+        resources=Resources(max_concurrent_clients=4, worker_count_policy="max_concurrency"),
     )
     output = tmp_path / f"clients-{total}"
     summary = run_virtual(config, fixture_spec(samples=total * 2), output=output)

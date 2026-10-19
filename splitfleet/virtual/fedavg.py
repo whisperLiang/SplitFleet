@@ -43,10 +43,8 @@ from .telemetry import Evidence
 
 
 class _FedAvgClient(NumPyClient):
-    def __init__(self, *, context, config, spec, partitions, run_scope=""):
+    def __init__(self, *, context, config, spec, partitions):
         self.context, self.config, self.spec = context, config, spec
-        self.run_scope = run_scope
-        self._slot_pool = None
         self.ops = FrameworkOps.for_spec(spec)
         self.partition_id = context.node_config["partition-id"]
         self.indices = partitions[str(self.partition_id)]
@@ -67,35 +65,21 @@ class _FedAvgClient(NumPyClient):
     def _model_scope(self):
         def construct():
             # Model initialization cannot consume this logical task's training
-            # RNG, whether a model slot is new or reused.
+            # RNG.
             with self.ops.rng_scope(seed=client_seed(self.config.seed, self.partition_id, "model"),
                                     device=self.profile.device):
                 return self.ops.build_model(self.spec.model_factory, self.profile.device)
 
-        pool = None
-        key = ("fedavg", self.ops.backend, str(self.profile.device))
-        capacity = self.config.resources.client_runtime_slots
-        if capacity:
-            if self.ops.backend not in {"torch", "tf", "tinygrad"}:
-                raise ValueError("Persistent client slots require native Torch, TensorFlow or Tinygrad state reload proofs")
-            from .worker_slots import worker_slots
-
-            pool = worker_slots(scope=self.run_scope, capacity=capacity)
-            model, reused = pool.acquire(key, construct, _release_model)
-        else:
-            model, reused = construct(), False
-        self._slot_pool = pool
-        success = False
+        # Flower/Ray reuses the Worker process; each task gets a fresh model so
+        # optimizer, graph, buffers and RNG state remain owned by its Context.
+        model = construct()
         try:
-            yield model, reused
-            success = True
+            yield model
         finally:
             if self.ops.backend == 'tinygrad':
                 for parameter in self.ops.native_state(model).values():
                     parameter.grad = None
             _release_model(model)
-            if pool is not None:
-                pool.finish(key, model, success=success)
 
     def fit(self, parameters, config):
         round_id = int(config["quality_round"])
@@ -106,7 +90,7 @@ class _FedAvgClient(NumPyClient):
         with self.ops.worker_resources(self.profile, mode=self.config.resources.mode) as resource_receipt, self.ops.rng_scope(
             seed=client_seed(self.config.seed, self.partition_id),
             saved=self.state.get("rng"), device=self.profile.device,
-        ), self._model_scope() as (model, reused):
+        ), self._model_scope() as model:
             self.ops.set_training(model, True)
             adapter = self.ops.adapter
             adapter.load_ndarrays(model, parameters)
@@ -155,10 +139,8 @@ class _FedAvgClient(NumPyClient):
                 "worker_pid": os.getpid(), "worker_host": socket.gethostname(),
                 "worker_boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
                 "worker_task_start_ns": started_ns, "worker_task_end_ns": time.perf_counter_ns(),
-                "worker_execution_slot_reused": reused,
                 "native_training_intervals_ns": json.dumps(native_intervals),
-                "worker_execution_slot_capacity": self.config.resources.client_runtime_slots,
-                "worker_execution_process_peak_slots": self._slot_pool.peak_resident if self._slot_pool else 1,
+                "worker_capacity": self.config.resources.effective_worker_capacity or 1,
                 "virtual_handler_ms": (time.perf_counter_ns() - started_ns) / 1e6,
                 "rng_state_hash": hashlib.sha256(self.state["rng"]).hexdigest(),
                 "rng_state_hash_scope": self.ops.rng_scope_description,
@@ -184,13 +166,12 @@ class _FedAvgClient(NumPyClient):
 
 
 class _FedAvgFactory:
-    def __init__(self, config, spec, partitions, run_scope=""):
+    def __init__(self, config, spec, partitions):
         self.config, self.spec, self.partitions = config, spec, partitions
-        self.run_scope = run_scope
 
     def __call__(self, context):
         return _FedAvgClient(context=context, config=self.config, spec=self.spec,
-                             partitions=self.partitions, run_scope=self.run_scope)
+                             partitions=self.partitions)
 
 
 def _release_model(model):
@@ -320,17 +301,20 @@ def run_fedavg(config, spec, *, output):
         evidence.write("partition_manifest.json", {"data": spec.data_manifest, "clients": {
             cid: {"indices": indices, "hash": partition_hash(indices), "num_samples": len(indices)}
             for cid, indices in partitions.items()}})
+        init_args, pool_size = initialize_ray(config, ray, ops)
+        evidence.record_capacity_observation(
+            config.resources, native_pool_size=pool_size
+        )
         strategy = _FedAvgStrategy(config=config, spec=spec, evidence=evidence, model=model, store=store)
         server = Server(client_manager=SimpleClientManager(), strategy=strategy)
-        server.set_max_workers(config.virtual_clients.total)
+        server.set_max_workers(config.resources.effective_worker_capacity)
         app = ServerApp(server_fn=lambda context: ServerAppComponents(
             server=server, config=ServerConfig(num_rounds=config.rounds, round_timeout=spec.round_timeout_sec)))
-        init_args, pool_size = initialize_ray(config, ray, ops)
         run_simulation(server_app=app, client_app=make_client_app(_FedAvgFactory(
-                           config, spec, partitions, run_scope=str(evidence.directory))),
+                           config, spec, partitions)),
                        num_supernodes=config.virtual_clients.total, backend_config={
                            "init_args": init_args, "client_resources": {
-                               "num_cpus": config.resources.client_cpus_per_worker,
+                               "num_cpus": config.resources.client_cpus_per_worker or 1.0,
                                "num_gpus": config.resources.client_gpus_per_worker}})
         arrays = parameters_to_ndarrays(server.parameters)
         if any(not np.isfinite(v).all() for v in arrays):
@@ -342,8 +326,11 @@ def run_fedavg(config, spec, *, output):
             raise RuntimeError("FedAvg did not complete the declared client/round budget")
         result = {"status": "passed", "native_flower_ray": True, "real_split_rpc": False,
                   "logical_clients": config.virtual_clients.total, "worker_limit": pool_size,
+                  "worker_target_count": config.resources.worker_target_count,
+                  "capacity_observation": config.resources.capacity_observation,
+                  "native_worker_pool_size": pool_size,
                   "worker_count_policy": config.resources.worker_count_policy,
-                  "requested_worker_count": config.workload.get("worker_target_count", config.virtual_clients.total),
+                  "requested_worker_count": config.resources.worker_target_count,
                   **round_concurrency(evidence.read_rows("round_metrics.jsonl")),
                   "rounds": config.rounds, "training_tasks": len(rows),
                   "optimization_steps": sum(row["metrics"]["num_batches"] for row in rows),
@@ -359,7 +346,14 @@ def run_fedavg(config, spec, *, output):
     except BaseException as error:
         for name in ("validation.json", "summary.json"):
             if not (evidence.directory / name).exists():
-                evidence.write(name, {"status": "failed", "reason": repr(error)})
+                evidence.write(
+                    name,
+                    {
+                        "status": "failed",
+                        "reason": repr(error),
+                        "capacity_observation": config.resources.capacity_observation,
+                    },
+                )
         raise
     finally:
         store.clear()

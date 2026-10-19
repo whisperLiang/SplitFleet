@@ -1,6 +1,6 @@
 """Share a stable Paddle default device across concurrent native operations."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from threading import Condition, RLock, get_ident
 
 from .native_capture_scope import NativeCaptureGate
@@ -32,7 +32,11 @@ class PaddleDeviceGate:
                 try:
                     with paddle.device.device_guard(device):
                         stream = paddle.device.current_stream(device) if device.startswith('gpu:') else None
-                        with paddle.device.stream_guard(stream):
+                        stream_scope = (
+                            paddle.device.stream_guard(stream)
+                            if stream is not None else nullcontext()
+                        )
+                        with stream_scope:
                             yield
                 finally:
                     self.device = previous
@@ -49,7 +53,11 @@ class PaddleDeviceGate:
                 self.waiting -= 1
         try:
             stream = paddle.device.current_stream(device) if device.startswith('gpu:') else None
-            with paddle.device.stream_guard(stream):
+            stream_scope = (
+                paddle.device.stream_guard(stream)
+                if stream is not None else nullcontext()
+            )
+            with stream_scope:
                 yield
         finally:
             with self.condition:

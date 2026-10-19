@@ -51,7 +51,7 @@ def make_config(*, method, backend="pytorch", seed, protocol, data_root, hardwar
     workers = hardware["worker_counts"][backend]
     if type(workers) is not int or not 3 <= workers <= clients:
         raise ValueError("Declare a fixed worker count between three and the client population")
-    policy = "one_per_client" if workers == clients else "pooled"
+    policy = "fixed_hardware"
     options = {
         "backend": backend, "method": method, "stage": "main",
         "protocol": str(Path(protocol).resolve()), "data_root": str(Path(data_root).resolve()),
@@ -61,13 +61,12 @@ def make_config(*, method, backend="pytorch", seed, protocol, data_root, hardwar
     }
     config = VirtualConfig(
         rounds=rounds, seed=seed, batch_size=16, local_epochs=1, learning_rate=.05,
-        server_device="cuda:1", placement="cosplit_ucb",
+        server_device="cuda:1", placement="greedy",
         virtual_clients=ClientPopulation(total=clients, training_timeout_sec=RUN_LIMITS["task_timeout_sec"]),
         resources=Resources(client_cpus_per_worker=1, max_concurrent_clients=workers,
             worker_count_policy=policy, max_suffix_replicas=clients, per_client_suffix_models=True,
-            max_resident_suffix_replicas=workers, server_concurrency=workers,
-            client_gpus_per_worker=1 / workers, client_gpu_pool_size=1, object_store_memory_mb=512,
-            client_runtime_slots=2 if policy == "pooled" else 1),
+            max_resident_suffix_replicas=workers, server_concurrency=1,
+            client_gpus_per_worker=1 / workers, client_gpu_pool_size=1, object_store_memory_mb=512),
         profiles={"gpu": Profile(device="cuda:0", torch_threads=1, gpu_fraction=1 / workers)},
         transport=Transport(rpc_timeout_sec=RUN_LIMITS["rpc_timeout_sec"]), workload=options,
     )

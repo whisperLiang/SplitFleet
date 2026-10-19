@@ -3,18 +3,17 @@
 SplitFleet also supports real virtual split learning through Flower/Ray. See
 [Virtual SFL Runtime](experiments/virtual_sfl/README.md) for the CPU smoke entry,
 100-client real-data training, state isolation, bounded suffix replicas, network
-constraints and CoSplit-UCB integration. The current PyTorch ResNet50 comparison (50 virtual clients, 100 rounds; SplitFleet vs FedAvg)
+constraints and measured Greedy placement. The retained PyTorch ResNet50 comparison (50 virtual clients, 100 rounds; SplitFleet vs FedAvg, before the measured-load controller update)
 is documented in [the experiment entry](experiments/resnet50_quality/README.md).
 
-SplitFleet combines a unified split federated learning (SFL) abstraction, SFL-grade fine-grained partitioning, and CoSplit-UCB fleet-wide adaptive placement. Built on [Flower](https://flower.ai/), it separates backend, task, partition, aggregation, and placement contracts. Five backend adapters implement the same SFL execution contract.
+SplitFleet combines a unified split federated learning (SFL) abstraction, SFL-grade fine-grained partitioning, and measured Greedy placement. Built on [Flower](https://flower.ai/), it separates backend, task, partition, aggregation, and placement contracts. Five backend adapters implement the same SFL execution contract.
 
 The unified task interface covers image classification, text classification, object detection, semantic segmentation, and instance segmentation.
 Maintained experiment protocols are in `experiments/`; the local manuscript and evidence guide is `paper/README.md`.
 Dataset-level integrations can be registered through `TaskSpec`/`TaskRegistry`, which bind a task adapter, model and dataset factories, metrics, and candidate cuts without coupling the split runtime to a dataset package.
-CoSplit-UCB is the default adaptive policy. Physical PyTorch runs calibrate four structural anchors with temporary stage-owned optimizers, restore model state and random streams, and learn from measured training feedback. Costs use actual optimizer-owned parameter bytes and batch payload sizes; state exchange is learned once per client round with nonnegative coefficients. Exploration limits both mean and confidence-upper round time to 105% of the baseline mean by default.
-Fresh calibration synchronizes Flower's current global weights and uses the server's captured batch contract. Evaluation binds worker metadata without calibrating. A compatible restored learner keeps its statistics and continues from online feedback without repeating initialization.
+Greedy is the default adaptive policy, with one server suffix execution slot (`C=1`). Each client selects its lowest predicted complete-round cost from the admitted cuts. Restored training calibration supplies initial compute and communication costs; actual fit feedback updates private client cost tables. Per-batch costs are multiplied by the local batch count, and model-state exchange is counted once per round. Calibration time is included in complete job time.
 
-There is one CoSplit-UCB implementation, with the `cosplit_context` feature schema and full candidate search from the first round. See the [algorithm guide](experiments/COSPLIT_UCB.md) and [physical experiment guide](experiments/README.md).
+Physical PyTorch calibration synchronizes current global weights and restores model state and random streams after temporary optimizer steps. Evaluation does not initialize training costs. Compatible saved Greedy cost tables can resume without repeating calibration. See the [Greedy guide](experiments/GREEDY.md) and [physical experiment guide](experiments/README.md).
 
 The autosplit runtime is backed by the repository-local `torchlens-2.34.1-py3-none-any.whl` via `uv.sources`. SplitFleet uses its native split APIs and maintains no local TorchLens patches or wheel builder. Candidate catalogs use `analyze()` for plans and capability reports; selected training cuts use `at()` to build executable segments. SplitFleet handles Flower strategy integration, client/server transport, server-tail replicas, and aggregation policy.
 
@@ -49,10 +48,10 @@ Currently supported:
 - split training with suffix gradients returned to the prefix
 - shared server tail
 - per-client server tail
-- one joint per-round dynamic placement policy interface through
+- one per-round dynamic placement policy interface through
   `AutoSplitStrategy.placement_policy`
-- cooperative online placement through
-  [`CoSplitUCBPlacementPolicy`](splitfleet/server/placement/cosplit_ucb/policy.py)
+- measured placement through
+  [`GreedyPlacementPolicy`](splitfleet/server/placement/greedy/policy.py)
 - a fleet-wide dynamic batch window negotiated by the strategy, permitting
   heterogeneous batch sizes when native TorchLens batch validation succeeds
 - SplitFed-style client and server aggregation
@@ -250,70 +249,37 @@ the dropped batch and example counts are reported in the round metrics rather
 than silently absorbed. This skip policy does not handle fixed-shape mismatches
 or native batch-probe failures inside the admitted window.
 
-### CoSplit-UCB placement across heterogeneous devices
+### Greedy placement across heterogeneous devices
 
-SplitFleet has one built-in dynamic partition policy: CoSplit-UCB. TorchLens
-discovers valid operation-level cuts, CoSplit-UCB learns component costs and
-jointly assigns selected clients under bounded suffix-server concurrency, and
-Flower performs client selection and aggregation. `boundary="auto"` only means
-automatic boundary discovery; dynamic selection belongs to the policy.
-
-The physical multi-task runner searches every valid `before`/`after` operation
-boundary, including RF-DETR Nano, with no candidate-count limit. Training cuts
-must retain trainable parameters in both stages and pass native capability and
-state ownership checks. Selected cuts are materialized for training.
-The catalog shares one capture; execution handles are retained only for selected
-cuts. The retained four-task jobs record catalog sizes, selected boundaries and
-rejection diagnostics in their result files.
+The default physical and virtual adaptive entrypoints use Greedy and `C=1`. TorchLens supplies admitted operation-level cuts; Greedy chooses a cut independently for each selected client once per federated round. `boundary="auto"` enables discovery in the lower-level strategy API; pass a placement policy to enable adaptation there.
 
 ```python
 from splitfleet.tasks import ImageClassificationTask, ModelInputs, TaskBatch
 from splitfleet.server.strategy import AutoSplitStrategy
-from splitfleet.server.placement import CoSplitUCBPlacementPolicy, TorchLensCandidateProvider
+from splitfleet.server.placement import GreedyConfig, GreedyPlacementPolicy, TorchLensCandidateProvider
 
-# Use representative inputs and targets from the current deployment.
 sample = TaskBatch(ModelInputs.from_value(sample_inputs), sample_targets)
-task = ImageClassificationTask()
-placement = CoSplitUCBPlacementPolicy(
+placement = GreedyPlacementPolicy(
     candidate_provider=TorchLensCandidateProvider(model=model, sample_inputs=sample.inputs),
+    config=GreedyConfig(server_concurrency=1),
 )
 strategy = AutoSplitStrategy(
     model=model,
     sample_inputs=sample,
-    task=task,
+    task=ImageClassificationTask(),
     placement_policy=placement,
     aggregation_policy="splitfed",
+    optimizer_fn=lambda parameters: torch.optim.SGD(parameters, lr=0.005),
 )
-# On each worker, pass its own representative TaskBatch and task to
-# AutoSplitSplitLearningClient. Calibration runs before the first placement.
 ```
 
-CoSplit-UCB treats fine-grained split selection as a cooperative,
-non-stationary contextual-bandit problem. It learns client, network, server and
-repartitioning costs from real split-training feedback, shares edge knowledge
-by execution profile, keeps link learners per client, and uses a shared server
-learner. A lane simulator derives queueing and minimizes synchronous round
-makespan. Exploration must stay within both the predicted mean and confidence-upper
-round-time budgets. The default parameters are starting points, not claimed optima.
+Provide each worker's representative task batch and matching optimizer as well. Calibration measures four admitted structural anchors, restores state, and initializes private affine communication costs. Successful training feedback updates measured computation and link costs; failures update feasibility. The policy uses no confidence-bound exploration or joint cut solver. Recorded server load is diagnostic and is not a Greedy scoring feature.
 
-The solver schedules each client's sequential training batches on shared server
-lanes; the switch cost is paid once per round. It uses the latest observed batch
-count for each client, or a count supplied by runtime telemetry. Exploration is
-held back when a selected client's batch count is still unknown. Existing
-learner observations decay by elapsed training rounds before the next placement
-prediction. Client-reported backend, device, accelerator, and precision identify
-which clients share edge-side learning.
-Production diagnostics record round wall time from fit dispatch to result
-collection separately from the longest client-reported fit duration.
+Set `--server-concurrency N` to permit up to `N` suffix executions on the same GPU. This changes execution capacity, not the number of GPUs. Each client retains a private suffix model and optimizer. At `C=1` their execution is serialized while client prefixes may overlap. Higher capacities can reduce queue wait while increasing service spans and need not reduce complete job time.
 
-A device whose per-client suffix replica is missing at aggregation time is
-logged and dropped from that round's SplitFed reassembly; the rounds the other
-devices completed are still aggregated. A round in which *every* client failed
-is logged and skipped — the suffix replicas it created have no prefix half to
-be reassembled with — and training continues from the previous global model
-instead of raising. The same applies in reverse: client updates with no suffix
-result at all leave the global model untouched rather than publishing a
-prefix-only update.
+SplitFed reconstructs each client's complete logical update from its owned prefix and suffix states and then performs sample-weighted aggregation. FedAvg equivalence requires matched local work, optimizer state, buffers, randomness and numerical execution. Missing prefix/suffix pairs are dropped together; a round with no complete update preserves the previous global model.
+
+The current paper uses the original measured Greedy endpoints as SplitFleet (`C=1`), with original hashes and labels retained. Historical controller runs remain immutable evidence; the active Greedy refactor has not been performance-rerun. See [the paper and evidence guide](paper/README.md).
 
 ### Weight-tied models
 
@@ -329,7 +295,7 @@ mode are the two deltas summed. Shared buffers are not treated as tied.
 
 - [`splitfleet/autosplit`](splitfleet/autosplit): TorchLens adapter, two-stage planner, runtime facade, serde, and cache.
 - [`splitfleet/server/strategy/autosplit_strategy.py`](splitfleet/server/strategy/autosplit_strategy.py): Flower strategy metadata and aggregation policy.
-- [`splitfleet/server/placement/cosplit_ucb`](splitfleet/server/placement/cosplit_ucb): the sole production dynamic policy, including cooperative learners, feasibility, joint solving, safe exploration, and state.
+- [`splitfleet/server/placement/greedy`](splitfleet/server/placement/greedy): the default measured policy, including private cost tables, feasibility, calibration, feedback and state.
 - [`splitfleet/autosplit/batch_window.py`](splitfleet/autosplit/batch_window.py): the dynamic batch window contract shared by the prefix and the suffix.
 - [`splitfleet/server/stage_runtime`](splitfleet/server/stage_runtime): active TorchLens runtime handle management for coordinator-local suffix execution.
 - [`splitfleet/server/server_model/autosplit_tail_server_model.py`](splitfleet/server/server_model/autosplit_tail_server_model.py): server suffix model bridge.
@@ -398,8 +364,7 @@ uv run --no-sync pytest tests/unit/test_torchlens_boundary_serde.py -q
 uv run --no-sync pytest tests/unit/test_torchlens_candidate_contract.py -q
 uv run --no-sync pytest tests/unit/test_stage_runtime_contract.py -q
 uv run --no-sync pytest tests/unit/test_batch_window.py -q
-uv run --no-sync pytest tests/unit/test_cosplit_policy.py -q
-uv run --no-sync pytest tests/unit/test_cosplit_solver.py -q
+uv run --no-sync pytest tests/test_greedy_placement.py tests/test_greedy_calibration.py -q
 uv run --no-sync pytest tests/test_cross_device_cross_batch.py -q
 uv run --no-sync pytest tests/test_splitfed_aggregation.py -q
 uv run --no-sync pytest tests/test_server_round_finalization.py -q
@@ -408,7 +373,7 @@ uv run --no-sync pytest tests/test_server_round_finalization.py -q
 `tests/test_cross_device_cross_batch.py` covers the cross-device and cross-batch
 round behaviour: window broadcast and adoption, heterogeneous batch sizes in one
 round, prefix and suffix rejection of out-of-window batches, the skip policy,
-feature-ABI refusal, CoSplit-UCB placement through the strategy, and
+feature-ABI refusal, Greedy placement through the strategy, and
 SplitFed aggregation with a missing suffix replica.
 
 Integration checks:
@@ -418,6 +383,26 @@ uv run --no-sync pytest tests/integration/test_torchlens_runtime_replay.py -q
 uv run --no-sync pytest tests/integration/test_torchlens_real_task_matrix.py -q
 SPLITFLEET_RUN_HEAVY_REAL_MODELS=1 uv run --no-sync pytest tests/integration/test_torchlens_real_detection_optional.py -q
 ```
+
+To include the full native controls, install the optional backends and detection
+dependencies, and select a separate GPU Paddle environment (the CPU and GPU
+wheels share the same import name):
+
+```bash
+SPLITFLEET_PADDLE_PYTHON="$PWD/.venv-paddle-gpu/bin/python" \
+SPLITFLEET_FULL_PADDLE_CONTROL=1 \
+SPLITFLEET_FULL_OWNERSHIP_TESTS=1 \
+SPLITFLEET_RUN_RESNET18_ALL_NODES=1 \
+SPLITFLEET_NATIVE_CALIBRATION_BACKEND=pytorch \
+SPLITFLEET_NATIVE_CALIBRATION_DEVICE=cpu \
+SPLITFLEET_RUN_HEAVY_REAL_MODELS=1 \
+uv run --no-sync pytest -ra
+```
+
+The GPU controls require two real GPUs and the ResNet50 gate's CIFAR-10 data.
+Native framework controls use fresh processes; TensorFlow and JAX test imports
+default to growing GPU allocations so they can coexist with child controls.
+Missing dependencies or devices remain explicit skips in the report.
 
 ResNet18 training correctness check:
 

@@ -14,12 +14,16 @@ import numpy as np
 import pytest
 import torch
 
+from tests.integration.test_torchlens_optional_frameworks import _run_isolated
+
 
 @pytest.mark.integration
-def test_native_resnet_calibration_initializes_the_physical_policy_before_placement():
+def test_native_resnet_calibration_initializes_the_physical_policy_before_placement(request):
     backend = os.environ.get('SPLITFLEET_NATIVE_CALIBRATION_BACKEND')
     if backend is None:
         pytest.skip('Select a dedicated native backend environment')
+    if _run_isolated(request):
+        return
     device = os.environ.get('SPLITFLEET_NATIVE_CALIBRATION_DEVICE', 'cpu')
     from splitfleet.virtual.backend_ops import FrameworkOps
     ops = FrameworkOps(backend)
@@ -30,8 +34,8 @@ def test_native_resnet_calibration_initializes_the_physical_policy_before_placem
     from splitfleet.autosplit import AutoSplitSession
     from splitfleet.client.autosplit_split_client import AutoSplitSplitLearningClient
     from splitfleet.common.model_state import model_state_hash
-    from splitfleet.server.placement.cosplit_ucb import CoSplitUCBPlacementPolicy
-    from splitfleet.server.placement.cosplit_ucb.calibration import calibration_boundaries
+    from splitfleet.server.placement.greedy import GreedyPlacementPolicy
+    from splitfleet.server.placement.greedy.calibration import calibration_boundaries
     from splitfleet.server.strategy import AutoSplitStrategy
     from splitfleet.tasks import ImageClassificationTask, ModelInputs, TaskBatch
     from splitfleet.virtual.client_adapter import OptimizerFactory
@@ -52,7 +56,10 @@ def test_native_resnet_calibration_initializes_the_physical_policy_before_placem
     catalog = provider.get_candidates(training=True)
     before = model_state_hash(model, ops.adapter)
     assert model_state_hash(client_model, ops.adapter) == before
-    policy = CoSplitUCBPlacementPolicy(candidate_provider=provider)
+    policy = GreedyPlacementPolicy(candidate_provider=provider)
+    # Model calibration is exercised in-process here; split-channel probing
+    # is covered by the active-network and paced virtual integration tests.
+    policy.uses_active_network_probes = False
     optimizer = OptimizerFactory('sgd', .05, ops.backend)
     client = AutoSplitSplitLearningClient(model=client_model, sample_inputs=client_batch.inputs,
         calibration_batch=client_batch, train_data=[client_batch], task=ImageClassificationTask(),
@@ -66,10 +73,10 @@ def test_native_resnet_calibration_initializes_the_physical_policy_before_placem
 
     def get_properties(ins, timeout, group_id):
         requests.append(dict(ins.config))
-        if 'cosplit_calibration_boundaries' in ins.config:
+        if 'splitfleet_calibration_boundaries' in ins.config:
             result = client.get_properties(ins.config)
             receipt = client.online_calibration_receipt
-            assert receipt['state_and_rng_preserved'] and receipt['model_hash_before'] == receipt['model_hash_after']
+            assert receipt['state_and_torch_rng_preserved'] and receipt['model_hash_before'] == receipt['model_hash_after']
             return SimpleNamespace(properties=result)
         return SimpleNamespace(properties=client.get_properties(ins.config))
 
@@ -77,8 +84,8 @@ def test_native_resnet_calibration_initializes_the_physical_policy_before_placem
     manager = SimpleNamespace(num_available=lambda: 1, sample=lambda **kwargs: [worker])
     # Flower client sampling can consume host randomness. Check preservation
     # around the native calibration itself, independently of selection/probes.
-    from splitfleet.server.placement.cosplit_ucb import native_calibration
-    original = native_calibration.calibrate_native_split
+    from splitfleet.server.placement.greedy import calibration
+    original = calibration.calibrate_split
 
     def checked_calibration(*args, **kwargs):
         rng, python_rng, numpy_rng = torch.get_rng_state().clone(), random.getstate(), copy.deepcopy(np.random.get_state())
@@ -89,18 +96,18 @@ def test_native_resnet_calibration_initializes_the_physical_policy_before_placem
         np.testing.assert_array_equal(actual_numpy[1], numpy_rng[1])
         return receipt
 
-    native_calibration.calibrate_native_split = checked_calibration
+    calibration.calibrate_split = checked_calibration
     try:
         fit = strategy.configure_fit(1, ndarrays_to_parameters(ops.export_arrays(model)), manager)
     finally:
-        native_calibration.calibrate_native_split = original
+        calibration.calibrate_split = original
     assert len(fit) == 1
     anchors = calibration_boundaries(catalog)
     assert policy.telemetry_provider.initialized
-    assert policy.learners.server.model.num_updates == len(anchors)
+    assert len(policy.cost_tables["native-client"]["anchors"]) == len(anchors)
     assert policy.telemetry_provider.receipt['source'] == 'current_deployment_restored_training_cost_calibration'
-    assert any('cosplit_calibration_boundaries' in config for config in requests)
-    assert any('cosplit_probe_payload' in config for config in requests)
+    assert any('splitfleet_calibration_boundaries' in config for config in requests)
+    assert any('splitfleet_probe_payload' in config for config in requests)
     assert model_state_hash(model, ops.adapter) == model_state_hash(client_model, ops.adapter) == before
     assert policy.round_diagnostics[1]['assignment']['native-client'] in {row.boundary for row in catalog}
     assert set(policy.round_diagnostics[1]['estimates']['native-client']) == {row.boundary for row in catalog}
@@ -113,8 +120,8 @@ def test_native_resnet_calibration_initializes_the_physical_policy_before_placem
         assert receipt['optimizer_steps'] == expected_steps
         assert {row['boundary'] for row in receipt['records']} == set(anchors)
     if backend == 'tensorflow':
-        # Reuse native programs, while repeating every real measurement and
-        # restoring a different logical client's input/state just as the pool does.
+        # Reuse native programs while repeating every real measurement and
+        # restoring a different logical client's input/state.
         assert client.online_calibration_receipt['native_runtime_cache_hits'] == 0
         first_steps = client.online_calibration_receipt['optimizer_steps']
         first_losses = {row['boundary']: row['loss'] for row in client.online_calibration_receipt['records']}
@@ -132,10 +139,9 @@ def test_native_resnet_calibration_initializes_the_physical_policy_before_placem
         assert all(first[cut] is client._calibration_runtime_cache[cut] for cut in anchors)
         assert model_state_hash(client_model, ops.adapter) == before
         assert any(not np.isclose(row['loss'], first_losses[row['boundary']]) for row in repeated['records'])
-        from splitfleet.virtual.client_adapter import _release_client, _retire_client
-        _retire_client(client)
+        client.retire_execution()
         for handle in client._calibration_runtime_cache.values():
             assert handle.backend.trace_sample_input == ()
             assert handle.plan.metadata['_example_inputs'] == ()
-        _release_client(client)
+        client.close_execution()
         assert not client._calibration_runtime_cache and client._calibration_runtime_source is None

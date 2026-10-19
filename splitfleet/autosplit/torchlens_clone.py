@@ -148,7 +148,7 @@ def rebind_torch_runtime(runtime: SplitRuntime, model) -> SplitRuntime | None:
         # removes diagnostic provenance, while the executing nodes and schemas
         # are unchanged. Torch execution consults the rebound trace graph only.
         segments = runtime.adapter.build_segments(graph, runtime.plan, runtime.request)
-        return SplitRuntime(
+        rebound_runtime = SplitRuntime(
             model=model, trace=None, trace_graph=graph, request=runtime.request,
             plan=runtime.plan, adapter=runtime.adapter, segments=segments,
             capability_report=runtime.capability_report,
@@ -156,6 +156,13 @@ def rebind_torch_runtime(runtime: SplitRuntime, model) -> SplitRuntime | None:
             graph_ir=runtime.graph_ir, model_profile=runtime.model_profile,
             prepared_input_kwargs=dict(runtime.prepared_input_kwargs), batch_spec=runtime.batch_spec,
         )
+        if getattr(runtime.segments.suffix, "_splitfleet_live_rng", False):
+            # Rebuilding segments must retain the training RNG extension.
+            # Otherwise server clones revert to capture-time RNG guards and
+            # miss the certified pure-operation execution path.
+            from splitfleet.autosplit.torch_live_rng import enable_live_torch_rng
+            enable_live_torch_rng(rebound_runtime)
+        return rebound_runtime
     except _UnsupportedReplica:
         return None
 
@@ -168,6 +175,9 @@ def clone_runtime_handle(base, model):
     backend = copy.copy(base.backend)
     backend.model = model
     backend.runtime = runtime
+    reset_execution_state = getattr(backend, "reset_execution_state", None)
+    if reset_execution_state is not None:
+        reset_execution_state()
     handle = backend.make_handle()
     handle.plan.metadata["_reused_capture"] = True
     return handle

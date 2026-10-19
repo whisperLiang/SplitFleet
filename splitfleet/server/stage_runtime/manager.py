@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+
 from splitfleet.autosplit import TorchLensRuntimeHandle
 from splitfleet.autosplit.runtime import AutoSplitSession
 from splitfleet.autosplit.torchlens_clone import clone_runtime_handle
@@ -28,9 +30,11 @@ class StageRuntimeManager(ServerModelManager):
         reuse_completed_replicas: bool = False,
         per_client_models: bool = False,
         model_capacity: int | None = None,
+        replica_rng_isolation: bool = True,
     ) -> None:
         super().__init__()
         self.autosplit_session = autosplit_session or AutoSplitSession()
+        self.replica_rng_isolation = bool(replica_rng_isolation)
         self.before_collect = None
         self._placement_plan: SplitPlacementPlan | None = None
         self._runtime_handle: TorchLensRuntimeHandle | None = None
@@ -62,22 +66,14 @@ class StageRuntimeManager(ServerModelManager):
 
     def retire_model_task(self, model):
         """Detach a completed task while retaining one private execution slot."""
-        if getattr(model, "_inflight_steps", ()):
-            raise RuntimeError("Cannot retire a suffix with an in-flight step")
-        model.optimizer = None
-        model.sid = ""
-        model.model_version = 0
-        model.plan_id = ""
-        model.num_examples = 0
-        model.loss_total = 0.0
-        model._processed_steps.clear()
-        model.state_ownership = None
-        model.graph_contract = None
-        model.batch_window = None
+        model.reset_task_state()
 
     def release_model_runtime(self, model):
         """Remove every manager/session reference to one inactive replica."""
-        handles = tuple(getattr(model, "_runtime_cache", {}).values())
+        capture_rng = getattr(model, "capture_replica_rng_state", None)
+        if capture_rng is not None:
+            capture_rng()
+        handles = tuple(model.runtime_handles())
         owned_ids = {id(h) for h in handles}
         for key, handle in list(self._clone_runtime_cache.items()):
             if id(handle) in owned_ids:
@@ -85,10 +81,7 @@ class StageRuntimeManager(ServerModelManager):
         for key, handle in list(self.autosplit_session._runtime_handles.items()):
             if id(handle) in owned_ids:
                 self.autosplit_session._runtime_handles.pop(key, None)
-        if hasattr(model, "_runtime_cache"):
-            model._runtime_cache.clear()
-        model.runtime_handle = None
-        model.optimizer = None
+        model.close_runtime()
 
     def acquire_replica(self, sid):
         return self._require_delegate().acquire(sid)
@@ -190,17 +183,29 @@ class StageRuntimeManager(ServerModelManager):
                 raise RuntimeError("The active TorchLens runtime does not retain sample inputs.")
             if base.backend.framework_backend == "jax" and hasattr(model, "params"):
                 sample_inputs = (model.params, *sample_inputs[1:])
+            point = base.runtime.request.point
+            boundary = (
+                f"{point.target}%"
+                if point.kind == "percent"
+                else f"{point.kind}:{point.target}"
+            )
             handle = self.autosplit_session.prepare_runtime(
                 model,
                 sample_inputs,
                 sample_kwargs=base.plan.metadata.get("_example_kwargs"),
                 batch_axes=base.runtime.request.features.batch_axes,
-                boundary=base.plan.boundary,
+                boundary=boundary,
                 mode=base.plan.mode,
                 trainable=base.plan.trainable,
                 dynamic_batch=base.plan.dynamic_batch,
                 trace_batch_mode=base.plan.trace_batch_mode,
             )
+        enable_replica_rng = getattr(handle.backend, "enable_replica_rng_isolation", None)
+        if enable_replica_rng is not None:
+            seed = int.from_bytes(
+                hashlib.sha256(str(suffix).encode()).digest()[:8], "little"
+            )
+            enable_replica_rng(self.replica_rng_isolation, seed=seed)
         from splitfleet.split_engine import graph_contract_for_runtime_handle
         from splitfleet.split_engine.contracts import validate_contract
 

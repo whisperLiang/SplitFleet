@@ -9,7 +9,6 @@ resources:
   max_concurrent_clients: 16
   client_cpus_per_worker: 1
   max_suffix_replicas: 4
-  server_concurrency: 1
 transport:
   bind_host: 0.0.0.0
   advertise_host: 192.0.2.10

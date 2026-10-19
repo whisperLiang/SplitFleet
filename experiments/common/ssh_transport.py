@@ -42,7 +42,10 @@ class SshReverseTransport:
 
     def start(self):
         forwards = []
-        for service in ("server", "barrier"):
+        services = ["server", "barrier"]
+        if "client_server" in self.deployment:
+            services.append("client_server")
+        for service in services:
             host, port = self.deployment[service]["connect"].rsplit(":", 1)
             bind_port = self.deployment[service]["bind"].rsplit(":", 1)[1]
             if host != "127.0.0.1" or port != bind_port or not 0 < int(port) < 65536:

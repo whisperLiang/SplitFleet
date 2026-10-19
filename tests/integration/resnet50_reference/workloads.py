@@ -11,7 +11,7 @@ from functools import lru_cache
 import numpy as np
 import torch
 
-from splitfleet.server.placement.cosplit_ucb.candidate_provider import TorchLensCandidateProvider
+from splitfleet.server.placement.greedy.candidate_provider import TorchLensCandidateProvider
 from splitfleet.tasks.base import ModelInputs, TaskBatch
 from splitfleet.virtual.backend_ops import FrameworkOps
 

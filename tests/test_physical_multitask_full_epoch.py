@@ -12,7 +12,7 @@ from experiments.physical_multitask import (
 from experiments.orchestrate_physical_multitask import _run_one
 from experiments.rfdetr_nano_physical import RFDETRCandidateProvider
 from experiments.unified_multitask.data import _build_workload
-from splitfleet.server.placement.cosplit_ucb import TorchLensCandidateProvider
+from splitfleet.server.placement.greedy import TorchLensCandidateProvider
 from splitfleet.autosplit.types import PlacementConstraint, PlacementObjective
 from splitfleet.tasks import ModelInputs
 

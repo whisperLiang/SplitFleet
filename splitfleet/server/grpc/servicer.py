@@ -1,10 +1,14 @@
 import asyncio
+import json
 import time
 import traceback
 from collections.abc import AsyncIterable
 from concurrent.futures import ThreadPoolExecutor
 
+import grpc
+
 from splitfleet.common import BatchData, ControlCode
+from splitfleet.common.network_probe import PROBE_METHOD, probe_response
 from splitfleet.common.constants import (
     TRANSPORT_SERVER_ELAPSED_NS_METADATA_KEY,
     TRANSPORT_SERVER_RECEIVE_NS_METADATA_KEY,
@@ -44,9 +48,10 @@ class EventWithReturnValue(asyncio.Event):
 # pylint: disable=no-member
 class ServerModelServicer(server_model_pb2_grpc.ServerModelServicer):
     def __init__(self, server_model_manager: ServerModelManager, *, execution_concurrency=None,
-                 control_concurrency=None) -> None:
+                 control_concurrency=None, telemetry=None) -> None:
         super().__init__()
         self.server_model_manager = server_model_manager
+        self.telemetry = telemetry
         self._lock = asyncio.Lock()
         self._executor = None
         self._execution_slots = None
@@ -57,12 +62,17 @@ class ServerModelServicer(server_model_pb2_grpc.ServerModelServicer):
         self.active_executions = 0
         self.queued_executions = 0
         self.queue_wait_sec = 0.
+        if telemetry is not None and execution_concurrency is None:
+            execution_concurrency = telemetry.concurrency
         if execution_concurrency is not None:
             if execution_concurrency < 1:
                 raise ValueError("execution_concurrency must be positive")
             self._executor = ThreadPoolExecutor(max_workers=execution_concurrency,
                                                 thread_name_prefix="splitfleet-suffix")
             self._execution_slots = asyncio.Semaphore(execution_concurrency)
+            self.concurrency = int(execution_concurrency)
+            if telemetry is not None:
+                telemetry.concurrency = int(execution_concurrency)
         if control_concurrency is not None:
             if control_concurrency < 1:
                 raise ValueError("control_concurrency must be positive")
@@ -129,12 +139,18 @@ class ServerModelServicer(server_model_pb2_grpc.ServerModelServicer):
         sid = request_group.sid
         server_model = self.server_model_manager.get_server_model(sid)
         method = getattr(server_model, method_name)
+        load = self.telemetry.execution_context() if self.telemetry is not None else None
         try:
             res = method(batches)
         except Exception:
             traceback.print_exc()
             raise
 
+        if load is not None:
+            from splitfleet.server.telemetry import SERVER_LOAD_FIELDS
+            payload = json.dumps({key: load[key] for key in SERVER_LOAD_FIELDS if key in load})
+            for response in res:
+                response.metadata["splitfleet_server_load"] = payload
         return events, res
 
     async def execute(self, function, *args, control=False):
@@ -142,20 +158,32 @@ class ServerModelServicer(server_model_pb2_grpc.ServerModelServicer):
         queued = time.perf_counter()
         slots = self._control_slots if control else self._execution_slots
         executor = self._control_executor if control else self._executor
-        self.queued_executions += 1
+        telemetry = self.telemetry if not control else None
+        if not control:
+            self.queued_executions += 1
+        if telemetry is not None:
+            telemetry.enqueued()
         try:
             await slots.acquire()
+        except BaseException:
+            if telemetry is not None:
+                telemetry.cancel_queued()
+            raise
         finally:
-            self.queued_executions -= 1
+            if not control:
+                self.queued_executions -= 1
         try:
             queue_sec = time.perf_counter() - queued
+            if telemetry is not None:
+                telemetry.started(queue_sec)
             if not control:
                 self.queue_wait_sec += queue_sec
                 self.active_executions += 1
                 self.peak_executions = max(self.peak_executions, self.active_executions)
-            future = asyncio.get_running_loop().run_in_executor(executor, function, *args)
-            self._computations.add(future)
+            future = None
             try:
+                future = asyncio.get_running_loop().run_in_executor(executor, function, *args)
+                self._computations.add(future)
                 cancelled = None
                 while True:
                     try:
@@ -175,14 +203,26 @@ class ServerModelServicer(server_model_pb2_grpc.ServerModelServicer):
                     raise cancelled
                 return result, queue_sec
             finally:
-                self._computations.discard(future)
+                if future is not None:
+                    self._computations.discard(future)
                 if not control:
                     self.active_executions -= 1
+                if telemetry is not None:
+                    telemetry.finished()
         finally:
             slots.release()
 
     async def execute_control(self, function, *args):
         return await self.execute(function, *args, control=True)
+
+    def set_execution_concurrency(self, concurrency: int) -> None:
+        """Change the admission semaphore for a future round."""
+        if type(concurrency) is not int or concurrency < 1:
+            raise ValueError("execution concurrency must be a positive integer")
+        self._execution_slots = asyncio.Semaphore(concurrency)
+        self.concurrency = concurrency
+        if self.telemetry is not None:
+            self.telemetry.concurrency = concurrency
 
     async def execute_group(self, group, method_name):
         (events, responses), queue_sec = await self.execute(self._compute_group, group, method_name)
@@ -202,6 +242,8 @@ class ServerModelServicer(server_model_pb2_grpc.ServerModelServicer):
             self._executor.shutdown(wait=True, cancel_futures=True)
         if self._control_executor is not None:
             self._control_executor.shutdown(wait=True, cancel_futures=True)
+        if self.telemetry is not None:
+            self.telemetry.stop()
 
     def _to_grpc(self, data: BatchData) -> server_model_pb2.BatchData:
         return server_model_pb2.BatchData(
@@ -215,7 +257,11 @@ class ServerModelServicer(server_model_pb2_grpc.ServerModelServicer):
         request,
         context
     ) -> server_model_pb2.BatchData:
-        _ = (context, )
+        if request.method == PROBE_METHOD:
+            try:
+                return self._to_grpc(probe_response(from_grpc_format(request.data), request.metadata))
+            except ValueError as exc:
+                await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
         return self._to_grpc(await self._compute_response(request.cid, request))
 
     async def StreamRequest(

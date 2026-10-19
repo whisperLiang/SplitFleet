@@ -242,9 +242,17 @@ def test_completed_round_curve_is_persisted_before_evaluation_or_run_finish(tmp_
 
 def test_flower_queued_message_ttl_is_separate_from_native_handler_deadline():
     from flwr.common import FitIns, FitRes, Status, Code, ndarrays_to_parameters
-    from flwr.common.message import DEFAULT_TTL, Message
+    from flwr.common import DEFAULT_TTL, Message
     from flwr.server.compat.grid_client_proxy import GridClientProxy
-    from flwr.common.recorddict_compat import fitres_to_recorddict
+    from flwr.compat.common.recorddict_compat import fitres_to_recorddict
+    from flwr.supercore.task_identity import TaskIdentity
+
+    previous_run_id = TaskIdentity._run_id
+    previous_node_id = TaskIdentity._node_id
+    previous_task_id = TaskIdentity._task_id
+    TaskIdentity._run_id = 1
+    TaskIdentity._node_id = 1
+    TaskIdentity._task_id = 1
 
     class Grid:
         def __init__(self):
@@ -256,13 +264,18 @@ def test_flower_queued_message_ttl_is_separate_from_native_handler_deadline():
             result = FitRes(Status(Code.OK, ""), ndarrays_to_parameters([]), 1, {})
             return [Message(fitres_to_recorddict(result, keep_input=True), reply_to=message)]
 
-    grid = Grid()
-    proxy = GridClientProxy(1, grid, 1)
-    instruction = FitIns(ndarrays_to_parameters([]), {"virtual_handler_deadline_sec": 120.})
-    proxy.fit(instruction, timeout=None, group_id=1)
-    assert grid.messages[-1].metadata.ttl == DEFAULT_TTL == 43_200
-    proxy.fit(instruction, timeout=5000., group_id=1)
-    assert grid.messages[-1].metadata.ttl == 5000.
+    try:
+        grid = Grid()
+        proxy = GridClientProxy(1, grid, 1)
+        instruction = FitIns(ndarrays_to_parameters([]), {"virtual_handler_deadline_sec": 120.})
+        proxy.fit(instruction, timeout=None, group_id=1)
+        assert grid.messages[-1].metadata.ttl == DEFAULT_TTL == 43_200
+        proxy.fit(instruction, timeout=5000., group_id=1)
+        assert grid.messages[-1].metadata.ttl == 5000.
+    finally:
+        TaskIdentity._run_id = previous_run_id
+        TaskIdentity._node_id = previous_node_id
+        TaskIdentity._task_id = previous_task_id
 
 
 def test_quality_children_reject_changed_frozen_weights_and_partition_before_training(tmp_path, quality_inputs):

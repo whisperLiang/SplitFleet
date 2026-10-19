@@ -142,7 +142,7 @@ def _build_placement(
         prefix_worker_id="client",
         suffix_worker_id=suffix_worker.worker_id,
         # Static/manual planning does not predict latency. Dynamic cost
-        # learning and ranking belong exclusively to CoSplit-UCB.
+        # learning and ranking belong exclusively to Greedy.
         score=0.0,
         backend="torchlens",
         engine="torchlens",

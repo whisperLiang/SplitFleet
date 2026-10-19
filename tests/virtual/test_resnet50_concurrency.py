@@ -96,7 +96,7 @@ def test_adaptive_hardware_shares_real_device_assignments_between_methods(tmp_pa
     path = tmp_path / 'hardware.json'
     path.write_text(json.dumps(hardware))
     original = VirtualConfig(virtual_clients=ClientPopulation(total=50),
-        resources=Resources(worker_count_policy='pooled', max_concurrent_clients=8,
+        resources=Resources(worker_count_policy='max_concurrency', max_concurrent_clients=8,
                             client_gpus_per_worker=1 / 8), workload={'backend': 'pytorch', 'method': 'fedavg'})
     left = apply_hardware_profile(original, path)
     right = apply_hardware_profile(replace(original, workload={**original.workload, 'method': 'splitfleet'}), path)

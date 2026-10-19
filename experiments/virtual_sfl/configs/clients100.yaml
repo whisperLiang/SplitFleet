@@ -6,7 +6,6 @@ virtual_clients:
   participation_fraction: 1.0
 resources:
   max_concurrent_clients: 100
-  server_concurrency: 1
   max_suffix_replicas: 4
   server_memory_budget_mb: 4096
 workload:

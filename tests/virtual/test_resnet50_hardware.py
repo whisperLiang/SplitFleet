@@ -85,7 +85,7 @@ def test_cpu_client_groups_apply_physical_affinity_and_restore_worker(tmp_path):
     path = tmp_path / "hardware.json"
     path.write_text(json.dumps(profile))
     config = apply_hardware_profile(VirtualConfig(virtual_clients=ClientPopulation(total=50),
-        resources=Resources(max_concurrent_clients=13, worker_count_policy="pooled", client_gpus_per_worker=1/13), workload={"backend": "pytorch"}), path)
+        resources=Resources(max_concurrent_clients=13, worker_count_policy="max_concurrency", client_gpus_per_worker=1/13), workload={"backend": "pytorch"}), path)
     for cid in (1, 2, 3, 4):
         with worker_resources(config.profile(cid), mode=config.resources.mode) as receipt:
             assert set(receipt["affinity"]) == set(config.profile(cid).affinity)

@@ -4,7 +4,7 @@ Implementation updated 10 October 2026. FedCompass replaces FedProx in the defau
 
 The preceding six-method, 120-job plan stopped after 94 successful attempts and two failures, leaving 90 complete paired endpoints and four unpaired successes. Its original BERT graph failure, isolated Transformers 5.8.1 dependency amendment, DeepLab connection failure and reboot-interrupted diagnostic pilot remain under `results/fedcompass_physical_20261010/`. These outcomes do not enter either new population. New raw results are under `results/fl_dual_protocol_20261010/`; both populations must pass complete raw audits before their numerical results enter the paper. Historical FedProx measurements retain their identities.
 
-The common-budget method set is FedAvg, FedAsync, FedBuff, FedCompass, Fixed-SFL-25/50/75 and SplitFleet. The CoSplit-UCB/Independent-UCB/Greedy/L2S placement comparison has its own paused plan. FedCompass is a full-model, semi-asynchronous FL baseline; it does not offload a suffix to the split server.
+The common-budget method set is FedAvg, FedAsync, FedBuff, FedCompass, Fixed-SFL-25/50/75 and SplitFleet. The current fixed-round paper comparison uses Greedy (the SplitFleet default), L2S, FedAvg and fixed cuts; retained older common-budget controller runs remain historical evidence. FedCompass is a full-model, semi-asynchronous FL baseline; it does not offload a suffix to the split server.
 
 ## Source and mechanism
 
@@ -49,7 +49,7 @@ Pass `--time-budget-sec` and `--evaluation-interval-sec` to the orchestrator for
 
 Results contain `fedcompass_config`, `dispatch_records`, `aggregation_records`, `group_events`, `global_updates`, `completed_dispatches`, `total_optimizer_steps`, `total_examples_processed`, speed estimates, model-version/snapshot and completion times, and training-stop/drain durations. Dispatches include assigned steps, group expected/deadline times and coordinator-observed client idle time. Fit receipts distinguish aggregated, superseded, unaggregated and discarded updates. Communication accounting covers every completed dispatch. The validator checks one initial barrier, population, hashes, exact steps/tail sample counts, staleness weights, update uniqueness and budget endpoints. Summaries use asynchronous dispatch/checkpoint accounting and omit fixed-work speed ratios; study analysis disables total-duration speed claims where work is not comparable.
 
-Figure 5 is scheduled to show the new synchronous fixed-round and expanded common-budget populations in separate panels after both complete. A FedCompass result must come from actual execution and its own source receipts. The historical six-method evidence in Figure 7 retains its FedProx label and original population.
+The current manuscript reports the expanded common-budget population in Figures 4–5 (quality and dynamic-network diagnostics) and keeps the additional task panels in Appendix Figure 7. A FedCompass result must come from actual execution and its own source receipts. Historical six-method evidence remains separate from the current Greedy fixed-round figure.
 
 ## Validation before primary execution
 

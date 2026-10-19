@@ -18,6 +18,7 @@ from splitfleet.autosplit.state_ownership import (
 )
 from splitfleet.backends import BACKEND_ADAPTERS
 from splitfleet.backends.utils import adapter_for
+from tests.integration.test_torchlens_optional_frameworks import _run_isolated
 
 
 def test_integer_maximum_is_exact_and_streaming_while_float_weights_are_averaged():
@@ -246,7 +247,11 @@ def verify_resnet50_native_stage_ownership(backend, *, device="cpu"):
     configure_backend(backend)
     model = build_model(backend, canonical_state(233), device)
     training_mode(backend, model)
-    images, _ = native_batch(backend, np.zeros((2, 3, 64, 64), np.float32), np.zeros(2, np.int32), device)
+    # Tinygrad captures every lowered convolution intermediate. Use its native
+    # B=1 capture shape, retaining the dynamic replay probe. Functional JAX
+    # parameters also contain singleton dimensions, so keep its B=2 input.
+    batch = 1 if backend == "tinygrad" else 2
+    images, _ = native_batch(backend, np.zeros((batch, 3, 64, 64), np.float32), np.zeros(batch, np.int32), device)
     inputs = call_inputs(backend, model, images)
     handle = AutoSplitSession(device=device).prepare_runtime(
         model, inputs, boundary="50%", trainable=True,
@@ -284,12 +289,15 @@ def verify_resnet50_native_stage_ownership(backend, *, device="cpu"):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("backend", ["pytorch", "tensorflow", "paddle", "jax", "tinygrad"])
-def test_full_resnet50_native_stage_ownership(backend):
+def test_full_resnet50_native_stage_ownership(request, backend):
     # Full optional captures are explicit opt-in; small state/ownership tests
     # above run normally without launching five full ResNet50 captures in CI.
     import os
     if os.environ.get("SPLITFLEET_FULL_OWNERSHIP_TESTS") != "1":
         pytest.skip("Set SPLITFLEET_FULL_OWNERSHIP_TESTS=1 for full native ResNet50 captures")
+    if _run_isolated(request, extra_env={"CUDA_VISIBLE_DEVICES": "", "DEV": "CPU",
+                                        "CPU_COUNT": "1", "THREADS": "1", "JAX_PLATFORMS": "cpu"}):
+        return
     module = {"pytorch": "torch", "tensorflow": "tensorflow"}.get(backend, backend)
     pytest.importorskip(module)
     verify_resnet50_native_stage_ownership(backend)

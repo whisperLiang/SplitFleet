@@ -70,7 +70,7 @@ def hardware_profile(*, cpus, worker_counts=None, execution_cpus=None):
         "server_device": "cuda:1",
         "client_gpu_pool_size": 1,
         "resource_mode": "emulation",
-        "worker_count_policy": "fixed",
+        "worker_count_policy": "fixed_hardware",
         "worker_counts": worker_counts,
         **({'execution_affinity': execution_cpus} if execution_cpus is not None else {}),
         "profiles": {
@@ -108,11 +108,10 @@ def apply_hardware_profile(config, path):
             or profile["cuda_visible_devices"] != "0,1"
             or profile["client_gpu_pool_size"] != 1):
         raise ValueError("Hardware profile does not assign the declared population and two separate GPUs")
-    if profile.get("worker_count_policy") != "fixed":
+    if profile.get("worker_count_policy") != "fixed_hardware":
         raise ValueError("Hardware requires an explicit fixed worker policy")
     expected_workers = profile.get("worker_counts", {}).get(backend)
-    if (type(expected_workers) is not int or not 3 <= expected_workers <= population
-            or expected_workers != config.resources.max_concurrent_clients):
+    if type(expected_workers) is not int or not 3 <= expected_workers <= population:
         raise ValueError("Frozen hardware and runtime worker population differ")
     profiles = {name: Profile(**value) for name, value in profile["profiles"].items()}
     profiles["gpu"] = replace(profiles["gpu"], gpu_fraction=config.resources.client_gpus_per_worker)
@@ -126,7 +125,9 @@ def apply_hardware_profile(config, path):
     return replace(
         config, server_device=profile["server_device"], profiles=profiles, client_profiles=selected,
         resources=replace(config.resources, client_gpu_pool_size=profile["client_gpu_pool_size"],
-                          mode=profile["resource_mode"]),
+                          mode=profile["resource_mode"], worker_count_policy="fixed_hardware",
+                          max_concurrent_clients=expected_workers,
+                          client_cpus_per_worker=1.0),
         workload={**config.workload, "hardware_profile": identity},
     )
 

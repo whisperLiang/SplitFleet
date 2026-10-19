@@ -35,8 +35,8 @@ from splitfleet.client.app import start_client as split_start_client
 from splitfleet.client.autosplit_split_client import AutoSplitSplitLearningClient
 from splitfleet.common.constants import AUTOSPLIT_MODEL_VERSION_CONFIG_KEY
 from splitfleet.server.app import start_server as split_start_server
-from splitfleet.server.placement.cosplit_ucb import (
-    CoSplitUCBConfig, CoSplitUCBPlacementPolicy, TorchLensCandidateProvider,
+from splitfleet.server.placement.greedy import (
+    GreedyConfig, GreedyPlacementPolicy, TorchLensCandidateProvider,
 )
 from splitfleet.server.strategy import AutoSplitStrategy
 
@@ -46,15 +46,18 @@ FIXED_BOUNDARIES = ("25%", "50%", "75%")
 
 
 def _make_placement_policy(*, provider, bundle, args):
-    """Use the production CoSplit-UCB defaults for every adaptive run."""
-    return CoSplitUCBPlacementPolicy(
-        candidate_provider=provider,
-        config=CoSplitUCBConfig(
-            seed=int(bundle["seed"]), server_concurrency=1,
-            min_residence_rounds=args.min_residence_rounds,
-            state_path=str(Path(args.output).with_suffix(".bandit.json")),
-        ),
-    )
+    """SplitFleet uses measured Greedy; L2S remains an explicit comparator."""
+    controller = getattr(args, "placement_controller", "Greedy")
+    config = GreedyConfig(seed=int(bundle["seed"]),
+        server_concurrency=int(getattr(args, "server_concurrency", 1)),
+        state_path=str(Path(args.output).with_suffix(".placement.json")))
+    if controller == "Greedy":
+        return GreedyPlacementPolicy(candidate_provider=provider, config=config)
+    if controller == "L2S":
+        from experiments.baselines.adaptive_reference import AdaptiveReference
+        return AdaptiveReference(candidate_provider=provider, config=config,
+                                 algorithm="L2S", horizon=args.rounds, output=args.output)
+    raise ValueError("Choose Greedy (SplitFleet default) or L2S")
 
 
 def _seed_training_stream(bundle, rank: int) -> None:
@@ -144,7 +147,7 @@ def _resolve_training_cut_domains(*, model, sample_inputs, bundle):
         abs(candidate.graph_position_ratio - float(fraction.rstrip('%')) / 100),
         candidate.boundary,
     )).boundary for fraction in FIXED_BOUNDARIES}
-    from splitfleet.server.placement.cosplit_ucb.calibration import calibration_boundaries
+    from splitfleet.server.placement.greedy.calibration import calibration_boundaries
     return fixed, calibration_boundaries(candidates)
 
 
@@ -544,6 +547,12 @@ class RecordingFedAvg(FedAvg):
         )
 
     def configure_fit(self, server_round, parameters, client_manager):
+        schedule = getattr(self, "network_phase_provider", None)
+        if schedule is not None:
+            schedule.publish(server_round)
+        if getattr(self, "round_recorder", None) is not None and self.placement_policy is not None:
+            self.placement_policy.transport_probe_observer = lambda probe: self._record_phase(
+                "transport_probe", probe=probe)
         instructions = super().configure_fit(server_round, parameters, client_manager)
         self.state_download_records.extend({"round_id": int(server_round), "cid": str(proxy.cid),
             "model_state_download_bytes": sum(len(value) for value in ins.parameters.tensors)}
@@ -589,11 +598,41 @@ class RecordingSplit(AutoSplitStrategy):
         self.measurement_started_ns = time.monotonic_ns()
         super().__init__(**kwargs)
 
+    def _record_phase(self, event, **details):
+        recorder = getattr(self, "round_recorder", None)
+        if recorder is not None:
+            recorder.event(event, round_id=getattr(self, "_recording_round", None), **details)
+
+    def _plan_round_placements(self, server_round, client_ids, *, training):
+        fresh = (int(server_round), bool(training)) not in self._round_placement_assignments
+        if fresh:
+            self._record_phase("placement_selection_start", training=training)
+        assignment = super()._plan_round_placements(server_round, client_ids, training=training)
+        if fresh:
+            self._record_phase("placement_selection_end", training=training, assignment=assignment)
+        return assignment
+
+    def get_or_create_placement_plan(self, boundary=None, *, training=True):
+        self._record_phase("placement_prepare_start", boundary=boundary, training=training)
+        placement = super().get_or_create_placement_plan(boundary, training=training)
+        self._record_phase("placement_prepare_end", boundary=boundary, training=training)
+        return placement
+
     def configure_fit(self, server_round, parameters, client_manager):
+        self._recording_round = int(server_round)
+        self._record_phase("configure_fit_start")
+        schedule = getattr(self, "network_phase_provider", None)
+        if schedule is not None:
+            schedule.publish(server_round)
+        policy = getattr(self, "placement_policy", None)
+        if policy is not None:
+            policy.transport_probe_observer = lambda probe: self._record_phase(
+                "transport_probe", probe=probe)
         instructions = super().configure_fit(server_round, parameters, client_manager)
         self.state_download_records.extend({"round_id": int(server_round), "cid": str(proxy.cid),
             "model_state_download_bytes": sum(len(value) for value in ins.parameters.tensors)}
             for proxy, ins in instructions)
+        self._record_phase("configure_fit_end")
         return instructions
 
     def aggregate_fit(self, server_round, results, failures):
@@ -613,15 +652,31 @@ class RecordingSplit(AutoSplitStrategy):
                                        for res in results)
         return super().aggregate_server_fit(server_round, results)
 
+    def _update_placement_policy_after_fit(self, server_round, results, failures):
+        if getattr(self.placement_policy, "algorithm", None) == "L2S":
+            from experiments.physical_adaptive_baselines import reference_feedback
+            if failures:
+                raise RuntimeError("Reference physical arm has failed fits; preserve and stop")
+            self.placement_policy.observe_round(round_id=server_round,
+                feedback=reference_feedback(server_round, results))
+        else:
+            super()._update_placement_policy_after_fit(server_round, results, failures)
+
     def evaluate(self, server_round, client_parameters, server_parameters):
+        self._record_phase("evaluation_start")
+        evaluation_started = time.monotonic_ns()
         _ = server_parameters
         self.backend_adapter.load_ndarrays(self.model, parameters_to_ndarrays(client_parameters))
         metrics = _evaluate_physical(self.workload, self.model,
                                      device=torch.device(self.runtime_device))
         self.evaluation_records.append({
             "round_id": int(server_round), "metrics": metrics,
+            "duration_sec": (time.monotonic_ns() - evaluation_started) / 1e9,
             "elapsed_sec": (time.monotonic_ns() - self.measurement_started_ns) / 1e9,
         })
+        recorder = getattr(self, "round_recorder", None)
+        if recorder is not None:
+            recorder.save_round(self, server_round)
         return 0.0, metrics
 
 
@@ -636,6 +691,9 @@ def run_server(args: argparse.Namespace, *, placement_policy_factory=None,
     torch.set_num_threads(1)
     torch.manual_seed(int(bundle["seed"]))
     model = workload.model_factory().to(args.device)
+    server_concurrency = int(getattr(args, "server_concurrency", 1))
+    if server_concurrency < 1:
+        raise ValueError("server_concurrency must be positive")
     model.load_state_dict(bundle["initial_model_state"])
     _seed_training_stream(bundle, 999)
     if tensor_state_hash(model.state_dict()) != bundle["initial_model_hash"]:
@@ -720,9 +778,24 @@ def run_server(args: argparse.Namespace, *, placement_policy_factory=None,
             runtime_device=args.device, **common,
             owned_state_exchange=owned_exchange,
         )
+        # Fixed-boundary runs have no placement policy object from which the
+        # gRPC server can read the execution-lane limit.
+        strategy.server_concurrency = server_concurrency
+        if getattr(args, "network_schedule", None) is not None:
+            from experiments.common.network_schedule import RoundNetworkSchedule
+            strategy.network_phase_provider = RoundNetworkSchedule.from_file(
+                args.network_schedule, args.network_control)
+            strategy.network_phase_provider.publish_initialization()
         strategy.measurement_started_ns = start_monotonic_ns
         # Validate the complete catalog once; construct executable plans lazily
         # for the cuts actually selected for this round.
+        from experiments.common.physical_progress import PhysicalRoundRecorder
+        strategy.round_recorder = PhysicalRoundRecorder(args.output, measurement_started_ns=start_monotonic_ns,
+            metadata={"model_id": bundle["model_id"], "seed": bundle["seed"], "rounds": args.rounds,
+                      "initial_model_hash": bundle["initial_model_hash"], "partition_hash": bundle["partition_hash"],
+                      "data_content_hash": bundle["data_content_hash"], "worker_ids": bundle["worker_ids"],
+                      "server_training_concurrency": server_concurrency,
+                      "placement_controller": getattr(args, "placement_controller", "Greedy")})
         if policy is not None:
             policy.candidate_provider.get_candidates(training=True)
             policy.prepare_calibration(
@@ -753,14 +826,13 @@ def run_server(args: argparse.Namespace, *, placement_policy_factory=None,
         "aggregation_order": "ascending logical client_index",
         "online_cost_learning": policy is not None,
         "cost_initialization_receipt": getattr(policy.telemetry_provider, "receipt", None) if policy else None,
-        "mean_exploration_diagnostics": getattr(policy.exploration_controller, "round_records", {}) if policy else {},
         "online_calibration_boundaries": bundle.get("online_calibration_boundaries"),
-        "cosplit_config": vars(policy.config) if policy is not None else None,
+        "greedy_config": vars(policy.config) if policy is not None else None,
         "online_worker_contexts": (
             dict(policy.telemetry_provider.clients)
             if policy is not None else None
         ),
-        "min_residence_rounds": args.min_residence_rounds,
+        "decision_granularity": "federated_round",
         "image_model": bundle.get("image_model"),
         "model_id": bundle.get("model_id", bundle.get("image_model")),
         "math_policy": math_policy,
@@ -813,6 +885,10 @@ def run_server(args: argparse.Namespace, *, placement_policy_factory=None,
         "history": str(history), "started_unix": start, "finished_unix": time.time(),
         "server_duration_sec": (time.monotonic_ns() - start_monotonic_ns) / 1e9,
         "server_device": args.device,
+        "server_training_concurrency": server_concurrency,
+        "placement_controller": getattr(args, "placement_controller", "Greedy")
+            if policy is not None else None,
+        "server_rng_scope": "independent Torch RNG state per suffix replica",
         "fit_barrier": "all_configured_workers_ready",
     }
     if fedcompass_server is not None:
@@ -823,6 +899,8 @@ def run_server(args: argparse.Namespace, *, placement_policy_factory=None,
     experiment_result = getattr(strategy, "experiment_result", None)
     if experiment_result is not None:
         result["physical_placement_experiment"] = experiment_result()
+    if getattr(strategy, "network_phase_provider", None) is not None:
+        result["network_schedule"] = strategy.network_phase_provider.receipt()
     output.parent.mkdir(parents=True, exist_ok=True)
     write_training_result(output, result, strategy.model.state_dict(),
                           save_model=getattr(args, "save_model", False))
@@ -897,6 +975,8 @@ def run_client(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    from experiments.common.physical_progress import enable_native_diagnostics
+    enable_native_diagnostics()
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="role", required=True)
     prepare = sub.add_parser("prepare")
@@ -923,10 +1003,13 @@ def main() -> None:
         item.add_argument("--optimizer", choices=("sgd", "adam"), default="sgd")
         item.add_argument("--fixed-boundary", choices=("25%", "50%", "75%"), default="50%")
         item.add_argument("--split-state-exchange", choices=("full", "owned"), default="full")
-        item.add_argument("--min-residence-rounds", type=int, default=2,
-                          help="CoSplit-UCB residence; values above the run length hold the initial cut")
         if role == "server":
+            item.add_argument("--placement-controller", choices=("Greedy", "L2S"), default="Greedy")
+            item.add_argument("--network-schedule", type=Path)
+            item.add_argument("--network-control", type=Path)
             item.add_argument("--bind", required=True)
+            item.add_argument("--server-concurrency", type=int, default=1,
+                              help="Concurrent suffix replicas on this server GPU; Torch RNG is isolated when greater than one")
             item.add_argument("--rounds", type=int, default=3)
             item.add_argument("--output", type=Path, required=True)
             item.add_argument("--save-model", action="store_true", help="Retain full final weights for re-evaluation")

@@ -11,7 +11,7 @@ from splitfleet.tasks.losses import extract_logits, sparse_cross_entropy
 
 from experiments.resnet50_quality.model_contract import TRAINABLE_NAMES
 
-BACKENDS = {name: None for name in ("pytorch", "tensorflow", "paddle", "jax")}
+BACKENDS = {name: None for name in ("pytorch", "tensorflow", "paddle", "jax", "tinygrad")}
 MODULES = {"tensorflow": "tf", "pytorch": "torch"}
 
 
@@ -61,9 +61,10 @@ def configure_backend(backend):
         faulthandler.disable()
         paddle.disable_signal_handler()
         faulthandler.enable(file=2, all_threads=True)
-        paddle.set_flags({"FLAGS_cudnn_deterministic": True,
-                          "FLAGS_enable_cublas_tensor_op_math": False,
-                          "FLAGS_cudnn_exhaustive_search": False})
+        if paddle.is_compiled_with_cuda():
+            paddle.set_flags({"FLAGS_cudnn_deterministic": True,
+                              "FLAGS_enable_cublas_tensor_op_math": False,
+                              "FLAGS_cudnn_exhaustive_search": False})
 
 
 def model_module(backend):
@@ -121,6 +122,9 @@ def native_batch(backend, images, labels, device):
         import jax
         resolved = jax.devices("gpu" if device.startswith("cuda") else "cpu")[int(device.split(":")[-1]) if ":" in device else 0]
         return jax.device_put(images, resolved), jax.device_put(labels, resolved)
+    if backend == "tinygrad":
+        from tinygrad import Tensor
+        return Tensor(images, device=device.upper()).realize(), Tensor(labels, device=device.upper()).realize()
     raise ValueError(backend)
 
 
@@ -137,6 +141,8 @@ def native_parameters(backend, model):
         return dict(model.named_parameters())
     if backend == "jax":
         return dict(model.params)
+    if backend == "tinygrad":
+        return {name: value for name, value in model.state_tensors().items() if name in TRAINABLE_NAMES}
     raise ValueError(backend)
 
 
@@ -162,10 +168,18 @@ def optimizer(backend, model, learning_rate):
     if backend == "jax":
         from splitfleet.runtime.functional_sgd import OwnedFunctionalSGD
         return OwnedFunctionalSGD(model, learning_rate)
+    if backend == "tinygrad":
+        from tinygrad.nn.optim import SGD
+        return SGD(list(native_parameters(backend, model).values()), lr=learning_rate)
     raise ValueError(backend)
 
 
 def train_step(backend, model, images, labels, *, learning_rate=.05, native_optimizer=None, capture=False):
+    if backend == "tinygrad":
+        from tinygrad import Tensor
+        with Tensor.train():
+            return _train_step(backend, model, images, labels, learning_rate=learning_rate,
+                               native_optimizer=native_optimizer, capture=capture)
     from splitfleet.backends.utils import (
         native_device_scope,
         paddle_model_device,
@@ -201,7 +215,7 @@ def _train_step(backend, model, images, labels, *, learning_rate=.05, native_opt
             return sparse_cross_entropy(output["logits"], labels), output
         (loss, output), grads = jax.value_and_grad(objective, has_aux=True)(model.params)
     else:
-        opt.zero_grad() if backend == "pytorch" else opt.clear_grad()
+        opt.zero_grad() if backend in {"pytorch", "tinygrad"} else opt.clear_grad()
         output = model(images)
         loss = sparse_cross_entropy(extract_logits(output), labels)
         loss.backward()

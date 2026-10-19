@@ -51,6 +51,12 @@ class Evidence:
         self.lock = RLock()
         self.started = time.perf_counter()
         self.config = config
+        self.expected_capacity_observation = None
+        capacity_receipt = self.directory / "capacity_observation.json"
+        if capacity_receipt.exists():
+            self.expected_capacity_observation = json.loads(
+                capacity_receipt.read_text(encoding="utf-8")
+            )
         if not prepared:
             self.write("config.json", config.as_dict())
         versions = {}
@@ -113,3 +119,37 @@ class Evidence:
             json.loads(line)
             for line in (self.directory / name).read_text().splitlines()
         ]
+
+    def record_capacity_observation(self, resources, *, native_pool_size):
+        """Persist and, on replay, verify the native Worker admission receipt."""
+        observation = resources.capacity_observation
+        if observation is None:
+            raise RuntimeError("Native Worker admission did not produce a capacity receipt")
+        receipt = {
+            "worker_target_count": resources.worker_target_count,
+            "predicted_worker_capacity": observation.get("predicted"),
+            "native_worker_pool_size": int(native_pool_size),
+            "effective_worker_capacity": resources.effective_worker_capacity,
+            "capacity_observation": observation,
+        }
+        expected = self.expected_capacity_observation
+        if expected is not None:
+            expected_pool = expected.get("native_worker_pool_size")
+            expected_effective = expected.get("effective_worker_capacity")
+            if (
+                expected_pool is not None
+                and int(expected_pool) != int(native_pool_size)
+            ) or (
+                expected_effective is not None
+                and int(expected_effective)
+                != int(resources.effective_worker_capacity)
+            ):
+                raise RuntimeError(
+                    "Native Worker admission differs from the frozen capacity receipt: "
+                    f"expected pool={expected_pool}, effective={expected_effective}; "
+                    f"observed pool={native_pool_size}, "
+                    f"effective={resources.effective_worker_capacity}"
+                )
+            return receipt
+        self.write("capacity_observation.json", receipt)
+        return receipt

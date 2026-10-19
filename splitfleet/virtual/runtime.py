@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-import importlib.metadata
+import inspect
+import json
 import math
 import os
 import sys
@@ -19,11 +20,11 @@ from flwr.server import SimpleClientManager
 from torch.utils.data import default_collate
 
 from splitfleet.autosplit import ExecutionSchedulePolicy
-from splitfleet.server.placement.cosplit_ucb import (
-    CoSplitUCBConfig,
-    CoSplitUCBPlacementPolicy,
+from splitfleet.server.placement.greedy import (
+    GreedyConfig,
+    GreedyPlacementPolicy,
 )
-from splitfleet.server.placement.cosplit_ucb.candidate_provider import (
+from splitfleet.server.placement.greedy.candidate_provider import (
     TorchLensCandidateProvider,
 )
 from splitfleet.server.stage_runtime.manager import StageRuntimeManager
@@ -93,15 +94,30 @@ def initialize_ray(config, ray, ops=None):
     """Use the native Ray resource budget and admit the exact worker pool."""
     resources = config.resources
     ops = ops or FrameworkOps()
+    initialized = ray.is_initialized()
     init_args = {"include_dashboard": False, "ignore_reinit_error": False}
     if resources.ray_address:
         init_args["address"] = resources.ray_address
     else:
-        cpu_budget = resources.client_cpus_per_worker * resources.max_concurrent_clients
-        integer_budget = math.isclose(cpu_budget, round(cpu_budget), rel_tol=0, abs_tol=1e-9)
-        if not integer_budget and cpu_budget > 1:
-            raise ValueError("Ray 2.51.1 requires an integer local CPU budget")
-        init_args.update(num_cpus=round(cpu_budget) if integer_budget else cpu_budget,
+        worker_capacity = (
+            resources.effective_worker_capacity
+            or resources.max_concurrent_clients
+            or config.virtual_clients.total
+        )
+        cpu_budget = (resources.client_cpus_per_worker or 1.0) * worker_capacity
+        # Actor reservations may be fractional; a Ray node's total CPUs must
+        # be integral. Memory admission can reduce the worker count after its
+        # reservation was derived. Spread the rounded budget over precisely
+        # those workers so rounding up does not create an oversized pool.
+        native_cpu_budget = (round(cpu_budget)
+                             if math.isclose(cpu_budget, round(cpu_budget), rel_tol=0, abs_tol=1e-9)
+                             else math.ceil(cpu_budget))
+        if not initialized and native_cpu_budget != cpu_budget:
+            reservation = native_cpu_budget / worker_capacity
+            if int(native_cpu_budget / reservation) < worker_capacity:
+                reservation = math.nextafter(reservation, 0.)
+            object.__setattr__(resources, "client_cpus_per_worker", reservation)
+        init_args.update(num_cpus=native_cpu_budget,
                          object_store_memory=resources.object_store_memory_mb * 2**20)
         if resources.client_gpus_per_worker:
             available = ops.gpu_count()
@@ -113,14 +129,23 @@ def initialize_ray(config, ray, ops=None):
             # Ray otherwise autodetects GPU resources, including a GPU reserved
             # for this process's suffix/coordinator.
             init_args["num_gpus"] = 0
-    if not ray.is_initialized():
+    if not initialized:
+        worker_threads = str(max(profile.torch_threads for profile in config.profiles.values()))
         environment = {"env_vars": {
             "PYTHONPATH": os.pathsep.join(sys.path),
+            # Set native pools before the reused actor imports its frameworks.
+            # Per-task Torch scopes should not rebuild a host-sized pool.
+            "OMP_NUM_THREADS": worker_threads,
+            "MKL_NUM_THREADS": worker_threads,
+            "OPENBLAS_NUM_THREADS": worker_threads,
+            "TF_NUM_INTRAOP_THREADS": worker_threads,
+            "TF_NUM_INTEROP_THREADS": "1",
             **{name: os.environ[name] for name in (
                 "CUBLAS_WORKSPACE_CONFIG", "NVIDIA_TF32_OVERRIDE", "OMP_NUM_THREADS",
                 "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                 "TF_NUM_INTRAOP_THREADS", "TF_NUM_INTEROP_THREADS",
-                "TF_ENABLE_ONEDNN_OPTS", "JAX_PLATFORMS", "JAX_DEFAULT_MATMUL_PRECISION",
+                "TF_ENABLE_ONEDNN_OPTS", "TF_FORCE_GPU_ALLOW_GROWTH",
+                "JAX_PLATFORMS", "JAX_DEFAULT_MATMUL_PRECISION",
                 "XLA_PYTHON_CLIENT_PREALLOCATE", "XLA_PYTHON_CLIENT_ALLOCATOR",
                 "XLA_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_MEM_FRACTION", "CACHELEVEL",
                 "XLA_FLAGS", "PYTHONFAULTHANDLER",
@@ -133,19 +158,72 @@ def initialize_ray(config, ray, ops=None):
             environment["working_dir"] = str(Path(__file__).resolve().parents[2])
         ray.init(runtime_env=environment, **init_args)
     from flwr.simulation.ray_transport.ray_actor import pool_size_from_resources
-    actual = pool_size_from_resources({"num_cpus": resources.client_cpus_per_worker,
+    actual = pool_size_from_resources({"num_cpus": resources.client_cpus_per_worker or 1.0,
                                        "num_gpus": resources.client_gpus_per_worker})
-    if actual != resources.max_concurrent_clients:
+    predicted = resources.effective_worker_capacity or resources.max_concurrent_clients
+    if predicted is None:
+        raise RuntimeError("Worker capacity was not admitted before Ray initialization")
+    if actual != predicted:
+        message = {
+            "event": "worker_capacity_mismatch",
+            "predicted": int(predicted),
+            "actual": int(actual),
+            "policy": resources.worker_count_policy,
+            "configured_policy": resources.worker_count_policy,
+            "source": "native_flower_ray_pool",
+        }
+        # Fixed experiments are reproducibility contracts.  The maximizing
+        # policy can adopt a smaller native pool and keep logical clients
+        # queued in Flower; it never fabricates capacity.
+        if resources.strict_worker_capacity or actual > predicted:
+            resources.record_capacity_observation(
+                int(actual), predicted=int(predicted)
+            )
+            raise ValueError(
+                f"Native Flower pool has {actual} workers; expected {predicted} "
+                f"for admitted worker_count_policy={resources.worker_count_policy}. "
+                f"Use a Ray pool within the admitted limit or increase the per-worker "
+                f"resource reservation: {message}"
+            )
+        print(json.dumps(message, sort_keys=True), flush=True)
+        resources.adopt_capacity(int(actual), predicted=int(predicted))
+    else:
+        resources.adopt_capacity(int(actual), predicted=int(predicted))
+    _validate_explicit_suffix_concurrency(resources)
+    capacities = [
+        resources.effective_server_concurrency,
+        *resources.server_concurrency_by_round.values(),
+    ]
+    if max(capacities) > resources.resident_suffix_capacity:
         raise ValueError(
-            f"Native Flower pool has {actual} workers; expected {resources.max_concurrent_clients} "
-            f"for worker_count_policy={resources.worker_count_policy}. "
-            "Adjust the CPU/GPU reservations or supply a larger Ray cluster; "
-            "the runtime will not fall back to fewer workers."
+            "Native worker admission left fewer resident suffix slots than the "
+            "configured server execution concurrency"
         )
     return init_args, actual
 
 
+def _validate_explicit_suffix_concurrency(resources):
+    """Reject explicit lane requests that no longer fit resident slots."""
+    resident = resources.resident_suffix_capacity
+    if resources.server_concurrency is not None and resources.server_concurrency > resident:
+        raise ValueError(
+            "server_concurrency exceeds the admitted resident suffix capacity"
+        )
+    if any(capacity > resident for capacity in resources.server_concurrency_by_round.values()):
+        raise ValueError(
+            "server_concurrency_by_round exceeds the admitted resident suffix capacity"
+        )
+
+
 def check_simulation_dependencies():
+    """Load the current Flower Simulation Runtime entry point.
+
+    SplitFleet deliberately targets the modern ``ClientApp``/``ServerApp``
+    entry point.  There is no legacy ``start_simulation`` or old-version
+    compatibility branch here.  The version itself is left to the lockfile;
+    the callable signature is checked so an incompatible installation fails
+    with an actionable message before Ray is started.
+    """
     try:
         import ray
         from flwr.simulation import run_simulation
@@ -153,16 +231,36 @@ def check_simulation_dependencies():
         raise RuntimeError(
             "Virtual SFL needs the native simulation dependencies. Install with: uv sync --extra simulation"
         ) from exc
-    if importlib.metadata.version("flwr") != "1.29.0" or ray.__version__ != "2.51.1":
+    required = {"server_app", "client_app", "num_supernodes"}
+    if not callable(run_simulation) or not required.issubset(inspect.signature(run_simulation).parameters):
         raise RuntimeError(
-            "This adapter is verified against Flower 1.29.0 / Ray 2.51.1; use uv sync --extra simulation"
+            "The installed Flower package does not expose the current "
+            "ClientApp/ServerApp run_simulation API; install flwr[simulation] "
+            "from the locked project environment."
         )
     return ray, run_simulation
+
+
+def _stochastic_torch_modules(model):
+    """Return native Torch modules that consume random values.
+
+    The list is retained as an admission receipt and diagnostics field.  It is
+    not a concurrency gate: Torch suffix replicas always receive a private
+    thread-local RNG by default, including when several lanes are active.
+    """
+    if not isinstance(model, torch.nn.Module):
+        return ()
+    stochastic = []
+    for module in model.modules():
+        if isinstance(module, (torch.nn.modules.dropout._DropoutNd, torch.nn.RNNBase)):
+            stochastic.append(module.__class__.__name__)
+    return tuple(stochastic)
 
 
 def _admit_resources(config, model, ops=None):
     ops = ops or FrameworkOps.for_model(model)
     ops.admit_device(config.server_device)
+    _validate_explicit_suffix_concurrency(config.resources)
     if (
         not config.resources.ray_address
         and any(p.device.startswith("cuda") for p in config.profiles.values())
@@ -172,21 +270,14 @@ def _admit_resources(config, model, ops=None):
             "No local GPU is available for the declared virtual client profiles"
         )
     capacities = [
-        config.resources.server_concurrency,
+        config.resources.effective_server_concurrency,
         *config.resources.server_concurrency_by_round.values(),
     ]
-    if (config.resources.resident_suffix_capacity > config.resources.suffix_capacity
-            or max(capacities) > config.resources.resident_suffix_capacity):
+    if max(capacities) > config.resources.resident_suffix_capacity:
         raise ValueError(
-            "Server execution lanes cannot exceed the admitted suffix replica capacity"
+            "Server execution lanes cannot exceed resident suffix capacity"
         )
-    if ops.backend == "torch" and max(capacities) > 1 and any(
-        isinstance(m, (torch.nn.modules.dropout._DropoutNd, torch.nn.RNNBase))
-        for m in model.modules()
-    ):
-        raise ValueError(
-            "Stochastic suffix models require server_concurrency=1 for isolated Torch RNG state"
-        )
+    stochastic = _stochastic_torch_modules(model) if ops.backend == "torch" else ()
     state_bytes = ops.state_bytes(model)
     # Explicit state/optimizer floor; graph/activation memory is additionally
     # measured in runtime receipts, rather than passed off as this estimate.
@@ -194,6 +285,74 @@ def _admit_resources(config, model, ops=None):
             and config.resources.suffix_capacity != config.virtual_clients.total):
         raise ValueError("Per-client suffix model count must equal the logical client population")
     required = state_bytes * (4 * config.resources.resident_suffix_capacity + 3) / 2**20
+    # Native suffix state/optimizer memory is a physical-slot constraint.  A
+    # maximizing run may lower its admitted worker count before the manager is
+    # built; a fixed run fails closed instead of silently queueing a smaller
+    # experiment than requested.
+    def constrain_by_memory(available_mb, source):
+        if available_mb is None:
+            return
+        capacity = math.floor((available_mb * 2**20 / max(state_bytes, 1) - 3) / 4)
+        capacity = max(0, capacity)
+        # Server memory limits materialized suffix replicas.  A run may have
+        # many client workers while keeping only a smaller resident suffix
+        # population (``max_suffix_replicas``/``max_resident_suffix_replicas``).
+        # Compare against that physical suffix bound instead of shrinking the
+        # unrelated client worker pool.
+        current = config.resources.resident_suffix_capacity
+        if capacity >= current:
+            return
+        explicit_suffix_bound = (
+            config.resources.max_suffix_replicas is not None
+            or config.resources.max_resident_suffix_replicas is not None
+        )
+        if not explicit_suffix_bound and config.resources.strict_worker_capacity:
+            raise MemoryError(
+                f"{source} admits {capacity} suffix slots, below strict worker capacity {current}"
+            )
+        if capacity < 1:
+            raise MemoryError(f"{source} cannot admit one suffix execution slot")
+        print(
+            json.dumps(
+                {
+                    "event": (
+                        "suffix_capacity_memory_bound"
+                        if explicit_suffix_bound
+                        else "worker_capacity_memory_bound"
+                    ),
+                    "predicted": current,
+                    "actual": capacity,
+                    "source": source,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        if explicit_suffix_bound:
+            # Keep logical suffix-model count and client-worker capacity intact;
+            # only the number of native suffixes resident at once is reduced.
+            object.__setattr__(
+                config.resources,
+                "max_resident_suffix_replicas",
+                int(capacity),
+            )
+        else:
+            config.resources.adopt_capacity(
+                int(capacity), predicted=int(current), source=source
+            )
+
+    constrain_by_memory(config.resources.server_memory_budget_mb, "declared_server_memory_budget")
+    _validate_explicit_suffix_concurrency(config.resources)
+    required = state_bytes * (4 * config.resources.resident_suffix_capacity + 3) / 2**20
+    if max(
+        [
+            config.resources.effective_server_concurrency,
+            *config.resources.server_concurrency_by_round.values(),
+        ]
+    ) > config.resources.resident_suffix_capacity:
+        raise ValueError(
+            "Server execution lanes exceed the memory-admitted resident suffix capacity"
+        )
     if (
         config.resources.server_memory_budget_mb is not None
         and required > config.resources.server_memory_budget_mb
@@ -203,17 +362,31 @@ def _admit_resources(config, model, ops=None):
         )
     if config.server_device.startswith("cuda"):
         free = ops.free_gpu_memory(config.server_device)
+        constrain_by_memory(
+            free / 2**20 if free is not None else None,
+            "server_gpu_free_memory",
+        )
+        _validate_explicit_suffix_concurrency(config.resources)
         if free is not None and required * 2**20 > free:
-            raise MemoryError(
-                "Available server GPU memory is below the suffix state/optimizer admission floor"
-            )
+            required = state_bytes * (4 * config.resources.resident_suffix_capacity + 3) / 2**20
+            if required * 2**20 > free:
+                raise MemoryError(
+                    "Available server GPU memory is below the suffix state/optimizer admission floor"
+                )
+    required = state_bytes * (4 * config.resources.resident_suffix_capacity + 3) / 2**20
     return {
         "state_bytes": state_bytes,
         "state_optimizer_floor_mb": required,
         "floor_source": "estimated",
         "framework_backend": ops.backend,
         "suffix_model_count": config.resources.suffix_capacity,
+        "logical_suffix_model_count": config.resources.logical_suffix_models,
         "resident_suffix_limit": config.resources.resident_suffix_capacity,
+        "effective_worker_capacity": config.resources.effective_worker_capacity,
+        "effective_suffix_slots": config.resources.effective_suffix_slots,
+        "effective_server_concurrency": config.resources.effective_server_concurrency,
+        "stochastic_suffix_modules": list(sorted(set(stochastic))),
+        "replica_rng_isolation": ops.backend == "torch",
     }
 
 
@@ -264,10 +437,18 @@ def run_virtual(config: VirtualConfig, spec: TrainingSpec, *, output: str | Path
                 )
             )
             sample = ops.prepare_batch(model, sample, config.server_device)
+            # Admit the native Flower/Ray pool before constructing server
+            # executors.  Any non-strict capacity mismatch is therefore
+            # reflected in both worker and suffix-slot limits.
+            init_args, actual = initialize_ray(config, ray, ops)
+            admission["native_worker_pool_size"] = actual
+            evidence.record_capacity_observation(
+                config.resources, native_pool_size=actual
+            )
             scratch = tempfile.TemporaryDirectory(prefix="splitfleet-round-state-")
             store = RoundStateStore(scratch.name)
             policy = None
-            if config.placement == "cosplit_ucb" or spec.placement_policy_factory is not None:
+            if config.placement == "greedy" or spec.placement_policy_factory is not None:
                 provider_model = ops.adapter.clone_model(model)
                 provider_kwargs = {
                     "model": provider_model,
@@ -281,14 +462,20 @@ def run_virtual(config: VirtualConfig, spec: TrainingSpec, *, output: str | Path
                 provider = (
                     spec.candidate_provider_factory or TorchLensCandidateProvider
                 )(**provider_kwargs)
-                policy = (spec.placement_policy_factory or CoSplitUCBPlacementPolicy)(
+                policy = (spec.placement_policy_factory or GreedyPlacementPolicy)(
                     candidate_provider=provider,
-                    config=CoSplitUCBConfig(
-                        server_concurrency=config.resources.server_concurrency,
+                    config=GreedyConfig(
+                        server_concurrency=config.resources.effective_server_concurrency,
                         seed=config.seed,
-                        state_path=str(evidence.directory / "cosplit_state.json"),
+                        state_path=str(evidence.directory / "greedy_state.json"),
                     ),
                 )
+            # Placement policies may create one logical suffix configuration
+            # per client, but those configurations still use resettable native
+            # slots unless persistent per-client suffix state was requested.
+            # This keeps logical model identity separate from physical model
+            # residency while retaining Worker/slot reuse by default.
+            independent_suffix_models = bool(config.resources.per_client_suffix_models)
             strategy = VirtualStrategy(
                 virtual_config=config,
                 evidence=evidence,
@@ -305,7 +492,7 @@ def run_virtual(config: VirtualConfig, spec: TrainingSpec, *, output: str | Path
                 round_state_store=store,
                 dynamic_batch=(1, config.batch_size),
                 runtime_device=config.server_device,
-                defer_server_models=config.resources.per_client_suffix_models,
+                defer_server_models=independent_suffix_models,
                 optimizer_fn=OptimizerFactory(config.optimizer, config.learning_rate, ops.backend),
                 integer_aggregation_policy=spec.integer_aggregation_policy,
                 execution_schedule_policy=ExecutionSchedulePolicy(
@@ -321,9 +508,17 @@ def run_virtual(config: VirtualConfig, spec: TrainingSpec, *, output: str | Path
                 autosplit_session=strategy.autosplit_session,
                 replica_capacity=config.resources.resident_suffix_capacity,
                 state_store=store,
-                reuse_completed_replicas=not config.resources.per_client_suffix_models,
-                per_client_models=config.resources.per_client_suffix_models,
-                model_capacity=config.resources.suffix_capacity,
+                reuse_completed_replicas=not independent_suffix_models,
+                per_client_models=independent_suffix_models,
+                model_capacity=(
+                    config.virtual_clients.total
+                    if independent_suffix_models
+                    else config.resources.suffix_capacity
+                ),
+                # Every Torch suffix replica owns a private, thread-local RNG.
+                # This remains enabled for deterministic models as well, so a
+                # later cut change cannot silently alter concurrency semantics.
+                replica_rng_isolation=bool(admission.get("replica_rng_isolation", ops.backend == "torch")),
             )
             strategy.bind_stage_runtime_manager(manager)
             server = VirtualServer(
@@ -332,10 +527,13 @@ def run_virtual(config: VirtualConfig, spec: TrainingSpec, *, output: str | Path
                 strategy=strategy,
                 server_model_manager=manager,
             )
+            # This is only the coordinator's proxy-call thread pool.  It may
+            # fan out logical Flower requests while Ray's native actor pool
+            # remains bounded by the admitted Worker capacity below.
             server.set_max_workers(config.virtual_clients.total)
             max_concurrency = max(
                 [
-                    config.resources.server_concurrency,
+                    config.resources.effective_server_concurrency,
                     *config.resources.server_concurrency_by_round.values(),
                 ]
             )
@@ -363,8 +561,14 @@ def run_virtual(config: VirtualConfig, spec: TrainingSpec, *, output: str | Path
                 servicer=servicer,
             )
             strategy.service = service
+            from splitfleet.server.telemetry import LiveServerTelemetry
+            servicer.telemetry = LiveServerTelemetry(device=config.server_device,
+                                                     concurrency=max_concurrency)
             if policy is not None:
                 policy.runtime_context_provider = RuntimeConditions(strategy)
+                bind_telemetry = getattr(policy, "bind_server_telemetry", None)
+                if bind_telemetry is not None:
+                    bind_telemetry(servicer.telemetry)
             import asyncio
 
             manager.before_collect = lambda: asyncio.run_coroutine_threadsafe(
@@ -373,11 +577,7 @@ def run_virtual(config: VirtualConfig, spec: TrainingSpec, *, output: str | Path
             app = make_server_app(server, rounds=config.rounds, service=service)
 
             resources = config.resources
-            init_args, actual = initialize_ray(config, ray, ops)
-            admission["native_worker_pool_size"] = actual
-            client_factory = ClientFactory(
-                config=config, spec=spec, partitions=partitions, run_scope=str(evidence.directory)
-            )
+            client_factory = ClientFactory(config=config, spec=spec, partitions=partitions)
             run_simulation(
                 server_app=app,
                 client_app=make_client_app(client_factory),
@@ -385,7 +585,7 @@ def run_virtual(config: VirtualConfig, spec: TrainingSpec, *, output: str | Path
                 backend_config={
                     "init_args": init_args,
                     "client_resources": {
-                        "num_cpus": resources.client_cpus_per_worker,
+                        "num_cpus": resources.client_cpus_per_worker or 1.0,
                         "num_gpus": resources.client_gpus_per_worker,
                     },
                 },
@@ -493,16 +693,22 @@ def run_virtual(config: VirtualConfig, spec: TrainingSpec, *, output: str | Path
                         (r["metrics"]["client_peak_memory_mb"] for r in prefixes),
                         default=None,
                     ),
-                    "worker_limit": resources.max_concurrent_clients,
+                    "worker_limit": resources.effective_worker_capacity,
+                    "worker_target_count": resources.worker_target_count,
+                    "capacity_observation": resources.capacity_observation,
                     "worker_count_policy": resources.worker_count_policy,
-                    "requested_worker_count": config.workload.get("worker_target_count", config.virtual_clients.total),
+                    "requested_worker_count": resources.worker_target_count,
                     "native_worker_pool_size": actual,
-                    "worker_execution_slots_per_process": resources.client_runtime_slots or 1,
-                    "worker_execution_resident_slot_bound": actual * (resources.client_runtime_slots or 1),
+                    "worker_capacity": resources.effective_worker_capacity,
                     "peak_suffix_replicas": manager._delegate.peak_live,
-                    "per_client_suffix_models": resources.per_client_suffix_models,
-                    "suffix_model_count": resources.suffix_capacity,
-                    "observed_suffix_model_count": manager._delegate.peak_client_models if resources.per_client_suffix_models else None,
+                    "per_client_suffix_models": independent_suffix_models,
+                    "suffix_model_count": manager._delegate.peak_logical_model_count,
+                    "logical_suffix_model_count": resources.logical_suffix_models,
+                    "observed_suffix_model_count": (
+                        manager._delegate.peak_logical_model_count
+                        if independent_suffix_models else None
+                    ),
+                    "resident_suffix_model_peak": manager._delegate.peak_client_models,
                     "resident_suffix_limit": resources.resident_suffix_capacity,
                     "suffix_execution_limit": max_concurrency,
                     **round_concurrency(evidence.read_rows("round_metrics.jsonl")),
@@ -520,10 +726,14 @@ def run_virtual(config: VirtualConfig, spec: TrainingSpec, *, output: str | Path
                 "source": "measured",
                 "output": str(evidence.directory),
                 "logical_clients": config.virtual_clients.total,
-                "worker_limit": resources.max_concurrent_clients,
+                "worker_limit": resources.effective_worker_capacity,
+                "worker_target_count": resources.worker_target_count,
+                "capacity_observation": resources.capacity_observation,
                 "worker_count_policy": resources.worker_count_policy,
-                "requested_worker_count": config.workload.get("worker_target_count", config.virtual_clients.total),
-                "suffix_model_count": manager._delegate.peak_client_models if resources.per_client_suffix_models else resources.suffix_capacity,
+                "requested_worker_count": resources.worker_target_count,
+                "suffix_model_count": manager._delegate.peak_logical_model_count,
+                "resident_suffix_model_peak": manager._delegate.peak_client_models,
+                "logical_suffix_model_count": resources.logical_suffix_models,
                 "resident_suffix_limit": resources.resident_suffix_capacity,
                 "suffix_execution_limit": max_concurrency,
                 **round_concurrency(evidence.read_rows("round_metrics.jsonl")),
@@ -543,7 +753,12 @@ def run_virtual(config: VirtualConfig, spec: TrainingSpec, *, output: str | Path
         if not (evidence.directory / "validation.json").exists():
             evidence.write(
                 "validation.json",
-                {"status": "failed", "reason": str(exc), "multi_node": "not_executed"},
+                {
+                    "status": "failed",
+                    "reason": str(exc),
+                    "capacity_observation": config.resources.capacity_observation,
+                    "multi_node": "not_executed",
+                },
             )
         if not (evidence.directory / "summary.json").exists():
             evidence.write(
@@ -551,6 +766,7 @@ def run_virtual(config: VirtualConfig, spec: TrainingSpec, *, output: str | Path
                 {
                     "status": "failed",
                     "reason": str(exc),
+                    "capacity_observation": config.resources.capacity_observation,
                     "wall_sec": time.perf_counter() - started,
                 },
             )

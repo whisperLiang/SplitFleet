@@ -1,1 +1,1 @@
-"""Experimental placement references; production uses CoSplit-UCB."""
+"""Explicit comparators; SplitFleet defaults to measured Greedy placement."""

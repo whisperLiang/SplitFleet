@@ -3,10 +3,14 @@
 import numpy as np
 import pytest
 
+from tests.integration.test_torchlens_optional_frameworks import _run_isolated
+
 
 @pytest.mark.integration
 @pytest.mark.parametrize('device', ['/CPU:0', '/GPU:0'])
-def test_rebound_replica_matches_native_sgd_without_changing_source(device):
+def test_rebound_replica_matches_native_sgd_without_changing_source(request, device):
+    if _run_isolated(request):
+        return
     tf = pytest.importorskip('tensorflow')
     if device.startswith('/GPU') and not tf.config.list_physical_devices('GPU'):
         pytest.skip('A real TensorFlow GPU is required')
@@ -81,7 +85,14 @@ def test_rebound_replica_matches_native_sgd_without_changing_source(device):
 
 
 @pytest.mark.integration
-def test_full_resnet50_replica_matches_native_update_and_batchnorm_state():
+def test_full_resnet50_replica_matches_native_update_and_batchnorm_state(request):
+    if _run_isolated(
+        request,
+        extra_env={
+            "TF_ENABLE_ONEDNN_OPTS": "0",
+        },
+    ):
+        return
     tf = pytest.importorskip('tensorflow')
     if not tf.config.list_physical_devices('GPU'):
         pytest.skip('A real TensorFlow GPU is required')
@@ -146,7 +157,9 @@ def test_full_resnet50_replica_matches_native_update_and_batchnorm_state():
 
 @pytest.mark.integration
 @pytest.mark.parametrize('device', ['/CPU:0', '/GPU:1'])
-def test_private_replicas_share_native_gradient_programs_across_wire_and_threads(device):
+def test_private_replicas_share_native_gradient_programs_across_wire_and_threads(request, device):
+    if _run_isolated(request):
+        return
     from concurrent.futures import ThreadPoolExecutor
     from threading import Barrier, Event
 

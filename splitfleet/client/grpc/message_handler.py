@@ -1,4 +1,4 @@
-from flwr.client.client import (
+from flwr.client.message_handler.message_handler import (
     maybe_call_evaluate,
     maybe_call_fit,
     maybe_call_get_parameters,
@@ -9,16 +9,28 @@ from typing import Callable
 from flwr.common import Message
 from flwr.app.message_type import MessageType
 from flwr.common.constant import MessageTypeLegacy
-from flwr.common.recorddict_compat import (
-    evaluateres_to_recorddict,
-    fitres_to_recorddict,
-    getparametersres_to_recorddict,
-    getpropertiesres_to_recorddict,
-    recorddict_to_evaluateins,
-    recorddict_to_fitins,
-    recorddict_to_getparametersins,
-    recorddict_to_getpropertiesins,
-)
+try:
+    from flwr.compat.common.recorddict_compat import (
+        evaluateres_to_recorddict,
+        fitres_to_recorddict,
+        getparametersres_to_recorddict,
+        getpropertiesres_to_recorddict,
+        recorddict_to_evaluateins,
+        recorddict_to_fitins,
+        recorddict_to_getparametersins,
+        recorddict_to_getpropertiesins,
+    )
+except ImportError:  # Flower 1.29 on the physical Orin workers.
+    from flwr.common.recorddict_compat import (
+        evaluateres_to_recorddict,
+        fitres_to_recorddict,
+        getparametersres_to_recorddict,
+        getpropertiesres_to_recorddict,
+        recorddict_to_evaluateins,
+        recorddict_to_fitins,
+        recorddict_to_getparametersins,
+        recorddict_to_getpropertiesins,
+    )
 
 from splitfleet.common.constants import CLIENT_ID_CONFIG_KEY
 from splitfleet.client.client import Client

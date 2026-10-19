@@ -1,7 +1,7 @@
 rounds: 3
 batch_size: 2
 boundary: after:head
-placement: cosplit_ucb
+placement: greedy
 virtual_clients:
   total: 4
 resources:

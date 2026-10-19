@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -23,8 +24,8 @@ from splitfleet.common.constants import (
     AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY,
 )
 from splitfleet.server.placement import (
-    CoSplitUCBConfig,
-    CoSplitUCBPlacementPolicy,
+    GreedyConfig,
+    GreedyPlacementPolicy,
     SplitCandidateDescriptor,
     StaticCandidateProvider,
 )
@@ -254,7 +255,7 @@ def test_suffix_rejects_an_upload_outside_the_window() -> None:
         )
 
 
-def test_cosplit_ucb_assignment_drives_matching_strategy_boundaries() -> None:
+def test_greedy_assignment_drives_matching_strategy_boundaries() -> None:
     candidates = [
         SplitCandidateDescriptor(
             boundary=boundary,
@@ -266,8 +267,8 @@ def test_cosplit_ucb_assignment_drives_matching_strategy_boundaries() -> None:
             boundary_forward_bytes=128,
             boundary_gradient_bytes=128,
             boundary_tensor_count=1,
-            prefix_parameter_bytes=None,
-            suffix_parameter_bytes=None,
+            prefix_parameter_bytes=64,
+            suffix_parameter_bytes=64,
             client_memory_bytes=None,
             server_memory_bytes=None,
             trainable=True,
@@ -277,9 +278,28 @@ def test_cosplit_ucb_assignment_drives_matching_strategy_boundaries() -> None:
         )
         for boundary, position, prefix in (("after:fc1", 0.3, 2), ("after:fc2", 0.7, 4))
     ]
-    policy = CoSplitUCBPlacementPolicy(
+    policy = GreedyPlacementPolicy(
         candidate_provider=StaticCandidateProvider(candidates),
-        config=CoSplitUCBConfig(max_explorations_per_round=0, min_residence_rounds=0),
+        config=GreedyConfig(),
+        telemetry_provider=SimpleNamespace(
+            client_context=lambda cid: {"logical_client_id": cid, "batch_size": 2, "num_batches": 1},
+            receipt={
+                "server_calibration": {"records": [
+                    {"boundary": "after:fc1", "local_tail_service_ms": 10},
+                    {"boundary": "after:fc2", "local_tail_service_ms": 1}]},
+                "client_samples": [
+                    {"logical_client_id": cid, "boundary": cut,
+                     "client_forward_ms": front, "client_backward_ms": front}
+                    for cid, later in (("slow", 10), ("fast", 1))
+                    for cut, front in (("after:fc1", 1), ("after:fc2", later))],
+                "transport_bootstrap": {"samples": [
+                    {"logical_client_id": cid, "payload_bytes": size, "roundtrip_ms": 1}
+                    for cid in ("slow", "fast") for size in (65536, 2097152)]},
+                "state_exchange_bootstrap": {"samples": [
+                    {"logical_client_id": cid, "request_bytes": size,
+                     "reply_bytes": 65536, "roundtrip_ms": 1}
+                    for cid in ("slow", "fast") for size in (65536, 2097152)]},
+            }),
     )
     strategy = AutoSplitStrategy(
         model=DeepNet(),
@@ -291,6 +311,7 @@ def test_cosplit_ucb_assignment_drives_matching_strategy_boundaries() -> None:
     strategy.bind_stage_runtime_manager(manager)
 
     assignments = strategy._plan_round_placements(1, ["slow", "fast"], training=True)
+    assert assignments == {"slow": "after:fc1", "fast": "after:fc2"}
     slow_plan = strategy._placement_for_client(1, "slow", training=True)
     fast_plan = strategy._placement_for_client(1, "fast", training=True)
     assert slow_plan is strategy._placement_plans[assignments["slow"]]

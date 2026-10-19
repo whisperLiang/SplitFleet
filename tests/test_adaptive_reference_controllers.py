@@ -7,7 +7,7 @@ import torch
 from experiments.baselines.adaptive_reference import (
     AdaptiveReference, LinUCBE, graph_workload_features,
 )
-from splitfleet.server.placement.cosplit_ucb import PlacementFeedback, TorchLensCandidateProvider
+from splitfleet.server.placement.greedy import PlacementFeedback, TorchLensCandidateProvider
 from splitfleet.tasks import ModelInputs
 from experiments.physical_adaptive_baselines import reference_feedback, initial_admitted_boundary
 
@@ -16,23 +16,18 @@ from experiments.physical_adaptive_baselines import reference_feedback, initial_
 def test_evaluation_planning_does_not_initialize_or_advance_reference_training(algorithm):
     # Centralized evaluation produces an empty plan every round, but the
     # placement interface also supports actual client evaluation requests.
-    controller = AdaptiveReference.__new__(AdaptiveReference)
-    controller.algorithm = algorithm
-    controller.state_download_bytes = 123
-    calls = []
-    def evaluation_plan(**kwargs):
-        calls.append(kwargs)
-        assert kwargs['training'] is False
-        return {'a': 'after:evaluation-cut'}
-    controller.clients = {'a': SimpleNamespace(plan_round=evaluation_plan)}
+    from tests.test_greedy_placement import make_policy
+    fixture = make_policy()
+    controller = AdaptiveReference(candidate_provider=fixture.candidate_provider,
+        config=fixture.config, algorithm=algorithm, horizon=10, output="unused.json")
+    controller.telemetry_provider = fixture.telemetry_provider
     def unexpected_initialization():
-        pytest.fail('Evaluation must not initialize or sample the training controller')
+        pytest.fail('Evaluation must not initialize the training controller')
     controller._initialize_reference = unexpected_initialization
-    controller.pending_features = {}
     assert controller.plan_round(round_id=1, client_ids=[], training=False) == {}
-    assert controller.plan_round(round_id=1, client_ids=['a'], training=False) == {'a': 'after:evaluation-cut'}
-    assert calls == [{'round_id': 1, 'client_ids': ['a'], 'training': False}]
-    assert controller.pending_features == {}
+    assert controller.plan_round(round_id=1, client_ids=['a'], training=False) == {'a': 'early'}
+    assert controller.profiles is None and not controller.cost_tables
+
 
 
 def test_l2s_escapes_zero_feedback_fully_local_action():
@@ -71,6 +66,7 @@ def test_reference_feedback_uses_whole_fit_rpc_and_mean_batch_components():
     observations = reference_feedback(2, [(SimpleNamespace(cid='a'),
         SimpleNamespace(metrics=metrics, num_examples=6))])
     assert observations[0].completion_ms == 900
+    assert observations[0].completion_scope == "coordinator_fit_rpc"
     assert observations[0].state_exchange_ms == 300
     assert observations[0].client_forward_ms == 25
     assert observations[0].num_batches == 3

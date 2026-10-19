@@ -26,6 +26,7 @@ from splitfleet.server.server import Server
 from splitfleet.common.utils import run_async
 from splitfleet.common.address import parse_address
 from splitfleet.proto import server_model_pb2_grpc
+from splitfleet.server.telemetry import LiveServerTelemetry
 
 
 ADDRESS_FLEET_API_GRPC_BIDI = "[::]:8080"  # IPv6 to keep start_server compatible
@@ -44,9 +45,14 @@ def init_defaults(
             client_manager = SimpleClientManager()
 
         if getattr(strategy, "uses_stage_runtime", False):
+            # Keep the switch on by default.  TorchReplicaRNG uses a
+            # thread-local dispatch mode and never replaces the process-wide
+            # generator, so this is safe for one or many suffix lanes.
+            replica_rng_isolation = True
             server_model_manager = StageRuntimeManager(
                 init_server_model_fn=strategy.init_server_model_fn,
                 autosplit_session=getattr(strategy, "autosplit_session", None),
+                replica_rng_isolation=replica_rng_isolation,
             )
             if hasattr(strategy, "bind_stage_runtime_manager"):
                 strategy.bind_stage_runtime_manager(server_model_manager)
@@ -84,6 +90,8 @@ async def start_grpc_server(  # pylint: disable=too-many-arguments
     max_message_length: int = GRPC_MAX_MESSAGE_LENGTH,
     keepalive_time_ms: int = 30_000,
     certificates: Optional[Tuple[bytes, bytes, bytes]] = None,
+    telemetry=None,
+    execution_concurrency=None,
 ) -> grpc.Server:
 
     options = [
@@ -120,13 +128,22 @@ async def start_grpc_server(  # pylint: disable=too-many-arguments
     else:
         server.add_insecure_port(server_address)
 
-    slbd_servicer = ServerModelServicer(server_model_manager)
+    slbd_servicer = ServerModelServicer(server_model_manager,
+        execution_concurrency=execution_concurrency, telemetry=telemetry)
+    # Keep the same servicer available for drain/shutdown and telemetry cleanup.
+    server.splitfleet_servicer = slbd_servicer
     server_model_pb2_grpc.add_ServerModelServicer_to_server(slbd_servicer, server)
 
     flwr_servicer = FlowerServiceServicer(client_manager)
     add_FlowerServiceServicer_to_server(flwr_servicer, server)
 
-    await server.start()
+    try:
+        if telemetry is not None:
+            await asyncio.to_thread(telemetry.start)
+        await server.start()
+    except BaseException:
+        slbd_servicer.shutdown_executor()
+        raise
 
     return server
 
@@ -166,12 +183,26 @@ async def start_server(  # pylint: disable=too-many-arguments,too-many-locals
     )
 
     # Start gRPC server
+    active_strategy = initialized_server.strategy
+    placement = getattr(active_strategy, "placement_policy", None)
+    concurrency = getattr(
+        getattr(placement, "config", None),
+        "server_concurrency",
+        getattr(active_strategy, "server_concurrency", 1),
+    ) or 1
+    telemetry = LiveServerTelemetry(device=getattr(active_strategy, "runtime_device", "cpu"),
+                                    concurrency=concurrency)
+    bind_telemetry = getattr(placement, "bind_server_telemetry", None)
+    if bind_telemetry is not None:
+        bind_telemetry(telemetry)
     grpc_server = await start_grpc_server(
         client_manager=initialized_server.client_manager(),
         server_model_manager=initialized_server.server_model_manager,
         server_address=address,
         max_message_length=grpc_max_message_length,
         certificates=certificates,
+        telemetry=telemetry,
+        execution_concurrency=concurrency,
     )
     log(
         INFO,
@@ -192,6 +223,8 @@ async def start_server(  # pylint: disable=too-many-arguments,too-many-locals
 
     finally:
         await grpc_server.stop(grace=1)
+        await grpc_server.splitfleet_servicer.drain()
+        await asyncio.to_thread(grpc_server.splitfleet_servicer.shutdown_executor)
 
     event(EventType.START_SERVER_LEAVE)
 

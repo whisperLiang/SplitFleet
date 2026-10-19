@@ -261,7 +261,7 @@ def _batch_tinygrad_capture_payloads(backend):
     all raw UOps, and native topology/hash logic. Only the discarded boolean
     probe's nested host list is flattened; emitted shapes stay original.
     """
-    from tinygrad import Tensor
+    from tinygrad import Device, Tensor
     from torchlens.backends.tinygrad.backend import TinygradBackend
     from torchlens.backends.tinygrad._uop_graph import _unique_uops
 
@@ -301,6 +301,13 @@ def _batch_tinygrad_capture_payloads(backend):
             for start in range(0, len(candidates), 128):
                 chunk = candidates[start:start + 128]
                 Tensor.realize(*(payload for _, _, payload in chunk))
+                # Realization can queue native work. Complete the copies before
+                # another chunk rebinds live tensors or their UOps are restored.
+                devices = set()
+                for _, _, payload in chunk:
+                    devices.update((payload.device,) if isinstance(payload.device, str) else payload.device)
+                for device in devices:
+                    Device[device].synchronize()
                 for raw, converted, payload in chunk:
                     by_raw[id(raw)] = payload
                     payloads[id(converted)] = payload

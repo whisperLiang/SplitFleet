@@ -139,7 +139,7 @@ def _validate_training_calibration(result, bundle, identities):
     if not expected <= {row.get("boundary") for row in result.get("candidate_catalog", [])}:
         errors.append("training calibration anchors are absent from the candidate catalog")
     if (initialization.get("temporary_optimizer_updates") is not True
-            or initialization.get("discounted_online_updates_retained") is not True
+            or initialization.get("online_feedback_updates_retained", initialization.get("discounted_online_updates_retained")) is not True
             or initialization.get("network_initialized") is not True):
         errors.append("training calibration initialization scope is invalid")
     probe = initialization.get("transport_bootstrap") or {}
@@ -222,7 +222,7 @@ def _validate_training_calibration(result, bundle, identities):
         label = logical_id or "server"
         source = ("client_private_sample_current_deployment" if logical_id is not None
                   else "server_shape_matched_current_deployment")
-        if receipt.get("schema") != "splitfleet.cosplit-calibration" or receipt.get("source") != source:
+        if receipt.get("schema") != "splitfleet.training-calibration" or receipt.get("source") != source:
             errors.append(f"training calibration {label}: schema or source mismatch")
         if (receipt.get("model_hash_before") != bundle.get("initial_model_hash")
                 or receipt.get("model_hash_after") != bundle.get("initial_model_hash")
@@ -265,6 +265,59 @@ def _validate_training_calibration(result, bundle, identities):
     if initialization.get("client_calibration_elapsed_sec") != {
             logical_id: receipt.get("elapsed_sec") for logical_id, receipt in clients.items()}:
         errors.append("training calibration worker durations differ from the original receipts")
+    return errors
+
+
+def _native_monitor_receipt(log_text):
+    records = []
+    for line in log_text.splitlines():
+        try:
+            value = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(value, dict):
+            records.append(value)
+    ready = [row for row in records if row.get("event") == "native_trap_ready"]
+    exits = [row for row in records if row.get("event") == "monitored_child_exit"]
+    faults = [row for row in records if row.get("event") == "native_fault_captured"]
+    valid = bool(len(ready) == 1 and len(exits) == 1 and not faults
+        and exits[0].get("returncode") == 0 and exits[0].get("trap_ready") is True
+        and exits[0].get("native_fault_observed") is False)
+    return {"valid": valid, "child_pid": ready[0].get("pid") if len(ready) == 1 else None,
+            "debugger_attached_before_fault": False, "faults": faults}
+
+
+def _validate_transport_learning(result, *, rounds):
+    """Validate the recorded Greedy bootstrap; updates use actual fit feedback."""
+    from splitfleet.common.network_probe import PROBE_MODE, estimate_network
+    receipt = result.get("cost_initialization_receipt") or {}
+    if result.get("placement_controller", "Greedy") not in ("Greedy", "L2S"):
+        return ["Unsupported active placement controller"]
+    if receipt.get("transport_learning_mode") != "affine_bootstrap_with_actual_round_feedback":
+        return ["Greedy transport calibration receipt is inconsistent"]
+    if receipt.get("online_feedback_updates_retained") is not True:
+        return ["Greedy online feedback receipt is missing"]
+    errors = []
+    for rid in range(1, rounds + 1):
+        diagnostic = result.get("round_diagnostics", {}).get(str(rid), {})
+        expected = set(diagnostic.get("assignment", {}))
+        observed = diagnostic.get("feedback_clients", [])
+        if not expected or len(observed) != len(set(observed)) or set(observed) != expected:
+            errors.append(f"round {rid}: actual placement feedback is incomplete")
+        if receipt.get("network_context_mode") == PROBE_MODE:
+            probes = diagnostic.get("network_probes", {})
+            contexts = diagnostic.get("network_contexts", {})
+            if set(probes) != expected or set(contexts) != expected:
+                errors.append(f"round {rid}: current active network probes are incomplete")
+                continue
+            for cid, probe in probes.items():
+                try:
+                    context = estimate_network(probe, round_id=rid)
+                except (ValueError, TypeError, KeyError):
+                    errors.append(f"round {rid}: invalid active network probe for {cid}")
+                else:
+                    if contexts[cid] != context:
+                        errors.append(f"round {rid}: network context differs from measured probe for {cid}")
     return errors
 
 
@@ -337,18 +390,11 @@ def validate_result(result: dict[str, Any], *, task: str, method: str, rounds: i
             errors.append("calibration initial model differs from the frozen bundle")
         if initialization.get("prediction_override") is not False:
             errors.append("calibration must seed learners without replacing predictions")
+        errors.extend(_validate_transport_learning(result, rounds=rounds))
         for round_id in range(1, rounds + 1):
             diagnostic = result.get("round_diagnostics", {}).get(str(round_id), {})
-            counts = diagnostic.get("learner_update_counts", {})
-            if len(counts) != num_workers or any(
-                int(value.get("server_update_count", 0)) < 1
-                or int(value.get("group_update_count", 0)) < 1
-                for value in counts.values()
-            ):
-                errors.append(f"round {round_id}: online learner update receipt is missing")
-            if any(
-                    value.get("state_exchange_update_count") != 6 + round_id for value in counts.values()):
-                errors.append(f"round {round_id}: state exchange learner update receipt is invalid")
+            if len(diagnostic.get("assignment", {})) != num_workers:
+                errors.append(f"round {round_id}: placement assignment receipt is incomplete")
     if result.get("fit_failures") or result.get("expected_clients") != num_workers:
         errors.append("all configured failure-free workers were not reported")
     all_fits = result.get("fit_records", [])
@@ -405,9 +451,12 @@ def validate_result(result: dict[str, Any], *, task: str, method: str, rounds: i
         for row in fits:
             metrics = row.get("metrics", {})
             if method == "splitfleet":
-                from splitfleet.server.placement.cosplit_ucb.rpc_timing import state_exchange_duration
+                from splitfleet.server.placement.greedy.rpc_timing import state_exchange_duration
                 if state_exchange_duration(metrics) is None:
                     errors.append(f"round {round_id}: actual state exchange timing is missing or invalid")
+                if result.get("closed_loop_queue"):
+                    if metrics.get("server_resource_service_samples") != metrics.get("num_batches"):
+                        errors.append(f"round {round_id}: queue-free resource spans do not cover every batch")
             identity = metrics.get("logical_client_id")
             kind = identities.get(identity)
             device = str(metrics.get("device", ""))
@@ -501,7 +550,9 @@ def _run_one(config: dict[str, Any], *, task: str, method: str, bundle_path: Pat
              timeout: float, learning_rate: float, optimizer: str,
              fixed_boundary: str,
              split_state_exchange: str = "full",
-             min_residence_rounds: int = 2,
+             server_concurrency: int = 1,
+             placement_controller: str = "Greedy",
+             network_schedule: Path | None = None, network_control: Path | None = None,
              save_model: bool = False,
              log_dir: Path | None = None,
              local_source_root: Path | None = None,
@@ -515,6 +566,13 @@ def _run_one(config: dict[str, Any], *, task: str, method: str, bundle_path: Pat
              fedbuff_buffer_size: int = 2, fedbuff_server_learning_rate: float = 1.0) -> dict[str, Any]:
     server = config["server"]
     hosts = config["hosts"]
+    if placement_controller not in ("Greedy", "L2S"):
+        raise ValueError("Choose Greedy or L2S placement")
+    if (network_schedule is None) != (network_control is None):
+        raise ValueError("Network schedule and control must be supplied together")
+    if server.get("ssh"):
+        if network_schedule is not None:
+            raise ValueError("Round network controls currently require a local coordinator")
     run_dir.mkdir(parents=True, exist_ok=False)
     if log_dir is None:
         log_dir = Path("logs/physical_multitask") / run_dir.parent.name / run_dir.name
@@ -528,7 +586,10 @@ def _run_one(config: dict[str, Any], *, task: str, method: str, bundle_path: Pat
                   "--rounds", str(rounds), "--output", server_output,
                   "--learning-rate", str(learning_rate), "--optimizer", optimizer,
                   "--fixed-boundary", fixed_boundary]
-    server_cmd.extend(["--min-residence-rounds", str(min_residence_rounds)])
+    server_cmd.extend(["--server-concurrency", str(server_concurrency)])
+    server_cmd.extend(["--placement-controller", placement_controller])
+    if network_schedule is not None:
+        server_cmd.extend(["--network-schedule", str(network_schedule), "--network-control", str(network_control)])
     server_cmd.extend(["--split-state-exchange", split_state_exchange])
     server_cmd.extend(["--evaluation-interval-sec", str(evaluation_interval_sec)])
     if time_budget_sec is not None:
@@ -567,14 +628,14 @@ def _run_one(config: dict[str, Any], *, task: str, method: str, bundle_path: Pat
         try:
             if remote_server:
                 command = "cd " + shlex.quote(remote_root) \
-                    + " && echo $$ > server.pid && exec env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=" \
+                    + " && echo $$ > server.pid && exec env PYTHONFAULTHANDLER=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=" \
                     + shlex.quote(remote_root) + " " + shlex.join(server_cmd)
                 server_launch = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
                                  server["ssh"], command]
                 server_process = subprocess.Popen(server_launch, stdout=server_log,
                                                   stderr=subprocess.STDOUT)
             else:
-                local_cmd = ["env", "PYTHONDONTWRITEBYTECODE=1"]
+                local_cmd = ["env", "PYTHONFAULTHANDLER=1", "PYTHONDONTWRITEBYTECODE=1"]
                 if local_source_root is not None:
                     local_cmd.append("PYTHONPATH=" + str(local_source_root))
                 local_cmd.extend(server_cmd)
@@ -586,13 +647,13 @@ def _run_one(config: dict[str, Any], *, task: str, method: str, bundle_path: Pat
                 remote_cmd = [host["python"], "-m", "experiments.physical_multitask", "client",
                               "--bundle", f"{remote_root}/bundles/{task}.client_{index}.pt",
                               "--method", method, "--device", device,
-                              "--server", server["connect"], "--client-id", identity,
+                              "--server", config.get("client_server", server)["connect"], "--client-id", identity,
                               "--client-index", str(index),
                               "--barrier", config["barrier"]["connect"],
                               "--learning-rate", str(learning_rate),
                               "--optimizer", optimizer,
                               "--fixed-boundary", fixed_boundary]
-                command = "cd " + shlex.quote(remote_root) + " && PYTHONPATH=" \
+                command = "cd " + shlex.quote(remote_root) + " && PYTHONFAULTHANDLER=1 PYTHONPATH=" \
                     + shlex.quote(remote_root) + " PYTHONDONTWRITEBYTECODE=1 " + shlex.join(remote_cmd)
                 log = (log_dir / f"{identity}.log").open("w", encoding="utf-8")
                 process = subprocess.Popen(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
@@ -632,16 +693,20 @@ def _run_one(config: dict[str, Any], *, task: str, method: str, bundle_path: Pat
                                     f"{server['ssh']}:{remote_checkpoint}",
                                     str(run_dir / "final_model.pt")], check=True, timeout=30)
                 if method == "splitfleet":
-                    remote_bandit = str(Path(server_output).with_suffix(".bandit.json"))
+                    reference_controller = True
+                    remote_bandit = str(Path(server_output).with_suffix(
+                        ".placement.json"))
                     subprocess.run(["scp", "-q", "-o", "BatchMode=yes",
                                     f"{server['ssh']}:{remote_bandit}",
-                                    str(run_dir / "bandit_state.json")], check=True, timeout=30)
+                                    str(run_dir / ("placement_state.json"))],
+                                   check=True, timeout=30)
             else:
                 if save_model:
                     Path(server_output).with_suffix(".model.pt").rename(run_dir / "final_model.pt")
                 if method == "splitfleet":
-                    Path(server_output).with_suffix(".bandit.json").rename(
-                        run_dir / "bandit_state.json"
+                    reference_controller = True
+                    Path(server_output).with_suffix(".placement.json").rename(
+                        run_dir / ("placement_state.json")
                     )
             result = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
             if not save_model:
@@ -658,6 +723,12 @@ def _run_one(config: dict[str, Any], *, task: str, method: str, bundle_path: Pat
             report = validate_result(result, task=task, method=method, rounds=rounds,
                                      hosts=hosts, batch_size=int(bundle["batch_size"]),
                                      bundle=bundle, barrier_records=barrier.records)
+            if server.get("native_fault_monitor"):
+                monitor = _native_monitor_receipt((log_dir / "server.log").read_text())
+                report["native_fault_monitor"] = monitor
+                if not monitor["valid"]:
+                    report["errors"].append("Native monitor did not verify a ready, fault-free child exit")
+                    report["valid"] = False
             (run_dir / "validation_report.json").write_text(json.dumps(report, indent=2) + "\n")
             if not report["valid"]:
                 raise RuntimeError(f"{task}/{method} failed validation: {report['errors']}")
@@ -732,6 +803,7 @@ def run_matrix(config: dict[str, Any], *, run_id: str, output_root: Path,
                pretrain_weights: str | None = None,
                model_name: str | None = None, tokenizer_path: str | None = None,
                      split_state_exchange: str = "full",
+               server_concurrency: int = 1,
                save_model: bool = False, keep_input_bundles: bool = False,
                log_root: Path = Path("logs/physical_multitask"),
                time_budget_sec: float | None = None, evaluation_interval_sec: float = 30.0,
@@ -755,6 +827,8 @@ def run_matrix(config: dict[str, Any], *, run_id: str, output_root: Path,
             buffer_size=fedbuff_buffer_size, server_learning_rate=fedbuff_server_learning_rate)
     if (time_budget_sec is not None and (not math.isfinite(time_budget_sec) or time_budget_sec <= 0)):
         raise ValueError("time_budget_sec must be finite and positive")
+    if server_concurrency < 1:
+        raise ValueError("server_concurrency must be positive")
     if not math.isfinite(evaluation_interval_sec) or evaluation_interval_sec <= 0:
         raise ValueError("evaluation_interval_sec must be finite and positive")
     if not math.isfinite(fedcompass_rpc_timeout_sec) or fedcompass_rpc_timeout_sec <= 0:
@@ -862,6 +936,7 @@ def run_matrix(config: dict[str, Any], *, run_id: str, output_root: Path,
                             timeout=timeout, learning_rate=learning_rate,
                             optimizer=optimizer, fixed_boundary=boundary or "50%",
                             split_state_exchange=split_state_exchange,
+                            server_concurrency=server_concurrency,
                             save_model=save_model,
                             local_source_root=local_source_root,
                             time_budget_sec=time_budget_sec, evaluation_interval_sec=evaluation_interval_sec,
@@ -921,6 +996,8 @@ def main() -> None:
     parser.add_argument("--tokenizer-path")
     parser.add_argument("--pretrain-weights")
     parser.add_argument("--split-state-exchange", choices=("full", "owned"), default="full")
+    parser.add_argument("--server-concurrency", type=int, default=1,
+                        help="Concurrent suffix replicas on the server GPU")
     parser.add_argument("--save-model", action="store_true", help="Retain each final model for re-evaluation")
     parser.add_argument("--keep-input-bundles", action="store_true", help="Keep prepared inputs after the matrix finishes")
     parser.add_argument("--rounds", type=int, default=5)
@@ -955,6 +1032,7 @@ def main() -> None:
                      pretrain_weights=args.pretrain_weights,
                      model_name=args.model, tokenizer_path=args.tokenizer_path,
                      split_state_exchange=args.split_state_exchange,
+                     server_concurrency=args.server_concurrency,
                      save_model=args.save_model, keep_input_bundles=args.keep_input_bundles,
                      log_root=args.log_root, time_budget_sec=args.time_budget_sec,
                      evaluation_interval_sec=args.evaluation_interval_sec,

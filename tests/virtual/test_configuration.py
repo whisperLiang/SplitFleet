@@ -31,7 +31,8 @@ def test_identity_lookup_uses_worker_bound_and_only_commits_a_bijection(tmp_path
     strategy = VirtualStrategy.__new__(VirtualStrategy)
     strategy.client_properties, strategy.identity_lookup_sec = {}, 0.0
     strategy.virtual_config = SimpleNamespace(virtual_clients=SimpleNamespace(total=4),
-        resources=SimpleNamespace(max_concurrent_clients=2), profile=lambda _pid: SimpleNamespace(device='cpu'))
+        resources=SimpleNamespace(max_concurrent_clients=2, effective_worker_capacity=2),
+        profile=lambda _pid: SimpleNamespace(device='cpu'))
     strategy.evidence = SimpleNamespace(directory=tmp_path,
         write=lambda name, value: (tmp_path / name).write_text(json.dumps(value)))
     manager = SimpleNamespace(all=lambda: clients)

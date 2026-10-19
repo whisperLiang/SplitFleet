@@ -8,7 +8,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from splitfleet.tasks import DetectionTask
-from splitfleet.server.placement.cosplit_ucb.candidate_provider import TorchLensCandidateProvider
+from splitfleet.server.placement.greedy.candidate_provider import TorchLensCandidateProvider
 
 
 RESOLUTION = 384

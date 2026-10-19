@@ -34,13 +34,7 @@ from splitfleet.autosplit.torchlens_contract import runtime_contract_digest
 from splitfleet.server.server_model.server_model import ServerModel
 from splitfleet.server.stage_runtime.manager import StageRuntimeManager
 from splitfleet.server.strategy import AutoSplitStrategy
-from splitfleet.server.placement import (
-    CandidateEstimate,
-    CoSplitUCBConfig,
-    CoSplitUCBPlacementPolicy,
-    SplitCandidateDescriptor,
-    StaticCandidateProvider,
-)
+from splitfleet.server.placement import GreedyConfig, GreedyPlacementPolicy, SplitCandidateDescriptor, StaticCandidateProvider
 
 
 class TinyNet(nn.Module):
@@ -249,93 +243,6 @@ def test_per_client_placement_routes_matching_client_and_tail_plans_across_round
     assert wall_times[0]["duration_ms"] >= 0
 
 
-def test_cosplit_global_solver_assignment_is_shared_by_client_and_server_configs() -> None:
-    class LearnedComponents:
-        def predict(self, *, client_id, boundary, **kwargs):
-            _ = kwargs
-            early = boundary == "after:first"
-            return CandidateEstimate(
-                client_id=client_id,
-                boundary=boundary,
-                client_forward_mean_ms=0 if early else 60,
-                client_backward_mean_ms=0,
-                network_upload_mean_ms=0,
-                network_download_mean_ms=0,
-                server_service_mean_ms=50 if early else 0,
-                switch_mean_ms=0,
-                client_forward_uncertainty_ms=0,
-                client_backward_uncertainty_ms=0,
-                network_upload_uncertainty_ms=0,
-                network_download_uncertainty_ms=0,
-                server_service_uncertainty_ms=0,
-                switch_uncertainty_ms=0,
-            )
-
-    candidates = [
-        SplitCandidateDescriptor(
-            boundary=boundary,
-            split_id=boundary,
-            graph_position_ratio=position,
-            prefix_node_count=index,
-            suffix_node_count=3 - index,
-            total_node_count=3,
-            boundary_forward_bytes=64,
-            boundary_gradient_bytes=64,
-            boundary_tensor_count=1,
-            prefix_parameter_bytes=None,
-            suffix_parameter_bytes=None,
-            client_memory_bytes=None,
-            server_memory_bytes=None,
-            trainable=True,
-            feature_abi_id=boundary,
-            graph_signature="tiny",
-            framework_backend="pytorch",
-        )
-        for index, (boundary, position) in enumerate(
-            (("after:first", 0.25), ("50%", 0.75)), start=1
-        )
-    ]
-    learned = LearnedComponents()
-    policy = CoSplitUCBPlacementPolicy(
-        candidate_provider=StaticCandidateProvider(candidates),
-        learners=learned,
-        config=CoSplitUCBConfig(
-            max_explorations_per_round=0, min_residence_rounds=0,
-        ),
-    )
-    model = TinyNet().eval()
-    strategy = AutoSplitStrategy(
-        model=model,
-        sample_inputs=torch.randn(2, 4),
-        worker_specs=[],
-        placement_policy=policy,
-        min_fit_clients=2,
-        min_available_clients=2,
-        init_server_model_fn=lambda: DummyServerModel(),
-    )
-    manager = StageRuntimeManager(autosplit_session=strategy.autosplit_session)
-    strategy.bind_stage_runtime_manager(manager)
-    clients = FakeClientManager(["a", "b"])
-    initial = strategy.backend_adapter.export_ndarrays(model)
-    client_instructions = strategy.configure_fit(1, ndarrays_to_parameters(initial), clients)
-    server_instructions = strategy.configure_server_fit(1, initial, ["a", "b"])
-    client_boundaries = {
-        client.cid: ins.config[AUTOSPLIT_BOUNDARY_CONFIG_KEY]
-        for client, ins in client_instructions
-    }
-    server_boundaries = {
-        ins.sid: ins.config[AUTOSPLIT_BOUNDARY_CONFIG_KEY]
-        for ins in server_instructions
-    }
-    assert client_boundaries == server_boundaries
-    assert len(set(client_boundaries.values())) == 2
-    independent = {
-        cid: learned.predict(client_id=cid, boundary="after:first")
-        for cid in ("a", "b")
-    }
-    assert policy.round_diagnostics[1]["predicted_final_makespan_ms"] < (
-        policy.solver.simulate(independent).max_client_completion_ms
-    )
 
 
 def test_splitfed_reassembles_named_prefix_and_suffix_updates_before_fedavg() -> None:

@@ -172,15 +172,18 @@ class TensorFlowBackendAdapter(ArrayBackendAdapter):
             raise RuntimeError(f"TensorFlow tensor could not be placed on requested device {requested!r}")
         return tensor
     @staticmethod
-    def _variable_key(index, variable):
+    def _variable_key(index, variable, model=None):
         name = getattr(variable, "path", None) or getattr(variable, "name", None) or "weight"
+        model_name = getattr(model, "name", None)
+        if model_name and name.startswith(f"{model_name}/"):
+            name = name[len(model_name) + 1:]
         return f"{index}:{name}"
     def _state(self, model):
         declared = _declared_native_state(model)
         if declared is not None:
             return declared
         return {
-            self._variable_key(index, variable): variable
+            self._variable_key(index, variable, model): variable
             for index, variable in enumerate(model.weights)
         }
     def _load_arrays(self, model, values):
@@ -190,7 +193,7 @@ class TensorFlowBackendAdapter(ArrayBackendAdapter):
                 variable.assign(values[name])
             return
         for index, variable in enumerate(model.weights):
-            variable.assign(values[self._variable_key(index, variable)])
+            variable.assign(values[self._variable_key(index, variable, model)])
     def set_training(self, model, training):
         training = bool(training)
         setattr(model, "training", training)

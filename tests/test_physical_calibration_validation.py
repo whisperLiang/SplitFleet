@@ -15,9 +15,9 @@ def calibrated_round():
     anchors = [f"cut-{i}" for i in range(4)]
     bundle.update(online_calibration_boundaries=anchors)
     result.update(method="splitfleet", owned_state_exchange=True, online_cost_learning=True,
-                  cosplit_config={}, online_calibration_boundaries=anchors,
+                  greedy_config={}, online_calibration_boundaries=anchors,
                   candidate_catalog=[{"boundary": cut, "prefix_trainable_parameter_count": 1} for cut in anchors])
-    server = {"schema": "splitfleet.cosplit-calibration", "source": "server_shape_matched_current_deployment",
+    server = {"schema": "splitfleet.training-calibration", "source": "server_shape_matched_current_deployment",
               "device": "cuda:1", "model_hash_before": "initial", "model_hash_after": "initial",
               "state_and_torch_rng_preserved": True, "persistent_optimizer_steps": 0,
               "optimizer_steps": 8, "warmup_batches": 1, "elapsed_sec": 1,
@@ -39,10 +39,11 @@ def calibrated_round():
     result["online_worker_contexts"] = contexts
     result["server_fit_records"] = [{"round_id": 1, "cid": fit["cid"]} for fit in result["fit_records"]]
     result["round_diagnostics"] = {"1": {"assignment": {cid: anchors[0] for cid in contexts},
-        "learner_update_counts": {cid: {"server_update_count": 1, "group_update_count": 1} for cid in contexts}}}
+        "feedback_clients": list(contexts)}}
     result["cost_initialization_receipt"] = {
         "source": "current_deployment_restored_training_cost_calibration", "initial_model_hash": "initial",
-        "temporary_optimizer_updates": True, "discounted_online_updates_retained": True,
+        "temporary_optimizer_updates": True, "online_feedback_updates_retained": True,
+        "transport_learning_mode": "affine_bootstrap_with_actual_round_feedback",
         "network_initialized": True, "prediction_override": False, "server_calibration": server,
         "client_samples": samples, "client_calibration_elapsed_sec": durations}
     workers = result["online_worker_contexts"]
@@ -67,8 +68,6 @@ def calibrated_round():
                     for down, up in ((65536, 65536), (2097152, 65536), (65536, 2097152)) for repeat in range(2)]}
     for row in result["fit_records"]:
         row["metrics"].update(coordinator_fit_rpc_ms=100, client_fit_handler_ms=80)
-    for counts in result["round_diagnostics"]["1"]["learner_update_counts"].values():
-        counts["state_exchange_update_count"] = 7
     return hosts, bundle, result, barriers
 
 
@@ -186,7 +185,7 @@ def test_online_physical_validation_rejects_tampering(mutation):
     elif mutation == "handler_exceeds_rpc":
         result["fit_records"][0]["metrics"]["client_fit_handler_ms"] = 200
     elif mutation == "wrong_exchange_count":
-        next(iter(result["round_diagnostics"]["1"]["learner_update_counts"].values()))["state_exchange_update_count"] = 6
+        result["round_diagnostics"]["1"]["feedback_clients"].pop()
     else:
         initialization["server_calibration"]["persistent_optimizer_steps"] = 1
     assert not validate(case)["valid"]

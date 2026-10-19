@@ -25,21 +25,53 @@ def config(quality_inputs, tmp_path):
 def test_adaptive_runs_admit_early_operation_cuts_as_in_the_physical_policy(config, tmp_path):
     from dataclasses import asdict
     from experiments.physical_multitask import _make_placement_policy
-    from splitfleet.server.placement.cosplit_ucb import CoSplitUCBConfig
-    from splitfleet.server.placement.cosplit_ucb import StaticCandidateProvider
-    from tests.unit.test_cosplit_policy import _candidate
+    from splitfleet.server.placement.greedy import GreedyConfig
+    from splitfleet.server.placement.greedy import StaticCandidateProvider
+    from tests.unit.placement_fixtures import _candidate
 
     spec = quality_spec(config(method="splitfleet"))
     candidates = [_candidate("after:maxpool", .02), _candidate("after:stage1", .2),
                   _candidate("after:stage2", .5), _candidate("after:stage3", .8)]
     policy = spec.placement_policy_factory(candidate_provider=StaticCandidateProvider(candidates))
+    # Greedy scores from measured per-client anchors.  This test is about
+    # catalog admission and policy parity, so provide the smallest complete
+    # synthetic receipt instead of exercising the deployment calibration RPC.
+    policy.uses_active_network_probes = False
+    policy.telemetry_provider = SimpleNamespace(
+        clients={"a": {"logical_client_id": "a", "batch_size": 2, "num_batches": 1}},
+        client_context=lambda cid: {"logical_client_id": str(cid), "batch_size": 2, "num_batches": 1},
+        server_context=lambda: {},
+        receipt={
+            "server_calibration": {"records": [
+                {"boundary": candidate.boundary,
+                 "local_tail_service_ms": 10 * (1 - candidate.graph_position_ratio)}
+                for candidate in candidates
+            ]},
+            "client_samples": [
+                {"logical_client_id": "a", "boundary": candidate.boundary,
+                 "client_forward_ms": 10 * candidate.graph_position_ratio,
+                 "client_backward_ms": 5 * candidate.graph_position_ratio}
+                for candidate in candidates
+            ],
+            "transport_bootstrap": {"samples": [
+                {"logical_client_id": "a", "payload_bytes": size,
+                 "roundtrip_ms": 10 + size / 1000}
+                for size in (65536, 2097152)
+            ]},
+            "state_exchange_bootstrap": {"samples": [
+                {"logical_client_id": "a", "request_bytes": request,
+                 "reply_bytes": reply, "roundtrip_ms": 10 + (request + reply) / 1000}
+                for request, reply in ((65536, 65536), (2097152, 65536))
+            ]},
+        },
+    )
     policy.plan_round(round_id=1, client_ids=["a"], training=True)
     assert set(policy.round_diagnostics[1]["estimates"]["a"]) == {row.boundary for row in candidates}
     provider = StaticCandidateProvider(candidates)
     physical = _make_placement_policy(provider=provider, bundle={'seed': 233},
         args=SimpleNamespace(min_residence_rounds=2, output=tmp_path / 'physical'))
     virtual = spec.placement_policy_factory(candidate_provider=provider,
-        config=CoSplitUCBConfig(seed=233, server_concurrency=1))
+        config=GreedyConfig(seed=233, server_concurrency=1))
     settings = asdict(physical.config)
     settings['state_path'] = None
     assert asdict(virtual.config) == settings

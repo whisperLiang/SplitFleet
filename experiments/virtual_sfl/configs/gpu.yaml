@@ -7,7 +7,6 @@ resources:
   client_cpus_per_worker: 1
   client_gpus_per_worker: 0.5
   client_gpu_pool_size: 1
-  server_concurrency: 1
 profiles:
   gpu: {device: cuda, gpu_fraction: 0.5, torch_threads: 1}
 workload: {source: fixture, model: tiny, samples: 8}

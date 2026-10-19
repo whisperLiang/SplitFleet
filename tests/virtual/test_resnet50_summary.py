@@ -35,7 +35,7 @@ def complete_budget_fixture(tmp_path):
     steps_per_client = (900 + 15) // 16
     documents = {
         'config.json': {'rounds': rounds, 'workload': {'protocol': str(protocol)},
-                        'resources': {'max_concurrent_clients': clients, 'worker_count_policy': 'one_per_client'}},
+                        'resources': {'max_concurrent_clients': clients, 'worker_count_policy': 'fixed_hardware'}},
         'run_manifest.json': {'status': 'passed', 'stage': 'main', 'backend': 'pytorch',
                               'method': 'fedavg', 'seed': 233, 'clients': clients,
                               'protocol_sha256': hash_file(protocol / 'protocol.json')},

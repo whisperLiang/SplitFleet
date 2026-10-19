@@ -19,8 +19,11 @@ from flwr.common import (
     RecordSet,
     serde,
     log,
-    recorddict_compat as compat
 )
+try:
+    from flwr.compat.common import recorddict_compat as compat
+except ImportError:  # Flower 1.29 on the physical Orin workers.
+    from flwr.common import recorddict_compat as compat
 from flwr.proto.transport_pb2 import (  # pylint: disable=E0611
     ClientMessage,
     Reason,
@@ -34,9 +37,8 @@ from splitfleet.proto.server_model_pb2_grpc import ServerModelStub
 from splitfleet.common.address import parse_address
 
 
-# Flower 1.29 removed the legacy bidi constant while retaining the server-side
-# bridge.  SplitFleet still uses this transport because the same channel also
-# carries its server-model RPC service.
+# SplitFleet keeps this transport because the same channel also carries its
+# server-model RPC service.
 TRANSPORT_TYPE_GRPC_BIDI = "grpc-bidi"
 
 

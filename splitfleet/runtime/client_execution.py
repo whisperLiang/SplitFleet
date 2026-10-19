@@ -2,17 +2,16 @@
 
 from contextlib import contextmanager
 
-from splitfleet.common.constants import AUTOSPLIT_MODEL_VERSION_CONFIG_KEY
-
 
 @contextmanager
 def server_model_binding(client, proxy):
     core = getattr(client, "numpy_client", client)
+    setter = getattr(core, "set_server_model_proxy", None)
+    discard = getattr(core, "discard_round_context", None)
+    if setter is None or discard is None:
+        raise TypeError("SFL clients must implement the public execution lifecycle")
     previous = getattr(core, "server_model_proxy", None)
-    if hasattr(client, "set_server_model_proxy"):
-        client.set_server_model_proxy(proxy)
-    else:
-        core.server_model_proxy = proxy
+    setter(proxy)
     try:
         yield
         proxy.close_stream()
@@ -20,8 +19,5 @@ def server_model_binding(client, proxy):
         proxy.cancel()
         raise
     finally:
-        store = getattr(core, "_context_store", None)
-        config = getattr(core, "_round_config", {})
-        if store is not None:
-            store.discard_round(int(config.get(AUTOSPLIT_MODEL_VERSION_CONFIG_KEY, 0)))
-        core.server_model_proxy = previous
+        discard(core.current_round_id)
+        setter(previous)

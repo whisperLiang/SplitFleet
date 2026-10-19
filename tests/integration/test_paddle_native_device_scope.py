@@ -1,5 +1,7 @@
 """Stateless Paddle replay follows actual inputs through CPU-default facades."""
 
+import os
+
 import numpy as np
 import pytest
 
@@ -10,7 +12,7 @@ from tests.integration.test_torchlens_optional_frameworks import _run_isolated
 @pytest.mark.parametrize("device", ["cpu", "cuda:0"])
 def test_stateless_paddle_models_clone_load_and_replay_on_input_device(request, device):
     options = {"CUDA_VISIBLE_DEVICES": ""} if device == "cpu" else {}
-    if _run_isolated(request, extra_env=options):
+    if _run_isolated(request, extra_env=options, python=os.environ.get("SPLITFLEET_PADDLE_PYTHON")):
         return
     paddle = pytest.importorskip("paddle")
     if device.startswith("cuda") and (

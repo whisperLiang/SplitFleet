@@ -40,6 +40,8 @@ def _run_isolated(request, backend: str) -> bool:
     if backend == "tinygrad":
         env["DEV"] = "CPU"
         env["DEBUG"] = "0"
+        env["CPU_COUNT"] = env["OMP_NUM_THREADS"]
+        env["THREADS"] = env["OMP_NUM_THREADS"]
     result = subprocess.run(
         [sys.executable, "-m", "pytest", request.node.nodeid, "-q", "-s"],
         cwd=str(request.config.rootpath),
@@ -349,23 +351,8 @@ def _exercise_backend(backend: str) -> None:
             )
         split = f"after:{node.canonical_id}"
         try:
-            if backend == "tinygrad":
-                model, inputs, client_targets, loss_fn = BUILDERS[backend]()
-                adapter = adapter_for(model, inputs)
-                adapter.set_training(model, True)
-                runtime = prepare_torchlens_runtime(
-                    model,
-                    inputs,
-                    boundary=split,
-                    trainable=True,
-                    dynamic_batch=(2, 2),
-                    batch_axes={},
-                    model_name="resnet18-tinygrad",
-                    model_family="resnet18",
-                )
-            else:
-                adapter.load_ndarrays(model, initial_state)
-                runtime = seed.backend.repartition(split)
+            adapter.load_ndarrays(model, initial_state)
+            runtime = seed.backend.repartition(split)
         except Exception as exc:
             raise AssertionError(
                 f"operational ResNet-18 node {split} could not be partitioned: "
@@ -392,24 +379,7 @@ def _exercise_backend(backend: str) -> None:
         base_state = adapter.export_ndarrays(model)
         local_states: list[list[np.ndarray]] = []
         for client_index, targets in enumerate(client_targets):
-            if backend == "tinygrad":
-                if client_index > 0:
-                    model, inputs, fresh_targets, loss_fn = BUILDERS[backend]()
-                    targets = fresh_targets[client_index]
-                    adapter = adapter_for(model, inputs)
-                    adapter.set_training(model, True)
-                    runtime = prepare_torchlens_runtime(
-                        model,
-                        inputs,
-                        boundary=split,
-                        trainable=True,
-                        dynamic_batch=(2, 2),
-                        batch_axes={},
-                        model_name="resnet18-tinygrad",
-                        model_family="resnet18",
-                    )
-            else:
-                adapter.load_ndarrays(model, base_state)
+            adapter.load_ndarrays(model, base_state)
             before_trainable = _trainable_arrays(backend, model, adapter)
             optimizer = _optimizer(backend, model, adapter)
             current_args = _args(inputs, adapter)

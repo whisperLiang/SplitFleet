@@ -33,7 +33,15 @@ class LeasedServerModelManager(ServerModelManager):
             raise ValueError("Per-client suffix models cannot reuse another client's slot")
         self.per_client_models = per_client_models
         self.model_capacity = model_capacity or capacity
+        # Logical client state is held by the round configuration/result store;
+        # this map contains only currently materialized native models.  It is
+        # deliberately not populated for every selected client.
         self.client_models = {}
+        # Number of logical suffix identities in the current round.  This is
+        # metadata/configuration state and must not be confused with the
+        # number of materialized native models in ``live``/``idle``.
+        self.logical_model_count = 0
+        self.peak_logical_model_count = 0
         self.peak_client_models = 0
         self.idle = []
         self.lock = RLock()
@@ -57,17 +65,18 @@ class LeasedServerModelManager(ServerModelManager):
                 raise ValueError("Duplicate suffix replica identities")
             if any(c.sid == "" for c in configs) and len(configs) != 1:
                 raise ValueError("Shared suffix configuration must contain one model")
-            if self.per_client_models:
-                if len(configs) > self.model_capacity:
-                    raise ValueError("The per-client suffix population exceeds its declared model count")
-                # These distinct objects retain client identity and spilled state.
-                # Their native tensors are materialized only while the task holds
-                # a resident lease; no object is transferred to another client.
-                for sid in self.configs:
-                    model = self.factory().to_server_model()
-                    model.sid = sid
-                    self.client_models[sid] = model
-                self.peak_client_models = max(self.peak_client_models, len(self.client_models))
+            self.logical_model_count = len(self.configs)
+            self.peak_logical_model_count = max(
+                self.peak_logical_model_count, self.logical_model_count
+            )
+            if self.per_client_models and self.logical_model_count > self.model_capacity:
+                raise ValueError(
+                    "The per-client logical suffix population exceeds its declared model count"
+                )
+            # Do not construct one native model per logical client here.  A
+            # physical slot is acquired below and released after the complete
+            # prefix/suffix transaction.  Logical client identities remain in
+            # ``configs`` and the spilled result store.
 
     def acquire(self, sid):
         sid = str(sid)
@@ -82,12 +91,21 @@ class LeasedServerModelManager(ServerModelManager):
             self.attempted.add(sid)
             self.preparing.add(sid)
             reused = bool(self.idle)
-            model = (self.client_models[sid] if self.per_client_models else
-                     self.idle.pop() if reused else None)
+            model = self.idle.pop() if reused else None
             config = self.configs[sid]
         try:
             if model is None:
                 model = self.factory().to_server_model()
+                # Model construction happens outside the critical section so
+                # a slow framework build cannot block unrelated leases.  The
+                # peak counter is shared state, however, and must be updated
+                # while holding the same lock used for the live/preparing
+                # sets; otherwise concurrent acquisitions can lose an update.
+                with self.lock:
+                    self.peak_client_models = max(
+                        self.peak_client_models,
+                        len(self.live) + len(self.preparing),
+                    )
             if isinstance(config, ServerModelFitIns):
                 model.configure_fit(config)
             else:
@@ -105,11 +123,13 @@ class LeasedServerModelManager(ServerModelManager):
             finally:
                 with self.lock:
                     self.preparing.remove(sid)
+                    self.client_models.pop(sid, None)
                     self.failed[sid] = repr(error)
             raise
         with self.lock:
             self.preparing.remove(sid)
             self.live[sid] = model
+            self.client_models[sid] = model
             self.peak_live = max(self.peak_live, len(self.live))
             self.total_created += int(not reused)
             self.total_reused += int(reused)
@@ -128,6 +148,7 @@ class LeasedServerModelManager(ServerModelManager):
             model = self.live.pop(sid, None)
             if model is None:
                 return
+            self.client_models.pop(sid, None)
             self.finishing.add(sid)
             initial = self.configs[sid].parameters
         stored = None
@@ -172,7 +193,7 @@ class LeasedServerModelManager(ServerModelManager):
                     self.completed[sid] = stored
                 else:
                     self.failed[sid] = reason
-                if idle:
+                if idle and not self.per_client_models:
                     self.idle.append(model)
         finally:
             with self.lock:
@@ -197,11 +218,17 @@ class LeasedServerModelManager(ServerModelManager):
         with self.lock:
             if self.preparing or self.finishing:
                 raise RuntimeError("Cannot end a suffix round during a lifecycle operation")
-            models = self.client_models.values() if self.per_client_models else self.live.values()
+            models = tuple(self.client_models.values()) + tuple(self.live.values())
+            seen = set()
             for model in models:
+                if id(model) in seen:
+                    continue
+                seen.add(id(model))
                 self.release_model(model)
             for model in self.idle:
-                self.release_model(model)
+                if id(model) not in seen:
+                    seen.add(id(model))
+                    self.release_model(model)
             self.live.clear()
             self.idle.clear()
             self.client_models.clear()
@@ -210,3 +237,4 @@ class LeasedServerModelManager(ServerModelManager):
             self.attempted.clear()
             self.failed.clear()
             self.records.clear()
+            self.logical_model_count = 0

@@ -1,3 +1,5 @@
+> 历史报告。2026-10-19 起默认方案为 Greedy、C=1，当前论文与结果口径见 [paper/README.md](paper/README.md)。以下保留历史版本的核验记录。
+
 # SplitFleet 当前完成记录
 
 2026年10月13日的当前清理范围、成功证据保留和验证状态以 [本轮清理收据](paper/evidence/manuscript_cleanup_20261013/receipt.json)及 [结果索引](results/README.md)为准。早期多后端、模拟与旧控制器批次已删除；图3、图4失败及排除记录也按作者要求删除。以下内容为历史完成记录，文件数量、路径和测试状态反映对应清理阶段。

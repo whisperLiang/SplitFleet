@@ -1,13 +1,12 @@
 rounds: 3
 batch_size: 2
 boundary: after:head
-placement: cosplit_ucb
+placement: greedy
 virtual_clients:
   total: 4
 resources:
   max_concurrent_clients: 4
   max_suffix_replicas: 4
-  server_concurrency: 1
   server_concurrency_by_round:
     2: 2
     3: 1

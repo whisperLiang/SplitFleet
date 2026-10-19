@@ -16,6 +16,7 @@ from flwr.common import GRPC_MAX_MESSAGE_LENGTH, ndarrays_to_parameters, serde
 from flwr.proto.transport_pb2 import Parameters as ParametersProto
 
 from splitfleet.common import BatchData, ControlCode
+from splitfleet.common.network_probe import PROBE_METHOD
 from splitfleet.common.serde import from_grpc_format
 from splitfleet.proto import server_model_pb2_grpc
 from splitfleet.server.grpc.servicer import ServerModelServicer
@@ -42,6 +43,8 @@ class LeasedSuffixServicer(ServerModelServicer):
         self.capacity, self.concurrency = capacity, concurrency
         self.state_store, self.seed = state_store, seed
         self.tokens = {}
+        self.network_probe_tokens = {}
+        self.network_probe_round = 0
         self._replica_slots = asyncio.Semaphore(capacity)
         self._leases = set()
         self._lease_lock = asyncio.Lock()
@@ -53,15 +56,22 @@ class LeasedSuffixServicer(ServerModelServicer):
         self._download_payload = None
 
     def prepare_round(self, cids, round_id):
+        self.network_probe_tokens.clear()
         self.tokens = {str(cid): secrets.token_urlsafe(32) for cid in cids}
         self.round_id = round_id
         self.prefix_uploads.clear()
         self.suffix_rng.clear()
         self._download_payload = None
 
+    def prepare_network_probes(self, cids, round_id):
+        """Authorize only stateless network measurements before placement."""
+        self.network_probe_tokens = {str(cid): secrets.token_urlsafe(32) for cid in cids}
+        self.network_probe_round = int(round_id)
+
     def _compute_group(self, group, method_name):
-        # With one lane, each task owns its suffix RNG stream. Multiple lanes
-        # are admitted only for deterministic models (checked at startup).
+        # With one lane, retain the historical task RNG receipt. With multiple
+        # lanes, Torch suffix replicas isolate their own RNG state at phase
+        # launch, so their CUDA kernels may overlap safely.
         if self.concurrency == 1:
             config = self.server_model_manager._delegate.configs[group.sid].config
             partition = config["virtual_partition_id"]
@@ -78,6 +88,13 @@ class LeasedSuffixServicer(ServerModelServicer):
 
     async def UnaryRequest(self, request, context):
         token = dict(context.invocation_metadata()).get("authorization", "")
+        if request.method == PROBE_METHOD:
+            expected = self.network_probe_tokens.get(str(request.cid))
+            if (expected is None or not hmac.compare_digest(token, f"Bearer {expected}")
+                    or request.metadata.get("round_id") != str(self.network_probe_round)):
+                await context.abort(grpc.StatusCode.UNAUTHENTICATED,
+                                    "Invalid or expired network probe token")
+            return await super().UnaryRequest(request, context)
         expected = self.tokens.get(str(request.cid))
         if expected is None or not hmac.compare_digest(token, f"Bearer {expected}"):
             await context.abort(
@@ -222,6 +239,7 @@ class LeasedSuffixServicer(ServerModelServicer):
     async def reconcile(self):
         # Prevent late RPCs entering while the federated loop collects updates.
         self.tokens.clear()
+        self.network_probe_tokens.clear()
         requests = tuple(self._requests)
         for task in requests:
             task.cancel()
@@ -304,6 +322,8 @@ class SuffixService:
         if not bound:
             raise OSError(f"Cannot bind suffix service to {address}")
         self.port = bound
+        if self.servicer is not None and self.servicer.telemetry is not None:
+            await asyncio.to_thread(self.servicer.telemetry.start)
         await self.server.start()
 
     def start(self):
@@ -328,6 +348,15 @@ class SuffixService:
                     timeout=30
                 )
             if self.servicer is not None:
+                # A run can be cancelled before the normal round collector
+                # reaches ``reconcile``.  Drain and abort leases here as the
+                # final lifecycle boundary so no suffix model/slot survives
+                # service shutdown.
+                reconcile = getattr(self.servicer, "reconcile", None)
+                if reconcile is not None:
+                    asyncio.run_coroutine_threadsafe(
+                        reconcile(), self.loop
+                    ).result(timeout=300)
                 asyncio.run_coroutine_threadsafe(
                     self.servicer.drain(), self.loop
                 ).result(timeout=300)

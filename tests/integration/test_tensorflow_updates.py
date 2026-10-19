@@ -3,10 +3,14 @@
 import numpy as np
 import pytest
 
+from tests.integration.test_torchlens_optional_frameworks import _run_isolated
+
 
 @pytest.mark.integration
 @pytest.mark.parametrize('device', ['/CPU:0', '/GPU:0'])
-def test_native_optimizer_and_batchnorm_updates_match_eager_execution(device):
+def test_native_optimizer_and_batchnorm_updates_match_eager_execution(request, device):
+    if _run_isolated(request):
+        return
     tf = pytest.importorskip('tensorflow')
     if device.startswith('/GPU') and not tf.config.list_physical_devices('GPU'):
         pytest.skip('A real TensorFlow GPU is required')
@@ -60,7 +64,9 @@ def test_native_optimizer_and_batchnorm_updates_match_eager_execution(device):
 
 @pytest.mark.integration
 @pytest.mark.parametrize('device', ['/CPU:0', '/GPU:1'])
-def test_batchnorm_commit_programs_share_code_and_preserve_private_state(device):
+def test_batchnorm_commit_programs_share_code_and_preserve_private_state(request, device):
+    if _run_isolated(request):
+        return
     from concurrent.futures import ThreadPoolExecutor
     from threading import Barrier
     import gc

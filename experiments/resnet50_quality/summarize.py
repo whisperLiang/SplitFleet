@@ -48,9 +48,8 @@ def completed_run(path, *, backend, method, seed):
     policy = resources.get("worker_count_policy")
     if (type(actual_workers) is not int or actual_workers < 1
             or actual_workers != declared_workers
-            or policy not in {"one_per_client", "pooled"}
-            or (policy == "one_per_client" and actual_workers != BACKENDS[backend])
-            or (policy == "pooled" and actual_workers > BACKENDS[backend])):
+            or policy != "fixed_hardware"
+            or actual_workers > BACKENDS[backend]):
         raise ValueError(f"Run did not record a valid actual worker population: {path}")
     with (path / "round_metrics.csv").open() as stream:
         rounds = list(csv.DictReader(stream))

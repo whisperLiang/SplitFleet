@@ -1,4 +1,4 @@
-"""Validated configuration for real virtual split training (no cost fallback)."""
+"""Validated configuration for real virtual split training."""
 
 from __future__ import annotations
 
@@ -60,32 +60,42 @@ class Resources:
     client_cpus_per_worker: float | None = None
     client_gpus_per_worker: float = 0.0
     max_concurrent_clients: int | None = None
-    worker_count_policy: str = "one_per_client"
-    server_concurrency: int = 1
+    worker_count_policy: str = "max_concurrency"
+    # One suffix execution lane by default, independent of the client pool.
+    # Explicit None binds capacity to the admitted worker pool.
+    server_concurrency: int | None = 1
     server_concurrency_by_round: dict[int, int] = field(default_factory=dict)
     max_suffix_replicas: int | None = None
     max_resident_suffix_replicas: int | None = None
     per_client_suffix_models: bool = False
     server_memory_budget_mb: float | None = None
+    client_memory_budget_mb: float | None = None
     mode: str = "scheduling"
     ray_address: str | None = None
     object_store_memory_mb: int = 256
     client_gpu_pool_size: int | None = None
-    client_runtime_slots: int = 0
+    # Filled by ``VirtualConfig`` after the logical population and local
+    # resource budget are known.  They are serialized as evidence so a
+    # replay cannot silently use a different physical capacity.
+    worker_target_count: int | None = field(default=None, init=False, repr=False)
+    effective_worker_capacity: int | None = field(default=None, init=False, repr=False)
+    capacity_observation: dict | None = field(default=None, init=False, repr=False)
+    logical_suffix_model_count: int | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
-        if self.worker_count_policy not in {"one_per_client", "pooled"}:
-            raise ValueError("worker_count_policy must be one_per_client or pooled")
+        if self.worker_count_policy not in {"max_concurrency", "fixed", "fixed_hardware"}:
+            raise ValueError(
+                "worker_count_policy must be max_concurrency, fixed, or fixed_hardware"
+            )
         if self.max_concurrent_clients is not None:
             _positive_integer(self.max_concurrent_clients, "max_concurrent_clients")
-        elif self.worker_count_policy == "pooled":
-            raise ValueError("pooled execution requires an explicit max_concurrent_clients")
-        _positive_integer(self.client_runtime_slots, "client_runtime_slots", minimum=0)
-        for name in (
-            "server_concurrency",
-            "object_store_memory_mb",
-        ):
-            _positive_integer(getattr(self, name), name)
+        _positive_integer(self.object_store_memory_mb, "object_store_memory_mb")
+        if self.server_concurrency is not None:
+            _positive_integer(self.server_concurrency, "server_concurrency")
+        if self.worker_count_policy in {"fixed", "fixed_hardware"} and self.max_concurrent_clients is None:
+            raise ValueError("fixed worker execution requires max_concurrent_clients")
+        if self.client_memory_budget_mb is not None and self.client_memory_budget_mb <= 0:
+            raise ValueError("client_memory_budget_mb must be positive")
         if self.max_suffix_replicas is not None:
             _positive_integer(self.max_suffix_replicas, "max_suffix_replicas")
         if self.max_resident_suffix_replicas is not None:
@@ -129,11 +139,87 @@ class Resources:
 
     @property
     def suffix_capacity(self):
-        return self.max_suffix_replicas or self.max_concurrent_clients
+        # This is the logical suffix population.  It is intentionally separate
+        # from physical execution slots, which are bounded by workers.
+        return self.max_suffix_replicas or self.effective_worker_capacity or self.max_concurrent_clients
 
     @property
     def resident_suffix_capacity(self):
-        return self.max_resident_suffix_replicas or self.suffix_capacity
+        # ``max_suffix_replicas`` is the explicit bound for materialized
+        # suffix replicas in the common shared-model mode.  It must also be
+        # honoured when no separate resident override is supplied; otherwise
+        # a configuration such as ``max_suffix_replicas=4`` would still admit
+        # one model per worker.  The admitted worker capacity remains the
+        # physical execution bound.
+        requested = (
+            self.max_resident_suffix_replicas
+            or self.max_suffix_replicas
+            or self.effective_suffix_slots
+        )
+        return min(requested, self.effective_suffix_slots)
+
+    @property
+    def effective_suffix_slots(self):
+        """Physical suffix execution slots admitted for this run."""
+        return self.effective_worker_capacity or self.max_concurrent_clients or 1
+
+    @property
+    def logical_suffix_models(self):
+        return self.logical_suffix_model_count or self.max_suffix_replicas or 1
+
+    @property
+    def strict_worker_capacity(self):
+        return self.worker_count_policy in {"fixed", "fixed_hardware"}
+
+    @property
+    def effective_server_concurrency(self):
+        """Per-round suffix lane limit, bounded by resident suffix capacity."""
+        return min(
+            self.server_concurrency or self.effective_suffix_slots,
+            self.resident_suffix_capacity,
+        )
+
+    def with_capacity(self, *, target: int, effective: int):
+        """Return a resource record with the admitted native capacity frozen."""
+        value = replace(
+            self,
+            # ``max_concurrent_clients`` is the user's requested cap.  Keep it
+            # intact while the derived effective capacity is recorded beside
+            # it in the frozen configuration.
+            client_cpus_per_worker=self.client_cpus_per_worker,
+        )
+        object.__setattr__(value, "worker_target_count", int(target))
+        object.__setattr__(value, "effective_worker_capacity", int(effective))
+        return value
+
+    def adopt_capacity(self, actual: int, *, predicted: int, source: str = "native_flower_ray_pool") -> None:
+        """Freeze the capacity actually admitted by native Ray."""
+        if type(actual) is not int or actual < 1:
+            raise ValueError("actual worker capacity must be a positive integer")
+        self.record_capacity_observation(actual, predicted=predicted, source=source)
+        upper = min(
+            int(predicted),
+            int(self.worker_target_count or predicted),
+            int(self.effective_worker_capacity or predicted),
+        )
+        object.__setattr__(self, "effective_worker_capacity", min(int(actual), upper))
+
+    def record_capacity_observation(
+        self, actual: int, *, predicted: int, source: str = "native_flower_ray_pool"
+    ) -> None:
+        """Record a native-capacity check without changing the admitted limit."""
+        if type(actual) is not int or actual < 1:
+            raise ValueError("actual worker capacity must be a positive integer")
+        observation = {
+            "predicted": int(predicted),
+            "actual": int(actual),
+            "matched": int(actual) == int(predicted),
+            "source": str(source),
+        }
+        previous = self.capacity_observation
+        if previous is not None:
+            observation["prior"] = previous
+        object.__setattr__(self, "capacity_observation", observation)
 
 
 @dataclass(frozen=True)
@@ -260,7 +346,7 @@ class VirtualConfig:
     learning_rate: float = 0.01
     optimizer: str = "sgd"
     boundary: str = "50%"
-    placement: str = "static"
+    placement: str = "greedy"
     server_device: str = "cpu"
     virtual_clients: ClientPopulation = field(default_factory=ClientPopulation)
     resources: Resources = field(default_factory=Resources)
@@ -276,29 +362,119 @@ class VirtualConfig:
 
     def __post_init__(self):
         resources = self.resources
-        workers = resources.max_concurrent_clients
-        if resources.worker_count_policy == "one_per_client":
-            if workers is not None and workers != self.virtual_clients.total:
-                raise ValueError(
-                    "one_per_client requires max_concurrent_clients == virtual_clients.total; "
-                    "use worker_count_policy=pooled explicitly for queueing tests"
-                )
-            workers = self.virtual_clients.total
+        participant_target = self.max_single_round_participants()
+        if resources.ray_address and resources.client_cpus_per_worker is None:
+            raise ValueError("A remote Ray pool requires explicit client_cpus_per_worker")
+        available = (
+            len(os.sched_getaffinity(0))
+            if hasattr(os, "sched_getaffinity")
+            else (os.cpu_count() or 1)
+        )
+        requested = resources.max_concurrent_clients
+        if resources.strict_worker_capacity and requested is not None and requested > participant_target:
+            raise ValueError(
+                "fixed worker capacity cannot exceed the maximum participating client count"
+            )
+        target = min(participant_target, requested or participant_target)
+        if target < 1:
+            raise ValueError("No worker capacity is available for the selected clients")
+        max_threads = max((profile.torch_threads for profile in self.profiles.values()), default=1)
+        remote_pool = bool(resources.ray_address)
+
+        # A local maximizing pool uses the available CPU budget as a Ray
+        # reservation (for example 32 CPUs / 100 workers = 0.32 CPU each).
+        # Ray quotas are scheduling reservations, not claims that each task
+        # receives a dedicated hardware core.  Explicit CPU reservations are
+        # still honoured and can reduce a non-strict pool when the native Ray
+        # pool cannot admit the requested count.
+        effective = target
         cpus = resources.client_cpus_per_worker
-        if cpus is None:
-            if resources.ray_address:
-                raise ValueError("A remote Ray pool requires explicit client_cpus_per_worker")
-            available = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
-            # Advertise the host's existing CPU budget, even with more actors
-            # than CPUs. This is a scheduling reservation, not a speed limit.
-            cpus = min(available, workers) / workers
-        object.__setattr__(self, "resources", replace(resources,
-                           max_concurrent_clients=workers, client_cpus_per_worker=cpus))
-        if self.resources.resident_suffix_capacity > self.resources.suffix_capacity:
-            raise ValueError("Resident suffix capacity cannot exceed the suffix model count")
-        if (self.resources.per_client_suffix_models
-                and self.resources.suffix_capacity != self.virtual_clients.total):
+        derived_cpus = cpus is None
+        if not remote_pool:
+            if max_threads > 1:
+                effective = min(effective, max(1, math.floor(available / max_threads)))
+            if cpus is None:
+                cpus = min(float(available), float(effective)) / float(effective)
+            elif not resources.strict_worker_capacity:
+                effective = min(effective, max(1, math.floor(available / cpus)))
+        else:
+            # A remote cluster's CPU and memory inventory is only authoritative
+            # after Ray connects.  Do not cap it using the driver's affinity.
+            cpus = float(cpus)
+
+        if resources.client_gpus_per_worker > 0 and resources.client_gpu_pool_size:
+            effective = min(
+                effective,
+                max(1, math.floor(resources.client_gpu_pool_size / resources.client_gpus_per_worker)),
+            )
+        if resources.client_memory_budget_mb is not None and not remote_pool:
+            available_mb = None
+            meminfo = "/proc/meminfo"
+            if os.path.isfile(meminfo):
+                with open(meminfo, encoding="utf-8") as stream:
+                    for line in stream:
+                        if line.startswith("MemAvailable:"):
+                            available_mb = float(line.split()[1]) / 1024.0
+                            break
+            if available_mb is not None:
+                effective = min(
+                    effective,
+                    max(1, math.floor(available_mb / resources.client_memory_budget_mb)),
+                )
+        # A strict fixed configuration must never silently shrink below its
+        # requested physical capacity; native Ray admission verifies it again.
+        if resources.strict_worker_capacity:
+            effective = target
+        if effective < 1:
+            raise ValueError("No worker capacity is available for the selected clients")
+        if derived_cpus and not remote_pool:
+            cpus = min(float(available), float(effective)) / float(effective)
+        # Materialize the maximizing target as the public requested cap.  This
+        # keeps serialized configs self-contained (``None`` would otherwise
+        # make a replay derive a different target from a changed population).
+        if resources.max_concurrent_clients is None:
+            resources = replace(resources, max_concurrent_clients=int(target))
+        resources = resources.with_capacity(target=target, effective=effective)
+        if cpus is None or cpus <= 0 or not math.isfinite(cpus):
+            raise ValueError("Unable to derive a positive client CPU reservation")
+        resources = replace(resources, client_cpus_per_worker=float(cpus))
+        object.__setattr__(resources, "worker_target_count", int(target))
+        object.__setattr__(resources, "effective_worker_capacity", int(effective))
+        # A per-client logical suffix population is independent of resident
+        # execution slots.  Its serialized state is materialized on demand.
+        if resources.per_client_suffix_models and resources.max_suffix_replicas is None:
+            resources = replace(resources, max_suffix_replicas=self.virtual_clients.total)
+            object.__setattr__(resources, "worker_target_count", target)
+            object.__setattr__(resources, "effective_worker_capacity", effective)
+        if resources.max_resident_suffix_replicas is not None and resources.max_resident_suffix_replicas > effective:
+            raise ValueError("max_resident_suffix_replicas cannot exceed effective worker capacity")
+        if (
+            resources.max_suffix_replicas is not None
+            and resources.max_resident_suffix_replicas is not None
+            and resources.max_resident_suffix_replicas > resources.max_suffix_replicas
+        ):
+            raise ValueError(
+                "max_resident_suffix_replicas cannot exceed max_suffix_replicas"
+            )
+        if resources.resident_suffix_capacity > resources.effective_suffix_slots:
+            raise ValueError("Resident suffix capacity cannot exceed physical suffix slots")
+        resident_capacity = resources.resident_suffix_capacity
+        if resources.server_concurrency is not None and resources.server_concurrency > resident_capacity:
+            raise ValueError(
+                "server_concurrency cannot exceed resident suffix capacity"
+            )
+        if any(capacity > resident_capacity for capacity in resources.server_concurrency_by_round.values()):
+            raise ValueError(
+                "server_concurrency_by_round cannot exceed resident suffix capacity"
+            )
+        if resources.per_client_suffix_models and resources.suffix_capacity != self.virtual_clients.total:
             raise ValueError("Per-client suffix model count must equal the logical client population")
+        object.__setattr__(resources, "logical_suffix_model_count", (
+            self.virtual_clients.total
+            if resources.per_client_suffix_models
+            else (resources.max_suffix_replicas or 1)
+        ))
+        object.__setattr__(self, "resources", resources)
         for name in ("rounds", "batch_size", "local_epochs"):
             _positive_integer(getattr(self, name), name)
         _positive_integer(self.seed, "seed", minimum=0)
@@ -315,9 +491,9 @@ class VirtualConfig:
             )
         if self.optimizer not in {"sgd", "adam"} or self.placement not in {
             "static",
-            "cosplit_ucb",
+            "greedy",
         }:
-            raise ValueError("Use optimizer sgd/adam and placement static/cosplit_ucb")
+            raise ValueError("Use optimizer sgd/adam and placement static/greedy")
         if not self.profiles:
             raise ValueError("At least one client profile is required")
         for cid, name in self.client_profiles.items():
@@ -342,7 +518,7 @@ class VirtualConfig:
                 and profile.gpu_fraction != self.resources.client_gpus_per_worker
             ):
                 raise ValueError(
-                    "Native Flower 1.29 uses one resource quota per pool; gpu_fraction must match client_gpus_per_worker"
+                    "The native Flower RayBackend uses one resource quota per pool; gpu_fraction must match client_gpus_per_worker"
                 )
         if self.resources.ray_address and self.transport.advertise_host in {
             None,
@@ -362,6 +538,35 @@ class VirtualConfig:
                 "Ray cluster mode requires worker-reachable bind/advertise hosts, not loopback"
             )
 
+    def max_single_round_participants(self) -> int:
+        """Maximum number of clients that can be selected in one round."""
+        population = self.virtual_clients
+        if not population.offline_rounds:
+            online_max = population.total
+        else:
+            configured_rounds = {
+                int(round_id)
+                for rounds in population.offline_rounds.values()
+                for round_id in rounds
+            }
+            # A round with no schedule entry has the full population online.
+            # Include those rounds when the configured run reaches one.
+            if any(round_id not in configured_rounds for round_id in range(1, self.rounds + 1)):
+                online_max = population.total
+            else:
+                online_max = max(
+                    population.total
+                    - sum(
+                        round_id in population.offline_rounds.get(str(cid), [])
+                        for cid in range(population.total)
+                    )
+                    for round_id in range(1, self.rounds + 1)
+                )
+        return min(
+            population.total,
+            max(1, math.ceil(online_max * population.participation_fraction)),
+        )
+
     def profile(self, partition_id):
         return self.profiles[
             self.client_profiles.get(str(partition_id), next(iter(self.profiles)))
@@ -377,11 +582,16 @@ class VirtualConfig:
         return value
 
     def as_dict(self):
-        return asdict(self)
+        data = asdict(self)
+        # Keep the native admission receipt in the frozen configuration.  It
+        # is needed for exact round-trip validation and makes an adopted Ray
+        # capacity visible instead of silently re-deriving it on replay.
+        return data
 
     @classmethod
     def from_dict(cls, value):
         data = dict(value)
+        derived_resources = {}
         for name, target in (
             ("virtual_clients", ClientPopulation),
             ("resources", Resources),
@@ -390,6 +600,15 @@ class VirtualConfig:
         ):
             if name in data:
                 options = dict(data[name])
+                if name == "resources":
+                    for field_name in (
+                        "worker_target_count",
+                        "effective_worker_capacity",
+                        "capacity_observation",
+                        "logical_suffix_model_count",
+                    ):
+                        if field_name in options:
+                            derived_resources[field_name] = options.pop(field_name)
                 if name == "resources" and "server_concurrency_by_round" in options:
                     options["server_concurrency_by_round"] = {
                         int(r): c
@@ -407,4 +626,13 @@ class VirtualConfig:
         unknown = set(data) - {f.name for f in fields(cls)}
         if unknown:
             raise ValueError(f"Unknown virtual config fields: {sorted(unknown)}")
-        return cls(**data)
+        config = cls(**data)
+        # ``Resources`` keeps these values in init=False fields so ordinary
+        # YAML input cannot forge an admission.  Frozen replay input may carry
+        # the recorded receipt, which must be restored after normal
+        # constructor validation.
+        resources = config.resources
+        for field_name, field_value in derived_resources.items():
+            if field_value is not None:
+                object.__setattr__(resources, field_name, field_value)
+        return config

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 import time
 from collections.abc import Mapping
 from contextlib import nullcontext
@@ -49,7 +50,7 @@ from splitfleet.runtime.auxiliary_state import (
     supports_auxiliary_state,
     train_jax_suffix_with_auxiliary,
 )
-from splitfleet.runtime.torch_suffix_training import train_torch_suffix
+from splitfleet.runtime.torch_suffix_training import TorchReplicaRNG, train_torch_suffix
 
 
 @dataclass
@@ -129,6 +130,18 @@ class TorchLensSplitBackend:
         self.framework_backend = "torch"
         self._candidate_analysis: Any | None = None
         self.train_suffix_auxiliary: Mapping[str, Any] | None = None
+        # Each server-side suffix replica owns one stream.  Requests for the
+        # same replica remain ordered on that stream, while different client
+        # replicas can issue kernels to the same GPU concurrently.
+        self._suffix_stream: torch.cuda.Stream | None = None
+        self._suffix_stream_device: torch.device | None = None
+        self._suffix_stream_lock = threading.Lock()
+        self._suffix_rng: TorchReplicaRNG | None = None
+        self._suffix_rng_device: torch.device | None = None
+        self._suffix_rng_lock = threading.Lock()
+        # Replica-local RNG is the default for every suffix execution.
+        self._replica_rng_isolation = True
+        self._replica_rng_seed: int | None = None
 
     def trace(
         self,
@@ -227,6 +240,86 @@ class TorchLensSplitBackend:
         if self.runtime is None:
             raise RuntimeError("TorchLens split runtime has not been traced.")
         return self.runtime
+
+    def _suffix_execution_stream(
+        self, device: torch.device | None,
+    ) -> torch.cuda.Stream | None:
+        """Return this replica's private CUDA stream, if it runs on CUDA."""
+        if device is None or device.type != "cuda":
+            return None
+        with torch.cuda.device(device):
+            normalized = torch.device("cuda", torch.cuda.current_device())
+            with self._suffix_stream_lock:
+                if (self._suffix_stream is None
+                        or self._suffix_stream_device != normalized):
+                    self._suffix_stream = torch.cuda.Stream(device=normalized)
+                    self._suffix_stream_device = normalized
+                return self._suffix_stream
+
+    def _suffix_rng_scope(self, device: torch.device | None) -> TorchReplicaRNG | None:
+        """Return this replica's isolated Torch RNG state."""
+        if (not self._replica_rng_isolation
+                or device is None or self.framework_backend != "torch"):
+            return None
+        # Direct backend references keep the caller's native RNG semantics.
+        # Server-owned replicas receive an identity seed during lifecycle
+        # binding before their first stochastic suffix phase.
+        if self._replica_rng_seed is None:
+            return None
+        with torch.cuda.device(device) if device.type == "cuda" else nullcontext():
+            normalized = (
+                torch.device("cuda", torch.cuda.current_device())
+                if device.type == "cuda" else torch.device(device)
+            )
+            with self._suffix_rng_lock:
+                if self._suffix_rng is None or self._suffix_rng_device != normalized:
+                    self._suffix_rng = TorchReplicaRNG(
+                        device=normalized,
+                        seed=self._replica_rng_seed,
+                    )
+                    self._suffix_rng_device = normalized
+                return self._suffix_rng
+
+    def enable_replica_rng_isolation(self, enabled: bool = True, *, seed: int | None = None) -> None:
+        """Enable per-replica Torch RNG for a parallel suffix server."""
+        normalized_seed = None if seed is None else int(seed) % (2**63 - 1)
+        changed = bool(enabled) != self._replica_rng_isolation or (
+            normalized_seed is not None and normalized_seed != self._replica_rng_seed
+        )
+        self._replica_rng_isolation = bool(enabled)
+        if normalized_seed is not None:
+            self._replica_rng_seed = normalized_seed
+        if changed:
+            # A physical slot can serve a different logical client after its
+            # task is retired.  Do not let the previous client's generator
+            # state leak into the next seed/round.
+            with self._suffix_rng_lock:
+                self._suffix_rng = None
+                self._suffix_rng_device = None
+
+    def reset_execution_state(self) -> None:
+        """Give a cloned server replica private stream and RNG ownership."""
+        self._suffix_stream = None
+        self._suffix_stream_device = None
+        self._suffix_stream_lock = threading.Lock()
+        self._suffix_rng = None
+        self._suffix_rng_device = None
+        self._suffix_rng_lock = threading.Lock()
+
+    def capture_replica_rng_state(self, device: torch.device | None = None):
+        """Capture public per-replica RNG state before a runtime is released."""
+        if self._suffix_rng is None:
+            return None
+        if device is not None and self._suffix_rng_device != torch.device(device):
+            return None
+        return self._suffix_rng.get_state()
+
+    def restore_replica_rng_state(self, state, device: torch.device | None = None) -> None:
+        """Restore a persisted per-client RNG stream after runtime recreation."""
+        if state is None:
+            return
+        target = torch.device(device or self.device)
+        self._suffix_rng_scope(target).set_state(state)
 
     def _bind_native_tensorflow_execution(self):
         if self.framework_backend == 'tf' and getattr(self.model, '_splitfleet_tensorflow_function_forward', False):
@@ -469,6 +562,8 @@ class TorchLensSplitBackend:
                 optimizer=optimizer,
                 measurements=measurements,
                 boundary_gradients_only=boundary_gradients_only,
+                stream=self._suffix_execution_stream(device),
+                rng=self._suffix_rng_scope(device),
             )
         else:
             started = time.perf_counter_ns() if measurements is not None else None

@@ -18,7 +18,7 @@ def test_resident_catalog_counts_wire_tensors_and_preserves_complete_native_abi(
     )
     from splitfleet.backends.utils import adapter_for
     from splitfleet.runtime.functional_sgd import resident_parameter_bindings
-    from splitfleet.server.placement.cosplit_ucb.candidate_provider import (
+    from splitfleet.server.placement.greedy.candidate_provider import (
         TorchLensCandidateProvider,
     )
     from splitfleet.transport.split_wire import boundary_to_envelope
@@ -143,7 +143,7 @@ def test_default_jax_virtual_cosplit_trains_and_prices_the_actual_wire(request, 
         return provider
 
     monkeypatch.setattr(runtime, "TorchLensCandidateProvider", observe_provider)
-    config = VirtualConfig(rounds=2, batch_size=2, placement="cosplit_ucb",
+    config = VirtualConfig(rounds=2, batch_size=2, placement="greedy",
         virtual_clients=ClientPopulation(total=2), resources=Resources(max_concurrent_clients=2),
         workload={"isolate_unused_frameworks": True})
     spec = runtime.TrainingSpec(task=TASK_SPECS.get("image_classification"),

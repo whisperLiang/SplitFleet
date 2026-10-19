@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import time
 import uuid
 from functools import wraps
@@ -29,6 +30,7 @@ from splitfleet.common.constants import (
     AUTOSPLIT_MODEL_VERSION_CONFIG_KEY,
     AUTOSPLIT_MODEL_VERSION_CONTRACT_CONFIG_KEY,
     AUTOSPLIT_PLAN_ID_CONFIG_KEY,
+    AUTOSPLIT_REPLICA_RNG_SEED_CONFIG_KEY,
 )
 from splitfleet.server.server_model.server_model import ServerModel
 from splitfleet.split_engine import graph_contract_for_runtime_handle
@@ -92,6 +94,10 @@ class AutoSplitTailServerModel(ServerModel):
         self.mode = mode
         self.device = device
         self.backend_adapter = adapter_for(model, sample_inputs)
+        self._replica_rng_seed_base = 0
+        if self.backend_adapter.backend_name == "torch":
+            import torch
+            self._replica_rng_seed_base = torch.initial_seed()
         self._model_template = model if defer_model else None
         self.model = None if defer_model else self._clone_native_model(model)
         self.offloaded_parameters = None
@@ -99,6 +105,7 @@ class AutoSplitTailServerModel(ServerModel):
         self.runtime_handle: TorchLensRuntimeHandle | None = None
         self.graph_contract: GraphContract | None = None
         self.batch_window: tuple[int, int] | None = None
+        self.state_ownership = None
         self.num_examples = 0
         self.loss_total = 0.0
         self.sid = ""
@@ -108,9 +115,53 @@ class AutoSplitTailServerModel(ServerModel):
         self._inflight_steps: set[tuple[int, str, str]] = set()
         self._step_lock = RLock()
         self._runtime_cache: dict[tuple[str, str, bool, str], TorchLensRuntimeHandle] = {}
+        self._replica_rng_state = None
+        self._replica_rng_seed = None
         self.runtime_prepare_sec = 0.0
         self.boundary_deserialize_sec = 0.0
         self.gradient_serialize_sec = 0.0
+
+    def runtime_handles(self):
+        """Return owned runtime handles for lifecycle management."""
+        return tuple(self._runtime_cache.values())
+
+    def reset_task_state(self) -> None:
+        """Clear task-local optimizer/step state before a physical slot is reused."""
+        if self._inflight_steps:
+            raise RuntimeError("Cannot reset a suffix with an in-flight step")
+        self.optimizer = None
+        self.sid = ""
+        self.model_version = 0
+        self.plan_id = ""
+        self.num_examples = 0
+        self.loss_total = 0.0
+        self._processed_steps.clear()
+        self.state_ownership = None
+        self.graph_contract = None
+        self.batch_window = None
+        self.runtime_handle = None
+        self._replica_rng_state = None
+        self._replica_rng_seed = None
+
+    def close_runtime(self) -> None:
+        """Drop all per-replica runtime references without touching model state."""
+        if self._inflight_steps:
+            raise RuntimeError("Cannot close a suffix with an in-flight step")
+        self.capture_replica_rng_state()
+        self._runtime_cache.clear()
+        self.runtime_handle = None
+        self.optimizer = None
+
+    def capture_replica_rng_state(self) -> None:
+        """Persist RNG before the shared runtime handle is released."""
+        if self.runtime_handle is None:
+            return
+        capture = getattr(self.runtime_handle.backend, "capture_replica_rng_state", None)
+        if capture is not None:
+            self._replica_rng_state = capture(self.device)
+
+    reset_execution = reset_task_state
+    close = close_runtime
 
     def get_parameters(self):
         if self.model is None:
@@ -337,6 +388,25 @@ class AutoSplitTailServerModel(ServerModel):
             self.runtime_handle = self.runtime_manager.clone_runtime_for_model(
                 self.model, suffix=plan_suffix, plan_id=self.plan_id)
             self._runtime_cache[runtime_key] = self.runtime_handle
+        seed_rng = getattr(self.runtime_handle.backend, "enable_replica_rng_isolation", None)
+        if seed_rng is not None:
+            # Virtual strategies supply a seed derived from the experiment and
+            # stable partition, never Flower's random transport node ID. Native
+            # callers default to their initial Torch seed and client identity.
+            seed = config.get(AUTOSPLIT_REPLICA_RNG_SEED_CONFIG_KEY)
+            if seed is None:
+                seed = int.from_bytes(hashlib.sha256(
+                    f"{self._replica_rng_seed_base}:{self.sid}:suffix".encode()
+                ).digest()[:8], "little")
+            if type(seed) is not int:
+                raise ValueError("The suffix replica RNG seed must be an integer")
+            seed_rng(getattr(self.runtime_manager, "replica_rng_isolation", False), seed=seed)
+            if self._replica_rng_state is not None and self._replica_rng_seed == seed:
+                restore = getattr(self.runtime_handle.backend, "restore_replica_rng_state", None)
+                if restore is not None:
+                    restore(self._replica_rng_state, self.device)
+            self._replica_rng_state = None
+            self._replica_rng_seed = seed
         self.runtime_prepare_sec = time.perf_counter() - prepare_started
         self._configure_native_contract(config, state_schema)
 

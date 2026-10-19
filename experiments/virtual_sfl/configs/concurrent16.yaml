@@ -5,8 +5,6 @@ virtual_clients:
   total: 16
 resources:
   max_concurrent_clients: 16
-  server_concurrency: 1
-  max_suffix_replicas: 4
 workload:
   source: fixture
   model: tiny

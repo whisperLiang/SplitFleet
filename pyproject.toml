@@ -16,7 +16,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "flwr>=1.29.0",
+    "flwr==1.40.0",
     "torchlens==2.34.1",
     "torch>=2.11.0",
     "numpy>=2.2.6",
@@ -27,7 +27,7 @@ dependencies = [
 
 [project.optional-dependencies]
 simulation = [
-    "flwr[simulation]==1.29.0",
+    "flwr[simulation]==1.40.0",
 ]
 
 dev = [

@@ -541,7 +541,12 @@ class AutoSplitStrategy(PlainSlStrategy):
         if hasattr(self.placement_policy, "state_download_bytes"):
             self.placement_policy.state_download_bytes = sum(len(value) for value in parameters.tensors)
         prepare_calibration = getattr(self.placement_policy, "prepare_calibration", None)
-        if (prepare_calibration is not None and self.backend_adapter.backend_name in {'torch', 'tf', 'paddle', 'jax'}
+        # Physical SplitFleet prepares the state-preserving calibration once
+        # before Flower starts.  Some callers construct the strategy with raw
+        # ModelInputs rather than a TaskBatch, so there is no representative
+        # target available here; avoid a second, target-less calibration call.
+        if (prepare_calibration is not None and self._calibration_batch is not None
+                and self.backend_adapter.backend_name in {'torch', 'tf', 'paddle', 'jax'}
                 and hasattr(self.placement_policy.candidate_provider, "model")):
             prepare_calibration(
                 ModelInputs(self.sample_inputs, self.sample_kwargs),
@@ -571,7 +576,7 @@ class AutoSplitStrategy(PlainSlStrategy):
                     fit_ins.config[OWNERSHIP_KEY])
         self._round_fit_dispatch_start[int(server_round)] = time.perf_counter()
         if hasattr(self.placement_policy, "state_download_bytes"):
-            from splitfleet.server.placement.cosplit_ucb.rpc_timing import TimedFitClientProxy
+            from splitfleet.server.placement.greedy.rpc_timing import TimedFitClientProxy
             instructions = [(TimedFitClientProxy(client), ins) for client, ins in instructions]
         return instructions
 
@@ -779,7 +784,7 @@ class AutoSplitStrategy(PlainSlStrategy):
         if observe_round is None and observe_failure is None:
             return
         if observe_round is not None:
-            from splitfleet.server.placement.cosplit_ucb.rpc_timing import state_exchange_duration
+            from splitfleet.server.placement.greedy.rpc_timing import state_exchange_duration
             observations = []
             for client, fit_res in results:
                 cid = getattr(client, "cid", None)
@@ -790,23 +795,63 @@ class AutoSplitStrategy(PlainSlStrategy):
                     metrics.get("boundary")
                     or self._round_placement_assignments.get((int(server_round), True), {}).get(str(cid), "")
                 )
+                completion_ms = self._optional_metric(metrics, "coordinator_fit_rpc_ms")
+                completion_scope = "coordinator_fit_rpc"
+                if completion_ms is None:
+                    completion_ms = self._optional_metric(metrics, "fit_duration_ms")
+                    completion_scope = "client_fit"
+                service_component = ("server_resource_service" if
+                    getattr(getattr(policy, "config", None), "closed_loop_queue", False) else "server_service")
+                service_ms = self._batch_cost_metric(metrics, service_component)
+                if service_component == "server_resource_service" and service_ms is None:
+                    raise ValueError("Closed-queue placement requires measured queue-free server spans")
+                network_ms = self._batch_cost_metric(metrics, "network_roundtrip")
+                if service_component == "server_resource_service":
+                    count = int(metrics.get("num_batches", 0))
+                    encode = self._optional_metric(metrics, "boundary_serialize_sec")
+                    decode = self._optional_metric(metrics, "gradient_deserialize_sec")
+                    if count < 1 or network_ms is None or encode is None or decode is None:
+                        raise ValueError("Closed-queue placement requires actual transport and codec timings")
+                    network_ms += (encode + decode) * 1000. / count
+                exchange_ms = state_exchange_duration(metrics)
                 observations.append(PlacementFeedback(
                     round_id=int(server_round),
                     client_id=str(cid),
                     boundary=boundary,
-                    client_forward_ms=self._optional_metric(metrics, "client_forward_ms"),
-                    client_backward_ms=self._optional_metric(metrics, "client_backward_ms"),
-                    network_upload_ms=self._optional_metric(metrics, "network_upload_ms"),
-                    network_download_ms=self._optional_metric(metrics, "network_download_ms"),
-                    network_roundtrip_ms=self._optional_metric(metrics, "network_roundtrip_ms"),
-                    state_exchange_ms=state_exchange_duration(metrics),
-                    server_service_ms=self._optional_metric(metrics, "server_service_ms"),
+                    client_forward_ms=self._batch_cost_metric(metrics, "client_forward"),
+                    client_backward_ms=self._batch_cost_metric(metrics, "client_backward"),
+                    network_upload_ms=self._batch_cost_metric(metrics, "network_upload"),
+                    network_download_ms=self._batch_cost_metric(metrics, "network_download"),
+                    network_roundtrip_ms=network_ms,
+                    state_exchange_ms=exchange_ms,
+                    server_service_ms=service_ms,
                     switch_ms=self._optional_metric(metrics, "switch_ms"),
-                    completion_ms=self._optional_metric(metrics, "fit_duration_ms"),
+                    completion_ms=completion_ms,
+                    completion_scope=completion_scope,
                     num_examples=fit_res.num_examples,
                     num_batches=int(metrics.get("num_batches", 0)),
+                    transport_upload_bytes=(
+                        (float(metrics["activation_upload_bytes"]) + float(metrics["target_upload_bytes"])
+                         + float(metrics["request_metadata_upload_bytes"])) / int(metrics["num_batches"])
+                        if int(metrics.get("num_batches", 0)) > 0 and all(key in metrics for key in
+                            ("activation_upload_bytes", "target_upload_bytes", "request_metadata_upload_bytes")) else None),
+                    transport_download_bytes=(float(metrics["download_bytes"]) / int(metrics["num_batches"])
+                        if int(metrics.get("num_batches", 0)) > 0 and "download_bytes" in metrics else None),
+                    transport_request_overhead_bytes=(
+                        (float(metrics["target_upload_bytes"]) + float(metrics["request_metadata_upload_bytes"]))
+                        / int(metrics["num_batches"])
+                        if int(metrics.get("num_batches", 0)) > 0 and all(key in metrics for key in
+                            ("target_upload_bytes", "request_metadata_upload_bytes")) else None),
+                    transport_response_overhead_bytes=(float(metrics["response_metadata_download_bytes"])
+                        / int(metrics["num_batches"])
+                        if int(metrics.get("num_batches", 0)) > 0 and "response_metadata_download_bytes" in metrics else None),
                     client_peak_memory_mb=self._optional_metric(metrics, "client_peak_memory_mb"),
                     server_peak_memory_mb=self._optional_metric(metrics, "server_peak_memory_mb"),
+                    server_load=(
+                        {key.removeprefix("server_load_"): float(value)
+                         for key, value in metrics.items() if key.startswith("server_load_")}
+                        or None
+                    ),
                     execution_profile=(
                         {
                             "framework_backend": str(metrics["framework_backend"]),
@@ -836,6 +881,16 @@ class AutoSplitStrategy(PlainSlStrategy):
                     kind=self._classify_placement_failure(failure),
                     reason=failure,
                 )
+
+    @classmethod
+    def _batch_cost_metric(cls, metrics: Mapping[str, Any], component: str) -> float | None:
+        """Forecast repeated work from the batch mean; retain legacy fallback.
+
+        The short ``*_ms`` fields can be batch medians. Multiplying a median
+        by the batch count understates work when concurrent steps have tails.
+        """
+        mean = cls._optional_metric(metrics, component + "_mean_ms")
+        return mean if mean is not None else cls._optional_metric(metrics, component + "_ms")
 
     @staticmethod
     def _optional_metric(metrics: Mapping[str, Any], key: str) -> float | None:

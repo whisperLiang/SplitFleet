@@ -47,9 +47,9 @@ RUNTIME_SOURCES = (
     "experiments/unified_multitask/data.py",
     "experiments/unified_multitask/edge_models.py",
     "experiments/common/workload_training.py",
-    "splitfleet/server/placement/cosplit_ucb/candidate_provider.py",
-    "splitfleet/server/placement/cosplit_ucb/config.py",
-    "splitfleet/server/placement/cosplit_ucb/policy.py",
+    "splitfleet/server/placement/greedy/candidate_provider.py",
+    "splitfleet/server/placement/greedy/config.py",
+    "splitfleet/server/placement/greedy/policy.py",
     "splitfleet/server/strategy/autosplit_strategy.py",
 )
 FROZEN_FOUR_TASK_SOURCES = {
@@ -71,6 +71,10 @@ ASYNC_FL_SOURCES = (
 def _runtime_code_hash(folder: Path) -> str:
     source = json.loads((folder.parent / "source_hashes.json").read_text(encoding="utf-8"))
     required = RUNTIME_SOURCES
+    if not any("splitfleet/server/placement/greedy/" in path for path in source):
+        # Read historical source manifests using their original paths.
+        required = tuple(path.replace("placement/greedy/", "placement/cosplit_ucb/")
+                         for path in required)
     identity = hashlib.sha256(json.dumps(source, sort_keys=True).encode()).hexdigest()
     if identity in FROZEN_FOUR_TASK_SOURCES:
         # The retained executions precede the shared-helper extraction. Hash

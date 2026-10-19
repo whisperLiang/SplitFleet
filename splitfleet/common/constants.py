@@ -23,10 +23,11 @@ AUTOSPLIT_GRAPH_CONTRACT_CONFIG_KEY = "autosplit_graph_contract"
 AUTOSPLIT_GRAPH_CONTRACT_DIGEST_CONFIG_KEY = "autosplit_graph_contract_digest"
 AUTOSPLIT_MODEL_VERSION_CONFIG_KEY = "autosplit_model_version"
 AUTOSPLIT_MODEL_VERSION_CONTRACT_CONFIG_KEY = "autosplit_model_version_contract"
-COSPLIT_CALIBRATION_PARAMETERS_CONFIG_KEY = "cosplit_calibration_parameters"
-COSPLIT_CALIBRATION_MODEL_HASH_CONFIG_KEY = "cosplit_calibration_model_hash"
-COSPLIT_CALIBRATION_HASH_HANDSHAKE_KEY = "cosplit_calibration_hash_handshake"
-COSPLIT_CALIBRATION_PARAMETERS_REQUIRED_KEY = "cosplit_calibration_parameters_required"
+AUTOSPLIT_REPLICA_RNG_SEED_CONFIG_KEY = "autosplit_replica_rng_seed"
+PLACEMENT_CALIBRATION_PARAMETERS_CONFIG_KEY = "splitfleet_calibration_parameters"
+PLACEMENT_CALIBRATION_MODEL_HASH_CONFIG_KEY = "splitfleet_calibration_model_hash"
+PLACEMENT_CALIBRATION_HASH_HANDSHAKE_KEY = "splitfleet_calibration_hash_handshake"
+PLACEMENT_CALIBRATION_PARAMETERS_REQUIRED_KEY = "splitfleet_calibration_parameters_required"
 
 # Wall-clock transport stamps are carried as decimal nanoseconds in gRPC
 # metadata. One-way values are accepted only when both hosts' timestamps form
