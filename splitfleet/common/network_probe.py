@@ -18,6 +18,11 @@ PROBE_MODE = "active_split_rpc_probe_each_training_round"
 SMALL_BYTES = 1024
 LARGE_BYTES = 2_097_152
 PROBE_REPEATS = 3
+PROBE_ATTEMPTS = 3
+
+
+class UnresolvedNetworkProbe(ValueError):
+    """Valid RPC samples whose size-dependent duration is hidden by jitter."""
 
 
 def probe_response(data, metadata):
@@ -67,16 +72,25 @@ def measure_network(proxy, *, round_id, timeout=60):
 
     began = time.perf_counter()
     warmup = sample(SMALL_BYTES, SMALL_BYTES)
-    samples = []
-    for _ in range(PROBE_REPEATS):
-        samples.extend((sample(SMALL_BYTES, SMALL_BYTES),
-                        sample(LARGE_BYTES, SMALL_BYTES),
-                        sample(SMALL_BYTES, LARGE_BYTES)))
-    receipt = {"schema": PROBE_SCHEMA, "source": PROBE_SOURCE, "round_id": round_id,
-               "samples": samples, "warmup_samples": [warmup],
-               "elapsed_sec": time.perf_counter() - began}
-    estimate_network(receipt, round_id=round_id)
-    return receipt
+    rejected_attempts = []
+    for attempt in range(PROBE_ATTEMPTS):
+        samples = []
+        for _ in range(PROBE_REPEATS):
+            samples.extend((sample(SMALL_BYTES, SMALL_BYTES),
+                            sample(LARGE_BYTES, SMALL_BYTES),
+                            sample(SMALL_BYTES, LARGE_BYTES)))
+        receipt = {"schema": PROBE_SCHEMA, "source": PROBE_SOURCE, "round_id": round_id,
+                   "samples": samples, "warmup_samples": [warmup],
+                   "rejected_attempts": rejected_attempts,
+                   "elapsed_sec": time.perf_counter() - began}
+        try:
+            estimate_network(receipt, round_id=round_id)
+        except UnresolvedNetworkProbe:
+            if attempt + 1 == PROBE_ATTEMPTS:
+                raise
+            rejected_attempts.append({"samples": samples})
+        else:
+            return receipt
 
 
 def estimate_network(receipt, *, round_id):
@@ -106,7 +120,10 @@ def estimate_network(receipt, *, round_id):
     up_ms = median(groups[(LARGE_BYTES, SMALL_BYTES)]) - rtt_ms
     down_ms = median(groups[(SMALL_BYTES, LARGE_BYTES)]) - rtt_ms
     if up_ms <= 0 or down_ms <= 0:
-        raise ValueError("Active network probe could not resolve directional goodput")
+        raise UnresolvedNetworkProbe(
+            "Active network probe could not resolve directional goodput "
+            f"(small RTT={rtt_ms:.6f} ms, upload delta={up_ms:.6f} ms, "
+            f"download delta={down_ms:.6f} ms)")
     bits = (LARGE_BYTES - SMALL_BYTES) * 8
     context = {"upload_mbps": bits / (up_ms * 1000),
                "download_mbps": bits / (down_ms * 1000), "rtt_ms": rtt_ms}

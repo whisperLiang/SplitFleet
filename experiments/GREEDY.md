@@ -24,7 +24,11 @@ score = n * (prefix_batch_compute + suffix_batch_service + boundary_rpc)
 
 Each round uses one warmup followed by three repeats of small (1 KiB),
 upload-heavy (2 MiB / 1 KiB) and download-heavy (1 KiB / 2 MiB) RPCs. Median
-durations limit sensitivity to individual outliers. The measured RTT includes
+durations limit sensitivity to individual outliers. Clients probe sequentially
+so their probes do not compete for the shared RPC service. A nonpositive
+directional difference triggers up to two fresh sets of samples; rejected
+samples remain in the receipt and all attempts count toward probe time.
+Malformed replies fail immediately. The measured RTT includes
 fixed RPC overhead, so bootstrap intercepts are not added a second time.
 The estimates are application goodput and RPC latency, not NIC bandwidth or
 one-way propagation delay. Probe traffic does not construct a suffix model,

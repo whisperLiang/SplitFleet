@@ -279,7 +279,10 @@ class ClientTelemetry:
 
         # Publish no partial cohort if any probe fails. A failure cannot
         # silently reuse a configured rate or an earlier round's observation.
-        measured = self._map_clients(measure, pending)
+        # Probing clients concurrently makes the shared RPC service's queue
+        # dominate small-RPC RTT and can produce negative directional deltas.
+        # Calibration and training retain their independent worker bound.
+        measured = [measure(client) for client in pending]
         self.round_probes[int(round_id)] = {**previous, **dict(measured)}
         observer = getattr(self.policy, "transport_probe_observer", None)
         if observer is not None:
