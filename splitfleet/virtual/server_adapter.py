@@ -474,9 +474,12 @@ class VirtualStrategy(AutoSplitStrategy):
                     "reason": reason,
                 },
             )
-        if (self.spec.frozen_partitions is not None and self.spec.trainer is not None
-                and (failures or len(results) != len(self.round_clients[server_round]["selected"]))):
-            raise RuntimeError("Quality round is incomplete; partial client states cannot enter aggregation")
+        require_complete = (
+            self.spec.frozen_partitions is not None and self.spec.trainer is not None
+            or self.virtual_config.workload.get("require_complete_round") is True
+        )
+        if require_complete and (failures or len(results) != len(self.round_clients[server_round]["selected"])):
+            raise RuntimeError("Training round is incomplete; partial client states cannot enter aggregation")
         value = super().aggregate_fit(server_round, results, failures)
         self.round_aggregation_sec[server_round] = time.perf_counter() - started
         return value

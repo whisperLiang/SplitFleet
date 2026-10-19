@@ -122,6 +122,7 @@ class EdgeFactory:
     samples: int
     evaluation_samples: int
     tokenizer_path: str | None = None
+    pretrain_weights: str | None = None
 
     def workload(self):
         return edge_workload(self)
@@ -130,7 +131,15 @@ class EdgeFactory:
         return self.workload()[0].train_dataset
 
     def model(self):
-        return self.workload()[0].model_factory()
+        workload, _, configuration = self.workload()
+        if self.pretrain_weights is not None:
+            from experiments.unified_multitask.edge_models import make_edge_model
+
+            return make_edge_model(
+                self.name, config=configuration, pretrain_weights=self.pretrain_weights,
+                tokenizer_path=self.tokenizer_path,
+            )
+        return workload.model_factory()
 
     def evaluate(self, model, device):
         workload, _, _ = self.workload()
@@ -209,6 +218,7 @@ def build_spec(config):
         samples=samples,
         evaluation_samples=evaluation_samples,
         tokenizer_path=value.get("tokenizer_path"),
+        pretrain_weights=value.get("pretrain_weights"),
     )
     if task_name == "text_classification" and factory.tokenizer_path is None:
         from huggingface_hub.constants import HF_HUB_CACHE
@@ -227,6 +237,15 @@ def build_spec(config):
             )
         factory = replace(factory, tokenizer_path=str(directory))
     workload, metadata, _ = factory.workload()
+    if factory.pretrain_weights is not None:
+        from experiments.unified_multitask.edge_models import file_sha256
+
+        metadata = {**metadata, "initialization": {
+            "source": "checkpoint", "path": factory.pretrain_weights,
+            "sha256": file_sha256(factory.pretrain_weights),
+        }}
+    else:
+        metadata = {**metadata, "initialization": {"source": "random"}}
     provider = None
     if task_name == "object_detection":
         from experiments.rfdetr_nano_physical import RFDETRCandidateProvider

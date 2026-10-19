@@ -44,6 +44,8 @@ uv run --extra simulation --extra integration python -m experiments.virtual_sfl 
 
 fixture 用于执行正确性测试，结果明确标记 `data_source: fixture`。正式数据配置标记 `real`，不会自动下载或替换数据。CIFAR-10、AG News CSV、VOC 2007、Oxford-IIIT Pet 复用现有数据接口。BERT 使用固定 revision 的配置和 tokenizer；也可设置 `workload.tokenizer_path`。这些配置验证的是训练运行时，未声称达到收敛质量或加载完整预训练权重。
 
+收敛实验可显式设置 `workload.pretrain_weights` 为所有 Worker 可访问的本地检查点。模型工厂加载该检查点，运行记录保留其路径和 SHA-256；不设置时使用随机初始化，即使模型名包含 `pretrained`。ResNet50 的边缘模型预设冻结 BatchNorm 统计，微调时应提供相应预训练权重。设置 `workload.require_complete_round: true` 后，任何客户端失败或缺失都会在聚合前终止实验，失败原因仍保留在客户端记录中。
+
 ## 实际调用链
 
 ```mermaid

@@ -16,7 +16,7 @@ from .workloads import build_spec
 
 def resolve_paths(config):
     workload = dict(config.workload)
-    for key in ("data_root", "tokenizer_path"):
+    for key in ("data_root", "tokenizer_path", "pretrain_weights"):
         if workload.get(key):
             workload[key] = str(Path(workload[key]).resolve())
     from dataclasses import replace
