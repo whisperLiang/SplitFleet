@@ -70,6 +70,25 @@ def resnet18():
     return FrozenStatisticsVisionModel(factory(weights=None, num_classes=10))
 
 
+def train_classification_batch(model, raw, optimizer, device, learning_rate):
+    """Use the same image-classification objective for full-model FedAvg."""
+    from experiments.common.workload_training import _move
+
+    task = TASK_SPECS.get("image_classification").make_adapter()
+    batch = task.prepare_batch(raw)
+    inputs = batch.inputs.map_values(lambda value: _move(value, torch.device(device)))
+    targets = _move(batch.targets, torch.device(device))
+    optimizer.zero_grad(set_to_none=True)
+    loss = task.loss(model(*inputs.args, **inputs.kwargs), targets)
+    if not torch.isfinite(loss).all():
+        raise FloatingPointError("FedAvg full-model loss is nonfinite")
+    loss.backward()
+    if any(p.grad is not None and not torch.isfinite(p.grad).all() for p in model.parameters()):
+        raise FloatingPointError("FedAvg full-model gradient is nonfinite")
+    optimizer.step()
+    return batch.num_examples, float(loss.detach())
+
+
 def evaluate_classification(
     model, device, *, dataset_factory, task_name, collate_fn=None
 ):
@@ -172,13 +191,26 @@ def edge_workload(factory):
 
 def build_spec(config):
     value = config.workload
+    method = value.get("training_method", "splitfleet")
+    if method not in {"splitfleet", "fedavg"}:
+        raise ValueError("workload.training_method must be splitfleet or fedavg")
+    if method == "fedavg" and value.get("task", "image_classification") != "image_classification":
+        raise ValueError("The virtual CLI FedAvg preset currently supports image classification")
+    trainer = train_classification_batch if method == "fedavg" else None
     source = value.get("source", "real")
     if source == "fixture":
         if value.get("model", "tiny") != "tiny":
             raise ValueError(
                 "Only the tiny differentiable fixture is supported for source=fixture"
             )
-        return fixture_spec(samples=int(value.get("samples", 400)), seed=config.seed)
+        spec = replace(fixture_spec(samples=int(value.get("samples", 400)), seed=config.seed), trainer=trainer)
+        if value.get("evaluation_samples"):
+            spec = replace(spec, evaluate_fn=partial(
+                evaluate_classification,
+                dataset_factory=partial(fixture_dataset, int(value["evaluation_samples"]), config.seed + 1),
+                task_name="image_classification",
+            ))
+        return spec
     if source != "real":
         raise ValueError("workload.source must be real or fixture")
     root = str(Path(value.get("data_root", "data")).resolve())
@@ -199,6 +231,7 @@ def build_spec(config):
             train_dataset_factory=train,
             partition_labels=labels,
             batch_axes={"/args/0": 0},
+            trainer=trainer,
             source="real",
             evaluate_fn=partial(
                 evaluate_classification, dataset_factory=test, task_name=task_name
@@ -246,6 +279,7 @@ def build_spec(config):
         }}
     else:
         metadata = {**metadata, "initialization": {"source": "random"}}
+    metadata = {**metadata, "data_content_hash": workload.data_content_hash}
     provider = None
     if task_name == "object_detection":
         from experiments.rfdetr_nano_physical import RFDETRCandidateProvider
@@ -267,6 +301,7 @@ def build_spec(config):
         batch_axes=axes,
         evaluate_fn=factory.evaluate,
         candidate_provider_factory=provider,
+        trainer=trainer,
         source="real",
         data_manifest=metadata,
     )

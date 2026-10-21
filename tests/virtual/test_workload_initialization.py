@@ -38,6 +38,7 @@ def test_configured_checkpoint_initializes_backbone_and_records_its_hash(tmp_pat
     workload = SimpleNamespace(
         task=TASK_SPECS.get("image_classification"),
         partition_labels=(0, 1), collate_fn=None,
+        data_content_hash="fixture-content-hash",
         model_factory=lambda: make_edge_model("resnet50_pretrained"),
     )
     monkeypatch.setattr(EdgeFactory, "workload", lambda self: (workload, {}, None))

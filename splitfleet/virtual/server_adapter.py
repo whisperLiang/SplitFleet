@@ -551,6 +551,7 @@ class VirtualStrategy(AutoSplitStrategy):
             "metrics": metrics,
             "source": "measured",
             "evaluation_sec": time.perf_counter() - started,
+            "elapsed_wall_sec": time.perf_counter() - self.evidence.started,
         }
         self.round_evaluations.append(observation)
         self.evidence.append("evaluation_metrics.jsonl", observation)

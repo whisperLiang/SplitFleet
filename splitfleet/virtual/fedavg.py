@@ -238,6 +238,12 @@ class _FedAvgStrategy(FedAvg):
                    for _, result in results)
         arrays = aggregate_owned(self.initial_round, updates,
                                  integer_policy=self.spec.integer_aggregation_policy)
+        model_hash = self.ops.hash_arrays(self.model, arrays)
+        if self.config.workload.get("checkpoint_each_round") is True:
+            from .checkpoint import save_round_checkpoint
+
+            save_round_checkpoint(self.ops, self.model, arrays, self.evidence.directory,
+                                  round_id=server_round, model_hash=model_hash)
         samples = sum(result.num_examples for _, result in results)
         train_loss = sum(result.num_examples * result.metrics["loss"] for _, result in results) / samples
         for proxy, result in results:
@@ -252,6 +258,7 @@ class _FedAvgStrategy(FedAvg):
             "round_id": server_round, "source": "measured", "successful_clients": len(results),
             "round_wall_sec": time.perf_counter() - self.round_started[server_round],
             "failed_clients": 0, "train_loss": train_loss, "examples": samples,
+            "model_hash": model_hash,
             "prefix_optimization_steps": sum(m["num_batches"] for m in metrics),
             "worker_processes_observed": len({(m["worker_host"], m["worker_pid"]) for m in metrics}),
             **task_concurrency(metrics),
@@ -277,8 +284,11 @@ class _FedAvgStrategy(FedAvg):
         arrays = parameters_to_ndarrays(parameters)
         self.ops.load_arrays(self.model, arrays)
         metrics = self.spec.evaluate_fn(self.model, self.config.server_device)
-        self.round_evaluations.append({"round_id": server_round, "metrics": metrics,
-                                       "evaluation_sec": time.perf_counter() - started})
+        observation = {"round_id": server_round, "metrics": metrics, "source": "measured",
+                       "evaluation_sec": time.perf_counter() - started,
+                       "elapsed_wall_sec": time.perf_counter() - self.evidence.started}
+        self.round_evaluations.append(observation)
+        self.evidence.append("evaluation_metrics.jsonl", observation)
         if self.spec.round_callback is not None:
             self.spec.round_callback(server_round, arrays, metrics, self.evidence.directory, phase="evaluation")
         return float(metrics["loss"]), metrics
@@ -307,7 +317,9 @@ def run_fedavg(config, spec, *, output):
         )
         strategy = _FedAvgStrategy(config=config, spec=spec, evidence=evidence, model=model, store=store)
         server = Server(client_manager=SimpleClientManager(), strategy=strategy)
-        server.set_max_workers(config.resources.effective_worker_capacity)
+        # Match SplitFleet's coordinator fan-out; Ray still bounds actual
+        # client workers using the shared resource configuration.
+        server.set_max_workers(config.virtual_clients.total)
         app = ServerApp(server_fn=lambda context: ServerAppComponents(
             server=server, config=ServerConfig(num_rounds=config.rounds, round_timeout=spec.round_timeout_sec)))
         run_simulation(server_app=app, client_app=make_client_app(_FedAvgFactory(

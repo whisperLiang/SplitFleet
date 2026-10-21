@@ -48,6 +48,10 @@ fixture 用于执行正确性测试，结果明确标记 `data_source: fixture`�
 
 长实验设置 `workload.checkpoint_each_round: true`，在每个成功轮次聚合后将完整全局模型保存到 `checkpoints/round_NNNN.pt`（其他后端为 `.npz`）。每轮检查点包含模型哈希和当轮 Greedy 状态副本；`latest_checkpoint.json` 在模型写完后原子更新。它保存轮末全局模型，优化器仍按原语义每轮重建。评估结果另逐轮写入 `evaluation_metrics.jsonl`。CLI 检测到子进程异常退出时，会将遗留的 `running` 状态改为 `failed`，并保留已完成轮次的指标。
 
+图像分类可设置 `workload.training_method: fedavg`，使用原生 Flower FedAvg 和完整模型训练；默认值为 `splitfleet`。两者复用模型、数据分区、batch 顺序、SGD、评估和逐轮检查点。FedAvg 在配置的客户端设备上训练完整模型；SplitFleet 在相同客户端设备上训练前缀，并在服务器设备上训练后缀。
+
+配对比较在同一 YAML 的 `runs.splitfleet` 与 `runs.fedavg` 中提供两份配置，仅 `workload.training_method` 不同。CLI 按配置顺序逐个执行，不并行争抢同一机器。全部完成后，核验初始化权重、数据内容、分区、源码和其他配置一致，自动输出 `convergence_comparison.csv`、`training_time_comparison.csv` 和 `comparison_summary.json`。时间取每个冻结子进程的实测执行时间，包含初始化、数据校验、校准、训练、评估、逐轮保存和清理，不含排队等待。每轮评估的累计时钟另从运行时证据初始化开始记录。
+
 ## 实际调用链
 
 ```mermaid

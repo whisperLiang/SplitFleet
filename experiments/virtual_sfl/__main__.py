@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import yaml
@@ -54,6 +55,7 @@ def frozen_run(config, output):
         "--output",
         str(output),
     ]
+    began = time.perf_counter()
     with (output / "stdout.log").open("a") as log:
         result = subprocess.run(
             command,
@@ -63,6 +65,10 @@ def frozen_run(config, output):
             stderr=subprocess.STDOUT,
             check=False,
         )
+    (output / "invocation_timing.json").write_text(json.dumps({
+        "wall_sec": time.perf_counter() - began, "child_exit_code": result.returncode,
+        "scope": "Frozen child invocation, including imports, data verification, initialization, training, evaluation, checkpoints and cleanup; excludes queue wait",
+    }, indent=2) + "\n")
     if result.returncode:
         reason = f"Frozen virtual run failed (exit {result.returncode}); inspect {output / 'stdout.log'}"
         # Ray can terminate the interpreter before the child writes its final
@@ -101,9 +107,43 @@ def main():
     if "runs" in value:
         args.output.mkdir(parents=True, exist_ok=False)
         summaries = []
+        campaign = {"status": "running", "run_order": list(value["runs"]),
+                    "jobs": {name: {"status": "pending"} for name in value["runs"]}}
+
+        def record_campaign():
+            pending = args.output / ".campaign_status.pending"
+            pending.write_text(json.dumps(campaign, indent=2) + "\n")
+            pending.replace(args.output / "campaign_status.json")
+
+        record_campaign()
+        errors = {}
         for name, run_config in value["runs"].items():
             config = resolve_paths(VirtualConfig.from_dict(run_config))
-            summaries.append(frozen_run(config, args.output / name))
+            campaign["jobs"][name]["status"] = "running"
+            record_campaign()
+            try:
+                summaries.append(frozen_run(config, args.output / name))
+            except Exception as exc:
+                errors[name] = str(exc)
+                campaign["jobs"][name].update(status="failed", reason=str(exc))
+            else:
+                campaign["jobs"][name]["status"] = "passed"
+            record_campaign()
+        if errors:
+            campaign["status"] = "failed"
+            record_campaign()
+            raise RuntimeError(f"Campaign contains failed runs: {errors}")
+        if set(value["runs"]) == {"splitfleet", "fedavg"}:
+            from .comparison import summarize_comparison
+
+            try:
+                summarize_comparison(args.output)
+            except Exception as exc:
+                campaign.update(status="failed", reason=str(exc))
+                record_campaign()
+                raise
+        campaign["status"] = "passed"
+        record_campaign()
         print(json.dumps(summaries, indent=2))
     else:
         config = resolve_paths(VirtualConfig.from_dict(value))
@@ -129,7 +169,14 @@ def main():
                     "Frozen run already finished; preserve it and choose a new output"
                 )
             try:
-                summary = run_virtual(config, build_spec(config), output=args.output)
+                method = config.workload.get("training_method", "splitfleet")
+                spec = build_spec(config)
+                if method == "fedavg":
+                    from splitfleet.virtual.fedavg import run_fedavg
+
+                    summary = run_fedavg(config, spec, output=args.output)
+                else:
+                    summary = run_virtual(config, spec, output=args.output)
                 validation = json.loads((args.output / "validation.json").read_text())
                 finish_run(
                     args.output,
