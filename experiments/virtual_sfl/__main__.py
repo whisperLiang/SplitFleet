@@ -64,9 +64,27 @@ def frozen_run(config, output):
             check=False,
         )
     if result.returncode:
-        raise RuntimeError(
-            f"Frozen virtual run failed (exit {result.returncode}); inspect {output / 'stdout.log'}"
-        )
+        reason = f"Frozen virtual run failed (exit {result.returncode}); inspect {output / 'stdout.log'}"
+        # Ray can terminate the interpreter before the child writes its final
+        # status. Keep completed measurements and close the stale running flag.
+        if json.loads((output / "result.json").read_text()).get("status") == "running":
+            from experiments.common.evidence import finish_run
+
+            rows = []
+            metrics_file = output / "round_metrics.jsonl"
+            if metrics_file.exists():
+                for line in metrics_file.read_text().splitlines():
+                    if not line.strip():
+                        continue
+                    try:
+                        rows.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        # A hard exit may leave the final append unfinished.
+                        break
+            report = {"status": "failed", "reason": reason,
+                      "rounds_completed": len(rows), "child_exit_code": result.returncode}
+            finish_run(output, report, validation=report, metrics=rows)
+        raise RuntimeError(reason)
     return json.loads((output / "summary.json").read_text())
 
 

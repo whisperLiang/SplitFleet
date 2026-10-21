@@ -546,14 +546,14 @@ class VirtualStrategy(AutoSplitStrategy):
             self.model, parameters_to_ndarrays(client_parameters)
         )
         metrics = self.spec.evaluate_fn(self.model, self.virtual_config.server_device)
-        self.round_evaluations.append(
-            {
-                "round_id": server_round,
-                "metrics": metrics,
-                "source": "measured",
-                "evaluation_sec": time.perf_counter() - started,
-            }
-        )
+        observation = {
+            "round_id": server_round,
+            "metrics": metrics,
+            "source": "measured",
+            "evaluation_sec": time.perf_counter() - started,
+        }
+        self.round_evaluations.append(observation)
+        self.evidence.append("evaluation_metrics.jsonl", observation)
         if self.spec.round_callback is not None:
             self.spec.round_callback(
                 server_round, parameters_to_ndarrays(client_parameters),
@@ -606,6 +606,13 @@ class VirtualServer(Server):
             )
             arrays = parameters_to_ndarrays(parameters)
             model_hash = self.strategy.framework_ops.hash_arrays(self.strategy.model, arrays)
+            if config.workload.get("checkpoint_each_round") is True and success and not failures:
+                from .checkpoint import save_round_checkpoint
+
+                save_round_checkpoint(
+                    self.strategy.framework_ops, self.strategy.model, arrays,
+                    self.evidence.directory, round_id=server_round, model_hash=model_hash,
+                )
             metrics = [r.metrics for _, r in success]
             samples = sum(r.num_examples for _, r in success)
             loss = (
