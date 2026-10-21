@@ -23,7 +23,7 @@ def summarize_comparison(directory):
             "config": config,
             "partitions": partition["clients"], "data": partition["data"],
             "initial_model_hash": validation["initial_model_hash"],
-            "source_identity": read("runtime_manifest.json")["source_identity"],
+            "runtime_manifest": read("runtime_manifest.json"),
         }
         rounds = [json.loads(line) for line in (run / "round_metrics.jsonl").read_text().splitlines()]
         evaluations = {r["round_id"]: r for r in read("model_metrics.json")["evaluations"]}
