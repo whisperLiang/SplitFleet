@@ -65,9 +65,12 @@ def test_probe_calls_split_rpc_and_uses_one_monotonic_clock(monkeypatch):
 
     monkeypatch.setattr(network_probe.time, "perf_counter_ns", lambda: now_ns[0])
     receipt = measure_network(Proxy(), round_id=3)
-    assert len(requests) == 10
-    assert requests.count((LARGE_BYTES, SMALL_BYTES)) == 3
-    assert requests.count((SMALL_BYTES, LARGE_BYTES)) == 3
+    shapes = {(SMALL_BYTES, SMALL_BYTES), (LARGE_BYTES, SMALL_BYTES),
+              (SMALL_BYTES, LARGE_BYTES)}
+    assert {(row['request_bytes'], row['reply_bytes'])
+            for row in receipt['warmup_samples']} == shapes
+    assert len(requests) == 3 + 3 * PROBE_REPEATS
+    assert all(requests.count(shape) == 1 + PROBE_REPEATS for shape in shapes)
     assert estimate_network(receipt, round_id=3) == pytest.approx({
         "upload_mbps": 20, "download_mbps": 80, "rtt_ms": 7})
 
@@ -81,7 +84,7 @@ def test_probe_retries_unresolved_samples_and_retains_rejected_observations(monk
             reply_bytes = int(request.metadata["reply_bytes"])
             # The first set has small-RPC queuing delay exceeding the large
             # RPC duration. The next set observes an uncongested channel.
-            if 1 <= len(calls) <= 3 * PROBE_REPEATS:
+            if 3 <= len(calls) < 3 + 3 * PROBE_REPEATS:
                 elapsed_ms = 30 if request_bytes == reply_bytes == SMALL_BYTES else 10
             else:
                 elapsed_ms = 7 + (request_bytes - SMALL_BYTES) * 8 / 20_000 \
@@ -93,7 +96,7 @@ def test_probe_retries_unresolved_samples_and_retains_rejected_observations(monk
     monkeypatch.setattr(network_probe.time, "perf_counter_ns", lambda: now_ns[0])
     monkeypatch.setattr(network_probe.time, "perf_counter", lambda: now_ns[0] / 1e9)
     receipt = measure_network(Proxy(), round_id=1)
-    assert len(calls) == 1 + 2 * 3 * PROBE_REPEATS
+    assert len(calls) == 3 + 2 * 3 * PROBE_REPEATS
     assert len(receipt["rejected_attempts"]) == 1
     assert [row["roundtrip_ms"] for row in receipt["rejected_attempts"][0]["samples"]] == [30, 10, 10] * PROBE_REPEATS
     assert receipt["elapsed_sec"] == pytest.approx(sum(calls) / 1000)
@@ -113,7 +116,7 @@ def test_permanently_unresolved_channel_still_fails_after_bounded_retries(monkey
     monkeypatch.setattr(network_probe.time, "perf_counter_ns", lambda: now_ns[0])
     with pytest.raises(UnresolvedNetworkProbe, match="could not resolve"):
         measure_network(Proxy(), round_id=1)
-    assert len(calls) == 1 + PROBE_ATTEMPTS * 3 * PROBE_REPEATS
+    assert len(calls) == 3 + PROBE_ATTEMPTS * 3 * PROBE_REPEATS
 
 
 def test_invalid_reply_is_not_retried(monkeypatch):

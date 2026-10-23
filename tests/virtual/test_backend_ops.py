@@ -144,7 +144,7 @@ def test_native_array_checkpoint_counter_and_device_contract(backend, tmp_path, 
         np.testing.assert_allclose(np.asarray(bound["weight"]), .95, atol=1e-7)
 
 
-@pytest.mark.parametrize("backend", ["tensorflow", "paddle", "jax", "tinygrad"])
+@pytest.mark.parametrize("backend", ["tensorflow", "paddle", "jax"])
 def test_other_backends_are_rejected_before_experiment_preparation(quality_inputs, backend):
     from experiments.resnet50_quality.run import make_config
     with pytest.raises(ValueError, match=f"Unknown native backend {backend!r}"):

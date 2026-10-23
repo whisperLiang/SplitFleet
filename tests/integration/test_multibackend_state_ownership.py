@@ -170,73 +170,6 @@ def test_tensorflow_native_hook_preserves_hwio_and_scalar_int64_with_atomic_load
     assert all(row.name.startswith(f"{index}:") for index, row in enumerate(adapter.state_manifest(legacy).entries))
 
 
-def _verify_tinygrad_live_source_ownership():
-    tinygrad = pytest.importorskip("tinygrad")
-    Tensor = tinygrad.Tensor
-
-    class Model:
-        training = True
-
-        def __init__(self):
-            self.first = Tensor(np.ones((4, 4), np.float32), device="CPU").realize().is_param_(True)
-            self.second = Tensor(np.ones((4, 2), np.float32), device="CPU").realize().is_param_(True)
-            self.counter = Tensor(np.asarray(2**40, np.int64), device="CPU").realize().is_param_(False)
-
-        def __call__(self, images):
-            return (images @ self.first) @ self.second
-
-        def state_tensors(self):
-            return {"first": self.first, "second": self.second, "counter": self.counter}
-
-        def state_associations(self):
-            return {"counter": ("first",)}
-
-        def load_state(self, state):
-            for name, value in self.state_tensors().items():
-                value.replace(Tensor(state[name], device="CPU").realize())
-
-    model = Model()
-    images = Tensor(np.ones((3, 4), np.float32), device="CPU").realize()
-    handle = AutoSplitSession().prepare_runtime(
-        model, images, boundary="50%", trainable=True, batch_axes={"/args/0": 0},
-    )
-    endpoints = [node for node in handle.runtime.trace_graph.nodes if not node.is_input and node.output_shape == (1, 4)]
-    assert endpoints
-    handle = handle.backend.repartition("after:" + endpoints[-1].canonical_id)
-    adapter = adapter_for(model, images)
-    schema = adapter.state_manifest(model).schema_hash
-    before = state_ownership(handle, schema)
-    assert dict(zip(before["names"], before["owners"])) == {
-        "first": "prefix", "second": "suffix", "counter": "prefix",
-    }
-    values = adapter.export_ndarrays(model)
-    values[0] += np.float32(0.5)
-    adapter.load_ndarrays(model, values)
-    assert state_ownership(handle, schema) == before
-    assert export_owned(model, before, "prefix")[-1].item() == 2**40
-
-
-def test_tinygrad_ownership_uses_live_sources_not_transitive_parameter_refs():
-    # Tinygrad loads its LLVM runtime lazily.  Keep that loader independent of
-    # the JAX and TensorFlow native runtimes already imported by other tests.
-    import importlib.util
-    import os
-    from pathlib import Path
-    import subprocess
-    import sys
-
-    if importlib.util.find_spec("tinygrad") is None:
-        pytest.skip("tinygrad is not installed")
-    path = Path(__file__).resolve()
-    environment = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", CUDA_VISIBLE_DEVICES="-1",
-                       CACHELEVEL="0", DEV="CPU", OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1")
-    result = subprocess.run(
-        [sys.executable, "-B", "-c", "import runpy, sys; runpy.run_path(sys.argv[1])['_verify_tinygrad_live_source_ownership']()", str(path)],
-        cwd=path.parents[2], env=environment, timeout=60, capture_output=True, text=True,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-
-
 def verify_resnet50_native_stage_ownership(backend, *, device="cpu"):
     """Bounded external-process helper: capture one full model, then native cuts."""
     from experiments.resnet50_quality.model_contract import SCHEMA, canonical_state
@@ -247,10 +180,7 @@ def verify_resnet50_native_stage_ownership(backend, *, device="cpu"):
     configure_backend(backend)
     model = build_model(backend, canonical_state(233), device)
     training_mode(backend, model)
-    # Tinygrad captures every lowered convolution intermediate. Use its native
-    # B=1 capture shape, retaining the dynamic replay probe. Functional JAX
-    # parameters also contain singleton dimensions, so keep its B=2 input.
-    batch = 1 if backend == "tinygrad" else 2
+    batch = 2
     images, _ = native_batch(backend, np.zeros((batch, 3, 64, 64), np.float32), np.zeros(batch, np.int32), device)
     inputs = call_inputs(backend, model, images)
     handle = AutoSplitSession(device=device).prepare_runtime(
@@ -265,7 +195,7 @@ def verify_resnet50_native_stage_ownership(backend, *, device="cpu"):
         shape = (spatial, spatial, channels) if backend == "tensorflow" else (channels, spatial, spatial)
         matches = [node for node in graph.nodes if not (node.is_input or node.is_output or node.is_buffer_only_source)
                    and tuple((node.output_shape or ())[1:]) == shape
-                   and ("float32" in str(node.dtype) or str(node.dtype) in {"dtypes.float", "float"})]
+                   and ("float32" in str(node.dtype) or str(node.dtype) == "float")]
         assert matches, (backend, stage)
         # This identifies an actual terminal native activation.  State owners
         # are still obtained exclusively from the plan and native references.
@@ -288,10 +218,10 @@ def verify_resnet50_native_stage_ownership(backend, *, device="cpu"):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("backend", ["pytorch", "tensorflow", "paddle", "jax", "tinygrad"])
+@pytest.mark.parametrize("backend", ["pytorch", "tensorflow", "paddle", "jax"])
 def test_full_resnet50_native_stage_ownership(request, backend):
     # Full optional captures are explicit opt-in; small state/ownership tests
-    # above run normally without launching five full ResNet50 captures in CI.
+    # above run normally without launching four full ResNet50 captures in CI.
     import os
     if os.environ.get("SPLITFLEET_FULL_OWNERSHIP_TESTS") != "1":
         pytest.skip("Set SPLITFLEET_FULL_OWNERSHIP_TESTS=1 for full native ResNet50 captures")

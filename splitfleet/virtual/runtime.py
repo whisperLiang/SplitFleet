@@ -99,6 +99,9 @@ def initialize_ray(config, ray, ops=None):
     if resources.ray_address:
         init_args["address"] = resources.ray_address
     else:
+        # A single-host simulation must not depend on a physical interface or
+        # public DNS being reachable when Ray selects its node address.
+        init_args["_node_ip_address"] = "127.0.0.1"
         worker_capacity = (
             resources.effective_worker_capacity
             or resources.max_concurrent_clients

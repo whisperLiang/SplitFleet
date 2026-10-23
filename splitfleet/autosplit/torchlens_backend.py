@@ -46,7 +46,6 @@ from splitfleet.backends.utils import (
 from splitfleet.runtime.auxiliary_state import (
     prepare_auxiliary_runtime,
     restore_auxiliary_output,
-    snapshot_auxiliary_state,
     supports_auxiliary_state,
     train_jax_suffix_with_auxiliary,
 )
@@ -195,7 +194,7 @@ class TorchLensSplitBackend:
         )
         prepare = (
             prepare_auxiliary_runtime
-            if supports_auxiliary_state(model) and self.framework_backend in {"paddle", "tinygrad"}
+            if supports_auxiliary_state(model) and self.framework_backend == "paddle"
             else prepare_split_runtime
         )
         capture_scope = nullcontext()
@@ -203,18 +202,11 @@ class TorchLensSplitBackend:
             from splitfleet.runtime.paddle_device_scope import paddle_execution_scope
             capture_scope = paddle_execution_scope(capture=True)
         with capture_scope, native_device_scope(self.framework_backend, self.device):
-            prepare_options = {}
-            if (prepare is prepare_auxiliary_runtime and self.framework_backend == 'tinygrad'
-                    and str(boundary) == 'auto'):
-                selector = getattr(model, '_splitfleet_initial_capture_boundary', None)
-                if callable(selector):
-                    prepare_options['initial_boundary_selector'] = selector
             self.runtime = prepare(
                 model,
                 self.trace_sample_input,
                 self.split_spec,
                 input_kwargs=self.trace_sample_kwargs,
-                **prepare_options,
             )
         self.split_spec = self.runtime.request
         self._bind_native_tensorflow_execution()
@@ -519,16 +511,6 @@ class TorchLensSplitBackend:
             targets = _move_to_device(targets, device)
         auxiliary = supports_auxiliary_state(self._ensure_model())
         observed = []
-        tiny_statistics_frozen = False
-
-        def freeze_tiny_statistics():
-            nonlocal tiny_statistics_frozen
-            if tiny_statistics_frozen:
-                return
-            if len(observed) != 1:
-                raise RuntimeError('Native Tinygrad training did not expose exactly one auxiliary forward')
-            observed[0] = snapshot_auxiliary_state(observed[0], backend='tinygrad')
-            tiny_statistics_frozen = True
 
         original_loss = loss_fn
         if auxiliary and self.framework_backend != "jax":
@@ -538,21 +520,6 @@ class TorchLensSplitBackend:
                 return original_loss(restored, target)
 
             loss_fn = collect_loss
-            if self.framework_backend == 'tinygrad' and optimizer is not None:
-                native_optimizer = optimizer
-
-                class DeferredStatisticsOptimizer:
-                    def __getattr__(self, name):
-                        return getattr(native_optimizer, name)
-
-                    def step(self):
-                        # Native backward must build every parameter derivative
-                        # before realization replaces forward UOps with buffers.
-                        # Snapshot the same forward after backward, before SGD.
-                        freeze_tiny_statistics()
-                        return native_optimizer.step()
-
-                optimizer = DeferredStatisticsOptimizer()
         if self.framework_backend == "torch":
             result = train_torch_suffix(
                 runtime,
@@ -595,8 +562,6 @@ class TorchLensSplitBackend:
             if measurements is not None:
                 measurements["server_total_ms"] = (time.perf_counter_ns() - started) / 1_000_000.0
         if auxiliary:
-            if self.framework_backend == 'tinygrad':
-                freeze_tiny_statistics()
             if len(observed) != 1:
                 raise RuntimeError("Native suffix training did not expose exactly one auxiliary forward")
             self.train_suffix_auxiliary = observed[0]
@@ -616,6 +581,10 @@ class TorchLensSplitBackend:
         if device is not None:
             native = native.to(device)
             boundary_grads = _move_to_device(boundary_grads, device)
+        if (self.framework_backend == 'jax' and optimizer is None
+                and getattr(self._ensure_model(), '_splitfleet_jax_training_program_cache', False)):
+            from splitfleet.runtime.jax_training_program import backward_prefix
+            return backward_prefix(runtime, native, boundary_grads)
         return runtime.backward_prefix(native, boundary_grads=boundary_grads, optimizer=optimizer)
 
     def make_plan(self) -> SplitRuntimePlan:

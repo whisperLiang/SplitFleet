@@ -142,19 +142,8 @@ def state_ownership(handle, schema_hash: str, *, native_plan=None) -> dict:
         trainables = {name for name, value in state.items() if (
             bool(_attribute(value, "trainable", False)) if backend == "tf"
             else not bool(_attribute(value, "stop_gradient", True)) if backend == "paddle"
-            else bool(_attribute(value, "requires_grad", _attribute(value, "is_param", False)))
+            else bool(_attribute(value, "requires_grad", False))
         )}
-    if backend == "tinygrad":
-        # Tinygrad param_refs describes the complete ancestral UOp graph,
-        # including weights already consumed in the other split stage.  Only
-        # exact captured live parameter occurrences prove fresh consumption.
-        for node in graph.nodes:
-            live = _attribute(node.target, "live_tensor")
-            matched = set().union(*(identities.get(identity, set()) for identity in _native_identities(live)))
-            matched.intersection_update(trainables)
-            if matched:
-                source_names[node.canonical_id] = matched
-        bound = set().union(*source_names.values()) if source_names else set()
     stages = {"prefix": set(plan.prefix_node_ids), "suffix": set(plan.suffix_node_ids)}
     if stages["prefix"] & stages["suffix"]:
         raise ValueError("Native split plan has overlapping stage nodes")
@@ -197,11 +186,7 @@ def state_ownership(handle, schema_hash: str, *, native_plan=None) -> dict:
                         raise ValueError(f"JAX parameter {address!r} has no proven consuming input binding")
             if not matched and bool(_attribute(ref, "is_trainable", False)):
                 raise ValueError("Native trainable parameter reference cannot be bound to model state")
-            if backend == "tinygrad":
-                if bool(_attribute(ref, "is_trainable", False)) and not matched.issubset(bound):
-                    raise ValueError("Tinygrad parameter has no captured native live source binding")
-            else:
-                referenced.update(matched)
+            referenced.update(matched)
         # TF primitive capture can expose only ReadVariableOp resource inputs.
         for value in _attribute(node.target, "inputs", ()) or ():
             if _attribute(value, "source_kind") == "resource":

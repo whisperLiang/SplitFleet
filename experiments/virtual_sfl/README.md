@@ -137,6 +137,6 @@ uv run --extra simulation --extra dev --extra integration pytest tests -m 'not s
 
 测试包含完整 SGD 数值对照（`rtol=1e-6, atol=1e-7`）、Context/RNG/数据隔离、16/100 客户端真实优化、原生 Greedy 反馈、真实 TCP 限速下界、租约防重、身份认证、RPC 超时、端口占用和 CPU affinity 恢复。所有输出都保留当前源码/依赖版本；缺少某个可选后端而被现有测试跳过的项不计作通过。
 
-当前 PyTorch ResNet50 / 50 客户端 / 100 轮收敛与用时对比见 [实验入口说明](../resnet50_quality/README.md)。旧实验结果和历史运行报告已删除。
+当前论文使用 PyTorch ResNet50、100 个逻辑客户端、50 轮的 SplitFleet/FedAvg 配对结果，见[论文证据说明](../../paper/README.md)。三台 Orin 上六个 CPU/GPU 客户端的后端实验见[真实设备入口](../resnet50_backends/README.md)。旧的本地 50 客户端、100 轮准备批次已删除。
 
 Flower 接口依据：当前锁定安装源码与端到端执行，以及官方 Simulation API 和 stateful ClientApp 文档。

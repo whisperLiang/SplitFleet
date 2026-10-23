@@ -96,6 +96,7 @@ class ResNet50:
     """
 
     def __init__(self, state: Mapping[str, np.ndarray], *, device: str):
+        self._splitfleet_jax_training_program_cache = True
         self.device, self.jax_device = _resolve_device(device)
         self.training = False
         self.params: dict[str, Any] = {}

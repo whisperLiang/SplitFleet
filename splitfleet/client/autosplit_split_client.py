@@ -124,13 +124,16 @@ def _accelerator_name(device: str) -> str:
     return f"generic_{kind}"
 
 
-def _synchronize_prefix_device(backend_name: str, device: str) -> None:
+def _synchronize_prefix_device(backend_name: str, device: str, values=None) -> None:
     """Include queued CUDA work in measured prefix phases."""
 
     if backend_name == "torch" and str(device).split(":", 1)[0].lower() == "cuda":
         import torch
 
         torch.cuda.synchronize(device)
+    elif backend_name == 'jax' and values is not None:
+        import jax
+        jax.block_until_ready(values)
 
 
 def _transport_phase_ms(
@@ -495,9 +498,6 @@ class AutoSplitSplitLearningClient(NumPyClient):
         if self.backend_adapter.backend_name == "torch":
             for parameter in self.model.parameters():
                 parameter.grad = None
-        elif self.backend_adapter.backend_name == "tinygrad":
-            for parameter in self.backend_adapter._state(self.model).values():
-                parameter.grad = None
 
     def prewarm_runtime(
         self,
@@ -699,7 +699,10 @@ class AutoSplitSplitLearningClient(NumPyClient):
             residency_contract = resident_contract(runtime_handle, ownership, resident_bindings)
         telemetry = _RoundTelemetry()
         round_id = int(config.get(AUTOSPLIT_MODEL_VERSION_CONFIG_KEY, 0))
-        client_id = str(config.get(CLIENT_ID_CONFIG_KEY, ""))
+        # Physical Flower dispatch consumes the hidden ID while binding the
+        # request proxy. Keep the boundary identity tied to that same binding.
+        client_id = str(config.get(
+            CLIENT_ID_CONFIG_KEY, getattr(self._require_server_model_proxy(), "cid", "")))
         plan_id = str(config[AUTOSPLIT_PLAN_ID_CONFIG_KEY])
 
         num_examples = 0
@@ -716,7 +719,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
 
             zero_grad(self.model, prefix_optimizer)
 
-            _synchronize_prefix_device(self.backend_adapter.backend_name, self.device)
+            _synchronize_prefix_device(self.backend_adapter.backend_name, self.device, torch_inputs)
             prefix_started = time.perf_counter()
             native_started_ns = time.perf_counter_ns()
             boundary = runtime_handle.backend.run_prefix(
@@ -724,7 +727,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
                 training=True,
                 input_kwargs=call.kwargs,
             )
-            _synchronize_prefix_device(self.backend_adapter.backend_name, self.device)
+            _synchronize_prefix_device(self.backend_adapter.backend_name, self.device, boundary.tensors)
             if hasattr(self, "_quality_native_execution_intervals"):
                 self._quality_native_execution_intervals.append((native_started_ns, time.perf_counter_ns()))
             forward_sec = time.perf_counter() - prefix_started
@@ -764,7 +767,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
             if gradient_envelope.model_version != round_id:
                 raise RuntimeError("Gradient response model version mismatch")
             local_boundary = self._context_store.pop(round_id, client_id, step_id)
-            _synchronize_prefix_device(self.backend_adapter.backend_name, self.device)
+            _synchronize_prefix_device(self.backend_adapter.backend_name, self.device, local_boundary.tensors)
             backward_started = time.perf_counter()
             deserialize_started = time.perf_counter()
             boundary_grads = envelope_to_gradients(gradient_envelope, self.device)
@@ -775,7 +778,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
                 boundary_grads=boundary_grads,
                 optimizer=prefix_optimizer,
             )
-            _synchronize_prefix_device(self.backend_adapter.backend_name, self.device)
+            _synchronize_prefix_device(self.backend_adapter.backend_name, self.device, prefix_result)
             if hasattr(self, "_quality_native_execution_intervals"):
                 self._quality_native_execution_intervals.append((native_started_ns, time.perf_counter_ns()))
             backward_sec = time.perf_counter() - backward_started
@@ -859,7 +862,8 @@ class AutoSplitSplitLearningClient(NumPyClient):
         contract = round_runtime.contract
         telemetry = _RoundTelemetry()
         round_id = int(config.get(AUTOSPLIT_MODEL_VERSION_CONFIG_KEY, 0))
-        client_id = str(config.get(CLIENT_ID_CONFIG_KEY, ""))
+        client_id = str(config.get(
+            CLIENT_ID_CONFIG_KEY, getattr(self._require_server_model_proxy(), "cid", "")))
         plan_id = str(config[AUTOSPLIT_PLAN_ID_CONFIG_KEY])
 
         num_examples = 0

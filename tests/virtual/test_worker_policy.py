@@ -50,6 +50,30 @@ def test_smaller_worker_pool_is_an_explicit_max_concurrency_cap():
     assert config.resources.max_concurrent_clients == 2
 
 
+@pytest.mark.parametrize("remote", [False, True])
+def test_single_host_ray_uses_loopback_without_overriding_remote_cluster(monkeypatch, remote):
+    import ray
+
+    config = VirtualConfig(virtual_clients=ClientPopulation(total=2),
+                           resources=Resources(max_concurrent_clients=2, client_cpus_per_worker=1))
+    if remote:
+        object.__setattr__(config.resources, "ray_address", "192.0.2.10:6379")
+    calls = []
+    monkeypatch.setattr(ray, "is_initialized", lambda: False)
+    monkeypatch.setattr(ray, "init", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(ray, "nodes", lambda: [{"Resources": {"CPU": 2.}}])
+
+    _, workers = initialize_ray(config, ray)
+
+    assert workers == 2
+    if remote:
+        assert calls[0]["address"] == "192.0.2.10:6379"
+        assert "_node_ip_address" not in calls[0]
+    else:
+        assert calls[0]["_node_ip_address"] == "127.0.0.1"
+        assert "address" not in calls[0]
+
+
 def test_explicit_suffix_cap_bounds_resident_models_and_round_trips_admission():
     config = VirtualConfig(
         virtual_clients=ClientPopulation(total=100),

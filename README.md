@@ -3,10 +3,12 @@
 SplitFleet also supports real virtual split learning through Flower/Ray. See
 [Virtual SFL Runtime](experiments/virtual_sfl/README.md) for the CPU smoke entry,
 100-client real-data training, state isolation, bounded suffix replicas, network
-constraints and measured Greedy placement. The retained PyTorch ResNet50 comparison (50 virtual clients, 100 rounds; SplitFleet vs FedAvg, before the measured-load controller update)
-is documented in [the experiment entry](experiments/resnet50_quality/README.md).
+constraints and measured Greedy placement. The current paper retains the paired
+100-client, 50-round PyTorch result; see the [paper evidence guide](paper/README.md).
+Physical TensorFlow/JAX/Paddle training uses
+[six CPU/GPU clients on three Orins](experiments/resnet50_backends/README.md).
 
-SplitFleet combines a unified split federated learning (SFL) abstraction, SFL-grade fine-grained partitioning, and measured Greedy placement. Built on [Flower](https://flower.ai/), it separates backend, task, partition, aggregation, and placement contracts. Five backend adapters implement the same SFL execution contract.
+SplitFleet combines a unified split federated learning (SFL) abstraction, SFL-grade fine-grained partitioning, and measured Greedy placement. Built on [Flower](https://flower.ai/), it separates backend, task, partition, aggregation, and placement contracts. Four backend adapters implement the same SFL execution contract.
 
 The unified task interface covers image classification, text classification, object detection, semantic segmentation, and instance segmentation.
 Maintained experiment protocols are in `experiments/`; the local manuscript and evidence guide is `paper/README.md`.
@@ -22,12 +24,10 @@ The local wheel's native split extensions are distinct from the execution-captur
 Boundary features and gradients use typed tensor envelopes, graph contracts, SHA-256 checks and resource limits.
 
 TorchLens-backed split replay and training can also be enabled for TensorFlow, JAX,
-Paddle, and tinygrad through the corresponding optional dependency groups
-(`tensorflow`, `jax`, `paddle`, `tinygrad`, or `multibackend`). This project registers these five training backends; MLX and ONNX are
+and Paddle through the corresponding optional dependency groups
+(`tensorflow`, `jax`, `paddle`, or `multibackend`). This project registers these four training backends; MLX and ONNX are
 not exposed as SplitFleet training backends. JAX callers provide `functional_update_fn` on the split client
 when model parameters require an external functional update.
-The TorchLens tinygrad adapter is pinned to tinygrad 0.13 and SplitFleet uses
-Python 3.11 so the adapter can be exercised alongside the other backends.
 
 ## What This Project Does
 
@@ -107,9 +107,9 @@ round trips. Unsupported and failed cases have separate outcomes and nonzero exi
 codes. These synthetic checks do not measure dataset accuracy or convergence.
 Install the JAX extra with `uv sync --extra dev --extra jax` before this command,
 or use `--backends torch` with the base installation. The full task equivalence
-matrix currently covers PyTorch and JAX. TensorFlow, Paddle and tinygrad have
+matrix currently covers PyTorch and JAX. TensorFlow and Paddle have
 separate native replay/training, task-loss and split-node checks; those checks
-do not establish a complete five-backend by five-task equivalence matrix.
+do not establish a complete four-backend by five-task equivalence matrix.
 
 Run the TorchLens split training demo:
 

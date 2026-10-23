@@ -8,7 +8,7 @@ from typing import Any, Mapping
 def tensor_backend(value: Any) -> str:
     module = type(value).__module__.lower()
     for prefix, name in (("torch", "torch"), ("tensorflow", "tf"), ("keras", "tf"),
-                         ("jax", "jax"), ("jaxlib", "jax"), ("paddle", "paddle"), ("tinygrad", "tinygrad")):
+                         ("jax", "jax"), ("jaxlib", "jax"), ("paddle", "paddle")):
         if module.startswith(prefix):
             return name
     raise TypeError(f"Unsupported tensor backend for {type(value).__name__}; supply a custom loss_fn.")
@@ -68,7 +68,4 @@ def sparse_cross_entropy(logits: Any, targets: Any, *, ignore_index: int = -100)
         )
         return tf.math.divide_no_nan(tf.reduce_sum(tf.where(mask, losses, 0)),
                                      tf.reduce_sum(tf.cast(mask, losses.dtype)))
-    if backend == "tinygrad":
-        order = (0, *range(2, len(logits.shape)), 1)
-        return logits.permute(*order).sparse_categorical_crossentropy(targets, ignore_index=ignore_index)
     raise AssertionError(backend)

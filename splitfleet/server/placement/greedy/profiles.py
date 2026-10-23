@@ -1,8 +1,26 @@
 """Captured computation and differentiable-frontier volume proxies."""
 
 import math
+import re
 import numpy as np
-import torch
+
+
+def _dtype_name(dtype):
+    name = str(dtype).rsplit(".", 1)[-1]
+    match = re.fullmatch(r"<dtype: '([^']+)'>", name)
+    if match:
+        name = match.group(1)
+    return name
+
+
+def _dtype_itemsize(dtype):
+    name = _dtype_name(dtype)
+    if name == "bfloat16":
+        return 2
+    try:
+        return np.dtype(name).itemsize
+    except TypeError as error:
+        raise ValueError("Captured differentiable frontier dtype is unsupported") from error
 
 def _structural_fallback(catalog):
     """Interpolate by graph position when native MAC metadata is unavailable."""
@@ -41,11 +59,12 @@ def graph_workload_features(provider):
     for node in nodes:
         shape = node.output_shape
         elements = math.prod(shape) / batch if isinstance(shape, tuple) and all(isinstance(v, int) and v > 0 for v in shape) else 0
-        parameters = [ref.handle for ref in node.param_refs if isinstance(getattr(ref, "handle", None), torch.Tensor)]
+        parameters = [ref.handle for ref in node.param_refs
+                      if getattr(getattr(ref, "handle", None), "shape", None) is not None]
         kind = str(node.op_type).lower()
         group = 0 if "conv" in kind else 1 if kind in {"linear", "addmm"} else 2
         cost = elements
-        weights = [parameter for parameter in parameters if parameter.ndim >= 2]
+        weights = [parameter for parameter in parameters if len(parameter.shape) >= 2]
         if group == 0 and weights:
             cost = elements * math.prod(weights[0].shape[1:])
         elif group == 1 and weights:
@@ -56,7 +75,7 @@ def graph_workload_features(provider):
         values[group] = cost
         for parameter in parameters:
             if id(parameter) not in parameter_seen:
-                values[group + 3] += parameter.numel()
+                values[group + 3] += math.prod(parameter.shape)
                 parameter_seen.add(id(parameter))
         rows.append(values)
     cumulative = np.vstack([np.zeros(6), np.cumsum(rows, axis=0)])
@@ -70,13 +89,20 @@ def graph_workload_features(provider):
         prefix = cumulative[prefix_end]
         suffix = total - prefix
         gradient_proxy = 0
+        resident = set(candidate.metadata.get("resident_parameter_labels") or ())
         for label in candidate.metadata["boundary_tensor_labels"]:
+            if label in resident:
+                continue
             node = by_id[label]
-            if node.requires_grad and isinstance(node.output_shape, tuple) and all(isinstance(v, int) for v in node.output_shape):
-                dtype = getattr(torch, str(node.dtype).removeprefix("torch."), None)
-                if not isinstance(dtype, torch.dtype):
-                    raise ValueError("Captured differentiable frontier dtype is unsupported")
-                gradient_proxy += math.prod(node.output_shape) * torch.empty((), dtype=dtype).element_size() / batch
+            differentiable = bool(node.requires_grad)
+            if getattr(candidate, "framework_backend", "") == "jax" and node.requires_grad is None:
+                # JAX VJP differentiates inexact inputs without a mutable
+                # requires_grad flag. Resident parameter gradients are consumed
+                # by suffix SGD and never travel back to the client.
+                name = _dtype_name(node.dtype)
+                differentiable = name == "bfloat16" or np.dtype(name).kind in "fc"
+            if differentiable and isinstance(node.output_shape, tuple) and all(isinstance(v, int) for v in node.output_shape):
+                gradient_proxy += math.prod(node.output_shape) * _dtype_itemsize(node.dtype) / batch
         result[candidate.boundary] = {
             "l2s_structural": [*suffix[:3], candidate.boundary_forward_bytes,
                                gradient_proxy, *suffix[3:]],
@@ -86,4 +112,3 @@ def graph_workload_features(provider):
             "structural_feature_scope": "captured_shapes; misc includes BN/pool/residual; gradient volume is a proxy",
         }
     return result
-

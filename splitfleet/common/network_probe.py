@@ -15,7 +15,10 @@ PROBE_METHOD = "splitfleet_transport_probe"
 PROBE_SCHEMA = "splitfleet.active-network-probe.v1"
 PROBE_SOURCE = "measured_split_rpc"
 PROBE_MODE = "active_split_rpc_probe_each_training_round"
-SMALL_BYTES = 1024
+# A 1 KiB baseline can trigger delayed small-message delivery on the physical
+# SSH/HTTP2 path. Warm each payload shape and use a multi-packet baseline so
+# size-dependent transmission remains resolvable on the fast link as well.
+SMALL_BYTES = 65_536
 LARGE_BYTES = 2_097_152
 PROBE_REPEATS = 3
 PROBE_ATTEMPTS = 3
@@ -71,7 +74,9 @@ def measure_network(proxy, *, round_id, timeout=60):
                 "roundtrip_ms": elapsed_ms}
 
     began = time.perf_counter()
-    warmup = sample(SMALL_BYTES, SMALL_BYTES)
+    shapes = ((SMALL_BYTES, SMALL_BYTES), (LARGE_BYTES, SMALL_BYTES),
+              (SMALL_BYTES, LARGE_BYTES))
+    warmup = [sample(request, reply) for request, reply in shapes]
     rejected_attempts = []
     for attempt in range(PROBE_ATTEMPTS):
         samples = []
@@ -80,7 +85,7 @@ def measure_network(proxy, *, round_id, timeout=60):
                             sample(LARGE_BYTES, SMALL_BYTES),
                             sample(SMALL_BYTES, LARGE_BYTES)))
         receipt = {"schema": PROBE_SCHEMA, "source": PROBE_SOURCE, "round_id": round_id,
-                   "samples": samples, "warmup_samples": [warmup],
+                   "samples": samples, "warmup_samples": warmup,
                    "rejected_attempts": rejected_attempts,
                    "elapsed_sec": time.perf_counter() - began}
         try:

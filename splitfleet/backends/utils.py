@@ -4,14 +4,11 @@ from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
 from functools import wraps
-from threading import RLock
 from typing import Any
 
 import numpy as np
 
 from splitfleet.backends.registry import BACKEND_ADAPTERS
-
-_TINYGRAD_EXECUTION_LOCK = RLock()
 
 
 def paddle_tensor_device(value: Any) -> str:
@@ -133,12 +130,6 @@ def native_device_scope(backend: str, device: Any):
         with tf.device(_tensorflow_scope_device(device)):
             yield
         return
-    if backend == 'tinygrad':
-        # Tensor.train() is a process-wide flag, and capture temporarily wraps
-        # Tensor methods. Independent model state does not isolate either one.
-        with _TINYGRAD_EXECUTION_LOCK:
-            yield
-        return
     if backend != "paddle":
         yield
         return
@@ -176,7 +167,7 @@ def _iter_tensors(value: Any):
     if (
         hasattr(value, "shape")
         and hasattr(value, "dtype")
-        and module.startswith(("torch", "tensorflow", "jax", "jaxlib", "paddle", "tinygrad"))
+        and module.startswith(("torch", "tensorflow", "jax", "jaxlib", "paddle"))
     ):
         yield value
     elif isinstance(value, dict):
@@ -205,11 +196,9 @@ def detect_torchlens_backend(model: Any, example_inputs: Any) -> str:
                 return "jax"
             if module.startswith("paddle"):
                 return "paddle"
-            if module.startswith("tinygrad"):
-                return "tinygrad"
     raise TypeError(
         "Cannot infer a TorchLens split backend; supported backends are "
-        "torch, tf, jax, paddle, and tinygrad."
+        "torch, tf, jax, and paddle."
     )
 
 

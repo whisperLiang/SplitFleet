@@ -70,13 +70,7 @@ def payload_bytes_from_plan(
         match = re.fullmatch(r"<dtype: '([^']+)'>", dtype_name)
         if match:
             dtype_name = match.group(1)
-        if str(spec.dtype).startswith("dtypes."):
-            # tinygrad's float/int/uint aliases have fixed native widths;
-            # NumPy interprets unqualified float/int as platform defaults.
-            from tinygrad import dtypes
-            itemsize = getattr(dtypes, dtype_name).itemsize
-        else:
-            itemsize = 2 if dtype_name == "bfloat16" else np.dtype(dtype_name).itemsize
+        itemsize = 2 if dtype_name == "bfloat16" else np.dtype(dtype_name).itemsize
         total += math.prod(shape) * itemsize
     return total
 

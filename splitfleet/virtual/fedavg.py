@@ -76,9 +76,6 @@ class _FedAvgClient(NumPyClient):
         try:
             yield model
         finally:
-            if self.ops.backend == 'tinygrad':
-                for parameter in self.ops.native_state(model).values():
-                    parameter.grad = None
             _release_model(model)
 
     def fit(self, parameters, config):

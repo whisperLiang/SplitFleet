@@ -37,11 +37,6 @@ def _run_isolated(request, backend: str) -> bool:
     _limit_child_threads(env)
     if backend == "tf":
         env["CUDA_VISIBLE_DEVICES"] = ""
-    if backend == "tinygrad":
-        env["DEV"] = "CPU"
-        env["DEBUG"] = "0"
-        env["CPU_COUNT"] = env["OMP_NUM_THREADS"]
-        env["THREADS"] = env["OMP_NUM_THREADS"]
     result = subprocess.run(
         [sys.executable, "-m", "pytest", request.node.nodeid, "-q", "-s"],
         cwd=str(request.config.rootpath),
@@ -183,55 +178,11 @@ def _build_paddle_resnet18():
     return model, inputs, targets, paddle.nn.MSELoss()
 
 
-def _build_tinygrad_resnet18():
-    from tinygrad import Tensor, nn
-
-    Tensor.manual_seed(1806)
-
-    class BasicBlock:
-        def __init__(self):
-            self.weight1 = Tensor([0.5]).realize()
-            self.weight2 = Tensor([0.25]).realize()
-            self.weight1.requires_grad = True
-            self.weight2.requires_grad = True
-
-        def __call__(self, x):
-            return (x + (x * self.weight1).relu() * self.weight2).relu()
-
-    class TinygradResNet18:
-        """Eighteen trainable layers in the ResNet-18 residual topology.
-
-        tinygrad lowers even 1x1 convolutions into hundreds of UOps. Scalar
-        affine residual layers retain the 1 + 8x2 + 1 depth and skip topology
-        while keeping exhaustive UOp split validation executable.
-        """
-
-        def __init__(self):
-            self.stem_weight = Tensor([0.75]).realize()
-            self.stem_weight.requires_grad = True
-            self.blocks = [BasicBlock() for _ in range(8)]
-            self.classifier_weight = Tensor([1.25]).realize()
-            self.classifier_weight.requires_grad = True
-
-        def __call__(self, inputs):
-            x = (inputs * self.stem_weight).relu()
-            for residual_block in self.blocks:
-                x = residual_block(x)
-            return x * self.classifier_weight
-
-    inputs = Tensor([[0.5], [1.0]]).realize()
-    inputs.requires_grad = True
-    targets = (Tensor.zeros(2, 1).realize(), Tensor.ones(2, 1).realize())
-    loss_fn = lambda output, target: ((output - target) ** 2).mean()
-    return TinygradResNet18(), inputs, targets, loss_fn
-
-
 BUILDERS: dict[str, Callable[[], tuple[Any, Any, tuple[Any, Any], Any]]] = {
     "torch": _build_torch_resnet18,
     "tf": _build_tf_resnet18,
     "jax": _build_jax_resnet18,
     "paddle": _build_paddle_resnet18,
-    "tinygrad": _build_tinygrad_resnet18,
 }
 
 

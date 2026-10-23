@@ -22,8 +22,10 @@ score = n * (prefix_batch_compute + suffix_batch_service + boundary_rpc)
       + state_exchange
 ```
 
-Each round uses one warmup followed by three repeats of small (1 KiB),
-upload-heavy (2 MiB / 1 KiB) and download-heavy (1 KiB / 2 MiB) RPCs. Median
+Each round warms all three payload shapes, followed by three repeats of
+baseline (64 KiB / 64 KiB), upload-heavy (2 MiB / 64 KiB) and download-heavy
+(64 KiB / 2 MiB) RPCs. The multi-packet baseline avoids the small-message
+delivery stalls observed with 1 KiB RPCs on the physical SSH/HTTP2 path. Median
 durations limit sensitivity to individual outliers. Clients probe sequentially
 so their probes do not compete for the shared RPC service. A nonpositive
 directional difference triggers up to two fresh sets of samples; rejected

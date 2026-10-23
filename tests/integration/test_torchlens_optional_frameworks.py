@@ -155,25 +155,7 @@ def test_paddle_split_training_optional(request) -> None:
     _exercise_engine_protocol(model, inputs, targets, paddle.nn.MSELoss(), "paddle")
 
 
-def test_tinygrad_split_training_optional(request) -> None:
-    from importlib.metadata import PackageNotFoundError, version
-    try:
-        installed_version = version("tinygrad")
-    except PackageNotFoundError:
-        pytest.skip("tinygrad is not installed; TorchLens 2.34.1 requires tinygrad==0.13.0 on Python >=3.11")
-    if installed_version != "0.13.0":
-        pytest.skip("TorchLens 2.34.1 requires tinygrad==0.13.0 (Python >=3.11)")
-    if _run_isolated(request, extra_env={"DEV": "CPU", "DEBUG": "0"}): return
-    tinygrad = pytest.importorskip("tinygrad")
-    from tinygrad import Tensor
-    class Model:
-        def __call__(self, x): return (x * 2.0).relu() + 1.0
-    inputs, targets = Tensor.randn(2, 4), Tensor.randn(2, 4)
-    _exercise(Model(), inputs, targets, lambda output, target: ((output - target) ** 2).mean(), "tinygrad")
-    _exercise_engine_protocol(Model(), inputs, targets, lambda output, target: ((output - target) ** 2).mean(), "tinygrad")
-
-
-@pytest.mark.parametrize("backend", ["tf", "jax", "paddle", "tinygrad"])
+@pytest.mark.parametrize("backend", ["tf", "jax", "paddle"])
 def test_cosplit_payload_context_matches_optional_backend_capture(request, backend):
     if _run_isolated(request, extra_env={"CUDA_VISIBLE_DEVICES": "", "DEV": "CPU", "DEBUG": "0"}):
         return
@@ -197,22 +179,6 @@ def test_cosplit_payload_context_matches_optional_backend_capture(request, backe
         paddle = pytest.importorskip("paddle")
         model = paddle.nn.Sequential(paddle.nn.Linear(4, 8), paddle.nn.ReLU(), paddle.nn.Linear(8, 2))
         inputs, batch_argument = (paddle.ones((3, 4)),), 0
-    else:
-        pytest.importorskip("tinygrad")
-        from tinygrad import Tensor
-        from tinygrad.nn import Linear
-
-        class Model:
-            def __init__(self):
-                self.first, self.last = Linear(4, 8), Linear(8, 2)
-                for layer in (self.first, self.last):
-                    layer.weight.requires_grad = layer.bias.requires_grad = True
-
-            def __call__(self, x):
-                return self.last(self.first(x).relu())
-
-        model = Model()
-        inputs, batch_argument = (Tensor.ones(3, 4),), 0
     provider = TorchLensCandidateProvider(model=model, sample_inputs=inputs,
         batch_axes={f"/args/{batch_argument}": 0}, dynamic_batch=(1, 4))
     catalog = provider.get_candidates(training=True)

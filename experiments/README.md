@@ -4,7 +4,7 @@ The physical runner defaults to **Greedy** with **`--server-concurrency 1`**. Gr
 
 The active adaptive implementations are Greedy and the optional L2S reference. Retired UCB controllers are absent from active code and command-line choices. Frozen result directories retain their original labels and source snapshots for provenance.
 
-The [current paper](../paper/README.md) reports 120 fixed-ten-round endpoints across six methods, including 20 measured Greedy C=1 runs. It also retains the original 160-endpoint common-budget comparison with FedAsync, FedBuff and FedCompass. That cohort's SplitFleet arm uses the original frozen CoSplit-UCB controller and is labelled accordingly; it is not a measurement of the current Greedy default. The separate six-round dynamic-network check retains its own protocol. The concurrency-capacity experiment is removed from the current paper.
+The [current paper](../paper/README.md) reports 120 fixed-ten-round endpoints across six methods, including 20 measured Greedy C=1 runs. Its 160 common-budget endpoints combine completed Greedy measurements and retained controls, with task-specific budgets and source cohorts reported separately. It also includes a six-round dynamic-network check, seven-model capture evidence, a paired 100-client PyTorch experiment, and physical TensorFlow/JAX/Paddle validation. The concurrency-capacity experiment is removed from the current paper.
 
 ## Training
 
@@ -90,6 +90,8 @@ See `dependency_patches/DEEPLAB_INTERPOLATION_NOTICE.md` for attribution.
 | `analysis.execution_coverage` | Capture and validate the seven PyTorch model architectures |
 | `edge_model_admission` | Full-model and native split numerical/resource checks |
 | `summarize_physical_multitask` | Validate and summarize completed physical runs |
+| `resnet50_backends.campaign` | Prepare and execute six-client physical backend training |
+| `resnet50_backends.status` | Read the A6000 coordinator's retained progress |
 
 Calibration and measured feedback live in `splitfleet/server/placement/greedy/`, shared by the native strategy and the physical runner. Core code does not import experiment modules.
 
@@ -117,6 +119,6 @@ New physical records distinguish activation, target, request metadata, gradient,
 
 For historical reports, call `analyze(frozen_plan, OLD_ROOT)` read-only and `write_report(report, NEW_EXPORT_ROOT)`. The CLI `analyze --root` writes reports into that root, so do not point it at an immutable historical run. Older source cohorts without online-learning receipts are historical context, not evidence for the current Greedy implementation.
 
-The current manuscript cohorts are indexed in [results/README.md](../results/README.md). Only M01, P08, P09, P10 and E01 remain, together with their required inputs, source snapshots and protocol support files. Unused older cohorts, experimental entry points and their regression cases are removed.
+The current manuscript cohorts and active physical backend jobs are indexed in [results/README.md](../results/README.md). Their required inputs, checkpoints, source snapshots and protocol support files remain. The author's 2026-10-23 cleanup removed superseded backend attempts, cancelled queues, retired UCB development cohorts, and the Orin CPU-server runner with its remote-mirror query and test. See the [cleanup receipt](../paper/evidence/manuscript_cleanup_20261023/receipt.json) for file hashes and the protected evidence set. Frozen snapshots of retained jobs are unchanged by this cleanup.
 
 At the author's request, Figure 3/4 failed and excluded attempts were also deleted. Successful raw endpoints and published data remain unchanged. Current checks verify those successes against frozen publication evidence and use [the cleanup receipt](../paper/evidence/manuscript_cleanup_20261013/receipt.json) for deleted source hashes, explicitly without reconstructing deleted attempt populations. Fresh experiments continue to record failures and require a new output directory.

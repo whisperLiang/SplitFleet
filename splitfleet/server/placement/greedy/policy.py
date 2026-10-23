@@ -241,7 +241,10 @@ class GreedyPlacementPolicy:
         upload = candidate.metadata.get("optimizer_prefix_parameter_bytes", candidate.prefix_parameter_bytes)
         if activation is None or upload is None:
             raise ValueError("Greedy needs boundary and owned-parameter byte estimates")
-        gradient = self.profiles[candidate.boundary]["gradient_volume_proxy_bytes_per_sample"] * batch
+        gradient_sizes = candidate.metadata.get("boundary_gradient_bytes_by_batch_size", {})
+        gradient = gradient_sizes.get(batch, gradient_sizes.get(str(batch)))
+        if gradient is None:
+            gradient = self.profiles[candidate.boundary]["gradient_volume_proxy_bytes_per_sample"] * batch
         return float(activation), float(gradient), float(self.state_download_bytes or 0), float(upload)
 
     def _volumes(self, candidate, batch):

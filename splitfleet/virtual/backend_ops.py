@@ -134,16 +134,16 @@ class FrameworkOps:
         names = set()
         for name, value in self.native_state(model).items():
             active = (value.trainable if self.backend == "tf" else not value.stop_gradient
-                      if self.backend == "paddle" else getattr(value, "requires_grad", getattr(value, "is_param", False)))
+                      if self.backend == "paddle" else getattr(value, "requires_grad", False))
             if active:
                 names.add(name)
         return names
 
     def set_training(self, model, training):
         self.adapter.set_training(model, training)
-        # JAX and tinygrad factories provide explicit functional mode methods.
+        # JAX factories provide explicit functional mode methods.
         method = getattr(model, "train", None)
-        if self.backend in {"jax", "tinygrad"} and callable(method):
+        if self.backend == "jax" and callable(method):
             method(bool(training))
 
     def optimizer(self, model, name, learning_rate):
@@ -202,16 +202,6 @@ class FrameworkOps:
                 return len(jax.devices("gpu"))
             except RuntimeError:
                 return 0
-        if self.backend == 'tinygrad':
-            import ctypes
-            from tinygrad.runtime.ops_cuda import check, cuda
-            try:
-                check(cuda.cuInit(0))
-                count = ctypes.c_int()
-                check(cuda.cuDeviceGetCount(ctypes.byref(count)))
-            except (OSError, RuntimeError):
-                return 0
-            return count.value
         raise ValueError(f'Unsupported native GPU backend {self.backend}')
 
     def admit_device(self, device):

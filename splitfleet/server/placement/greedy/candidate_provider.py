@@ -293,6 +293,7 @@ class TorchLensCandidateProvider:
                         "optimizer_prefix_parameter_bytes": parameter_bytes.get(candidate.boundary, (None, None))[0],
                         "optimizer_suffix_parameter_bytes": parameter_bytes.get(candidate.boundary, (None, None))[1],
                         "boundary_forward_bytes_by_batch_size": payload_sizes.get(candidate.boundary, {}),
+                        "boundary_gradient_bytes_by_batch_size": candidate.descriptor.get("boundary_gradient_bytes_by_batch_size", {}),
                         "payload_batch_size": candidate.descriptor.get("payload_batch_size"),
                         "candidate_id": candidate.candidate_id,
                         "node_index": candidate.node_index,
@@ -300,6 +301,7 @@ class TorchLensCandidateProvider:
                         "resident_parameter_transport": candidate.descriptor.get("resident_parameter_transport"),
                         "native_boundary_bytes": candidate.descriptor.get("native_boundary_bytes", candidate.estimated_payload_bytes),
                         "resident_parameter_count": candidate.descriptor.get("resident_parameter_count", 0),
+                        "resident_parameter_labels": candidate.descriptor.get("resident_parameter_labels", ()),
                         "prefix_trainable_parameter_count": (
                             int(candidate.descriptor["trainable_prefix_parameter_count"])
                             if training and self.require_trainable_prefix else None
@@ -361,6 +363,8 @@ class TorchLensCandidateProvider:
             resident_contract,
             resident_parameter_bindings,
         )
+        from .profiles import _dtype_name
+        import numpy as np
 
         native_plan = backend._candidate_analysis.plan
         handle = TorchLensRuntimeHandle(backend.model, backend.runtime, runtime_plan, backend)
@@ -378,10 +382,19 @@ class TorchLensCandidateProvider:
         batches.add(capture_batch)
         sizes = {batch: payload_bytes_from_plan(backend.runtime, native_plan, batch_size=batch,
                                                excluded_labels=bindings) for batch in sorted(batches)}
+        no_gradient = set(bindings)
+        for label, spec in native_plan.boundary_spec.items():
+            name = _dtype_name(spec.dtype)
+            if name != "bfloat16" and np.dtype(name).kind not in "fc":
+                no_gradient.add(label)
+        gradient_sizes = {batch: payload_bytes_from_plan(backend.runtime, native_plan, batch_size=batch,
+            excluded_labels=no_gradient) for batch in sorted(batches)}
         descriptor = dict(candidate.descriptor)
         descriptor.update(resident_parameter_transport="splitfleet.functional-state.v1",
                           native_boundary_bytes=candidate.estimated_payload_bytes,
                           resident_parameter_count=len(bindings),
+                          resident_parameter_labels=tuple(sorted(bindings)),
+                          boundary_gradient_bytes_by_batch_size=gradient_sizes,
                           optimizer_prefix_parameter_bytes=byte_counts[0],
                           optimizer_suffix_parameter_bytes=byte_counts[1],
                           resident_state_contract=resident_contract(handle, ownership, bindings))

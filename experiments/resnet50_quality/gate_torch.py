@@ -18,7 +18,7 @@ import sys
 import time
 import traceback
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +35,7 @@ ATOL = 1e-5
 RTOL = 1e-4
 LEARNING_RATE = .05
 SEED = 233
+UTC = timezone.utc
 
 
 def compare_tensor(actual, expected, *, name):

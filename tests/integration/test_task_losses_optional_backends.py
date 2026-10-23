@@ -19,7 +19,7 @@ def _tensor(backend, value):
         return pytest.importorskip("jax.numpy").asarray(value)
     if backend == "paddle":
         return pytest.importorskip("paddle").to_tensor(value)
-    return pytest.importorskip("tinygrad").Tensor(value)
+    raise ValueError(backend)
 
 
 def _value_and_grad(backend, values, objective):
@@ -46,10 +46,7 @@ def _value_and_grad(backend, values, objective):
         loss = objective(values)
         gradient, = paddle.grad(loss, values)
         return loss.numpy(), gradient.numpy()
-    values.requires_grad = True
-    loss = objective(values)
-    loss.backward()
-    return loss.numpy(), values.grad.numpy()
+    raise ValueError(backend)
 
 
 def _reference_ce(logits, labels, ignore_index=-100):
@@ -65,7 +62,7 @@ def _reference_ce(logits, labels, ignore_index=-100):
     return losses[valid].mean(), np.moveaxis(gradients, -1, 1)
 
 
-@pytest.mark.parametrize("backend", ["torch", "tf", "jax", "paddle", "tinygrad"])
+@pytest.mark.parametrize("backend", ["torch", "tf", "jax", "paddle"])
 def test_standard_task_objectives_preserve_native_gradients(request, backend):
     if _run_isolated(request, extra_env={"CUDA_VISIBLE_DEVICES": "", "DEV": "CPU"}):
         return

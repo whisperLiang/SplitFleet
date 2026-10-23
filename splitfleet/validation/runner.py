@@ -54,7 +54,7 @@ def run_matrix(
 
     The fixtures exercise real task losses using synthetic inputs. They do not
     measure dataset accuracy, distributed convergence, or task coverage for
-    TensorFlow, PaddlePaddle, and tinygrad. Those backends have separate native
+    TensorFlow and PaddlePaddle. Those backends have separate native
     replay/training protocol checks in ``tests/integration``.
     """
     backends = tuple(dict.fromkeys(backends))

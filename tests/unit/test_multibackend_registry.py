@@ -9,7 +9,7 @@ from splitfleet.backends.utils import adapter_for, detect_torchlens_backend, mov
 
 @pytest.mark.parametrize(
     "name,canonical",
-    [("tf", "tf"), ("tensorflow", "tf"), ("jax", "jax"), ("paddle", "paddle"), ("tinygrad", "tinygrad")],
+    [("tf", "tf"), ("tensorflow", "tf"), ("jax", "jax"), ("paddle", "paddle")],
 )
 def test_optional_backend_adapters_are_registered_lazily(name: str, canonical: str) -> None:
     assert BACKEND_ADAPTERS.create(name).backend_name == canonical
@@ -17,7 +17,7 @@ def test_optional_backend_adapters_are_registered_lazily(name: str, canonical: s
 
 @pytest.mark.parametrize(
     "module,expected",
-    [("tensorflow.python", "tf"), ("jaxlib.xla_extension", "jax"), ("paddle.nn", "paddle"), ("tinygrad.tensor", "tinygrad")],
+    [("tensorflow.python", "tf"), ("jaxlib.xla_extension", "jax"), ("paddle.nn", "paddle")],
 )
 def test_torchlens_backend_detection_does_not_import_optional_frameworks(module: str, expected: str) -> None:
     model_type = type("Model", (), {"__module__": module})

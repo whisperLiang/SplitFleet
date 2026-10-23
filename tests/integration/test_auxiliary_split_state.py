@@ -181,73 +181,17 @@ def _case(backend, batch=2):
             loss=lambda output, target: jnp.mean((output["logits"] - target) ** 2), optimizer=None,
             numpy=np.asarray, first=lambda: np.asarray(model.params["first"]).copy(),
             count=lambda: model.counter, axes={"/args/1": 0}, boundary="50%")
-    from tinygrad import Tensor, dtypes
-    from tinygrad.nn import Conv2d, Linear
-    from tinygrad.nn.optim import SGD
-
-    class Model:
-        def __init__(self):
-            self.training = True
-            self.defer_statistics = True
-            self.first, self.last = Conv2d(3, 4, 1, bias=False), Linear(4, 3)
-            self.gamma, self.beta = Tensor.ones(4), Tensor.zeros(4)
-            self.running_mean, self.running_var = Tensor.zeros(4), Tensor.ones(4)
-            self.counter = Tensor(0, dtype=dtypes.int64)
-            for variable in self.variables():
-                variable.requires_grad = True
-
-        def variables(self):
-            return [self.first.weight, self.gamma, self.beta, self.last.weight, self.last.bias]
-
-        def __call__(self, inputs):
-            hidden = self.first(inputs)
-            mean = hidden.mean((0, 2, 3), keepdim=True)
-            centered = hidden - mean
-            variance = centered.square().mean((0, 2, 3), keepdim=True)
-            normalized = centered * (variance + 1e-5).rsqrt()
-            normalized = (normalized * self.gamma.reshape(1, 4, 1, 1) + self.beta.reshape(1, 4, 1, 1)).relu()
-            logits = self.last(normalized.mean((2, 3)))
-            statistics = {
-                "mean": mean.reshape(4).detach(), "variance": variance.reshape(4).detach(),
-                "count": Tensor.ones_like(hidden[:, :1], dtype=dtypes.int64).sum(),
-            }
-            return {"logits": logits, "batch_statistics": {"layer1.0.bn1": statistics}}
-
-        def apply_statistics(self, statistics, names=None):
-            if names is None or "layer1.0.bn1" in names:
-                row = statistics["layer1.0.bn1"]
-                count = int(row["count"].item())
-                self.running_mean.assign(.9 * self.running_mean + .1 * row["mean"]).realize()
-                self.running_var.assign(.9 * self.running_var + .1 * row["variance"] * count / (count - 1)).realize()
-                self.counter.assign(self.counter + 1).realize()
-
-    model = Model()
-    inputs, targets = Tensor(images.transpose(0, 3, 1, 2)), Tensor(labels)
-    return SimpleNamespace(model=model, inputs=(inputs,), targets=targets,
-        loss=lambda output, target: ((output["logits"] - target) ** 2).mean(),
-        optimizer=SGD(model.variables()[1:], lr=0.01),
-        prefix_optimizer=SGD([model.first.weight], lr=0.01), numpy=lambda value: np.asarray(value.numpy()),
-        first=lambda: model.first.weight.numpy().copy(), count=lambda: int(model.counter.item()),
-        axes={"/args/0": 0}, boundary="50%")
+    raise ValueError(backend)
 
 
-@pytest.mark.parametrize("backend", ["tf", "paddle", "jax", "tinygrad"])
+@pytest.mark.parametrize("backend", ["tf", "paddle", "jax"])
 def test_native_auxiliary_forward_backward_and_owned_commit(request, backend):
     if _isolated(request, backend):
         return
     from splitfleet.autosplit import prepare_torchlens_runtime
     from splitfleet.runtime.auxiliary_state import commit_auxiliary_state
 
-    case = _case(backend, batch=1 if backend == "tinygrad" else 2)
-    if backend == "tinygrad":
-        from tinygrad import Tensor
-        reference = type(case.model)()
-        for original, variable in zip(case.model.variables(), reference.variables(), strict=True):
-            variable.replace(Tensor(original.numpy().copy()))
-            variable.requires_grad = True
-        reference_loss = case.loss(reference(*case.inputs), case.targets)
-        reference_loss.backward()
-        expected_gradients = [variable.grad.numpy().copy() for variable in reference.variables()]
+    case = _case(backend)
     expected = case.model(*case.inputs)
     expected_statistics = {name: {key: case.numpy(value).copy() for key, value in row.items()}
                            for name, row in expected["batch_statistics"].items()}
@@ -262,31 +206,23 @@ def test_native_auxiliary_forward_backward_and_owned_commit(request, backend):
                       and not (node.is_input or node.is_output or node.is_param_source or node.is_buffer)][-1]
     handle = handle.backend.repartition("after:" + projection.canonical_id)
     assert case.count() == 0
-    if backend == "tinygrad":
-        from tinygrad import Tensor
-        from torchlens.split.errors import SplitBoundaryError
-        assert handle.runtime.batch_validation["status"] == "failed"
-        larger = Tensor(np.repeat(case.numpy(case.inputs[0]), 2, axis=0))
-        with pytest.raises(SplitBoundaryError, match="batch probe did not pass"):
-            handle.backend.run_prefix(larger, training=True)
-    if backend in {"paddle", "tinygrad"}:
+    if backend == "paddle":
         assert all(node.output_container_spec is not None and node.output_container_paths
                    for node in handle.runtime.trace_graph.nodes if node.is_output)
-    if backend != "tinygrad":
-        assert handle.runtime.batch_validation["status"] == "passed"
-        for batch in (1, 16):
-            arguments = list(case.inputs)
-            index = 1 if backend == "jax" else 0
-            arguments[index] = handle.runtime.adapter.resize_batch(arguments[index], 0, batch)
-            expected_batch = case.model(*arguments)
-            replayed_batch = handle.backend.run_suffix(handle.backend.run_prefix(*arguments))
-            np.testing.assert_allclose(case.numpy(replayed_batch["logits"]),
-                                       case.numpy(expected_batch["logits"]), atol=1e-5, rtol=1e-4)
-            for key, value in replayed_batch["batch_statistics"]["layer1.0.bn1"].items():
-                np.testing.assert_allclose(case.numpy(value),
-                    case.numpy(expected_batch["batch_statistics"]["layer1.0.bn1"][key]), atol=1e-5, rtol=1e-4)
-            assert int(case.numpy(replayed_batch["batch_statistics"]["layer1.0.bn1"]["count"])) == 4 * batch
-        assert case.count() == 0
+    assert handle.runtime.batch_validation["status"] == "passed"
+    for batch in (1, 16):
+        arguments = list(case.inputs)
+        index = 1 if backend == "jax" else 0
+        arguments[index] = handle.runtime.adapter.resize_batch(arguments[index], 0, batch)
+        expected_batch = case.model(*arguments)
+        replayed_batch = handle.backend.run_suffix(handle.backend.run_prefix(*arguments))
+        np.testing.assert_allclose(case.numpy(replayed_batch["logits"]),
+                                   case.numpy(expected_batch["logits"]), atol=1e-5, rtol=1e-4)
+        for key, value in replayed_batch["batch_statistics"]["layer1.0.bn1"].items():
+            np.testing.assert_allclose(case.numpy(value),
+                case.numpy(expected_batch["batch_statistics"]["layer1.0.bn1"][key]), atol=1e-5, rtol=1e-4)
+        assert int(case.numpy(replayed_batch["batch_statistics"]["layer1.0.bn1"]["count"])) == 4 * batch
+    assert case.count() == 0
     boundary = handle.backend.run_prefix(*case.inputs, training=True)
     calls = []
     replay = handle.runtime._run_suffix_unchecked
@@ -321,10 +257,6 @@ def test_native_auxiliary_forward_backward_and_owned_commit(request, backend):
             np.testing.assert_allclose(case.numpy(prefix_gradients["inputs"][0][key]), case.numpy(value), atol=1e-5, rtol=1e-4)
     else:
         assert not np.array_equal(before, case.first())
-        if backend == "tinygrad":
-            for variable, expected_gradient in zip(case.model.variables(), expected_gradients, strict=True):
-                assert variable.grad is not None
-                np.testing.assert_allclose(variable.grad.numpy(), expected_gradient, atol=1e-5, rtol=1e-4)
     # Read only after both native optimizer updates: lazy statistics must still
     # describe the actual forward that preceded those mutations.
     for name, row in actual.items():

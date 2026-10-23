@@ -174,9 +174,6 @@ class StageRuntimeManager(ServerModelManager):
                 from splitfleet.runtime.tensorflow_capture_scope import tensorflow_execution_scope
                 with tensorflow_execution_scope():
                     handle = clone_tensorflow_runtime_handle(base, model)
-            elif base.backend.framework_backend == 'tinygrad':
-                from splitfleet.autosplit.tinygrad_clone import clone_tinygrad_runtime_handle
-                handle = clone_tinygrad_runtime_handle(base, model)
         if handle is None:
             sample_inputs = base.plan.metadata.get("_example_inputs")
             if sample_inputs is None:

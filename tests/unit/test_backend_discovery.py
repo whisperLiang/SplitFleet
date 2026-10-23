@@ -30,7 +30,7 @@ def test_builtin_backend_discovery_has_install_hints():
     reports = {report.name: report for report in BACKEND_ADAPTERS.availability()}
     assert reports["torch"].available
     assert reports["tensorflow"].install_extra == reports["tf"].install_extra == "tensorflow"
-    assert set(reports) == {"torch", "tf", "tensorflow", "jax", "paddle", "tinygrad"}
+    assert set(reports) == {"torch", "tf", "tensorflow", "jax", "paddle"}
 
 
 def test_factory_errors_are_not_misreported_as_unregistered_backend():

@@ -129,7 +129,7 @@ def calibrate_native_split(model, inputs, targets, *, boundaries, make_handle,
                 functional = isinstance(optimizer, OwnedFunctionalSGD)
                 if functional:
                     optimizer.ownership = ownership
-                bindings = resident_parameter_bindings(handle, ownership) if functional and stage == 'suffix' else {}
+                bindings = resident_parameter_bindings(handle, ownership) if functional else {}
                 samples = []
                 for batch_index in range(2):
                     if backend == 'paddle':
@@ -143,8 +143,15 @@ def calibrate_native_split(model, inputs, targets, *, boundaries, make_handle,
                     begin = time.perf_counter()
                     loss, returned = handle.backend.train_suffix(boundary, targets, loss_fn=loss_fn,
                         optimizer=optimizer if stage == 'suffix' and not functional else None)
+                    all_returned = returned
                     if functional and stage == 'suffix':
-                        optimizer.suffix_update(bindings, returned)
+                        returned = optimizer.suffix_update(bindings, returned)
+                    elif functional:
+                        # Production suffix SGD consumes its resident weight
+                        # gradients. Client calibration must time that same
+                        # activation-only VJP rather than propagate private
+                        # suffix parameter roots back through the prefix.
+                        returned = {key: value for key, value in returned.items() if key not in bindings}
                     auxiliary = handle.backend.train_suffix_auxiliary
                     if auxiliary is not None:
                         commit_auxiliary_state(model, statistics_for_stage(model, auxiliary, ownership, 'suffix'))
@@ -161,7 +168,7 @@ def calibrate_native_split(model, inputs, targets, *, boundaries, make_handle,
                     backward_ms = (time.perf_counter() - begin) * 1000
                     if batch_index == 1:
                         samples.append((forward_ms, backward_ms, service_ms))
-                if not _finite(backend, (loss, returned, prefix, [value.grad for value in parameters.values()])):
+                if not _finite(backend, (loss, all_returned, prefix, [value.grad for value in parameters.values()])):
                     raise ValueError('Calibration loss or native gradients are nonfinite')
                 forward_ms, backward_ms, service_ms = np.median(samples, axis=0).tolist()
                 records.append({'boundary': cut, 'graph_signature': handle.plan.graph_signature,
@@ -170,7 +177,7 @@ def calibrate_native_split(model, inputs, targets, *, boundaries, make_handle,
                     'loss': adapter.scalar_value(loss), 'measured_batches': 1,
                     'optimizer_steps': 2 if optimizer is not None else 0,
                     'optimizer_stage': stage if optimizer_fn is not None else None})
-                del handle, optimizer, boundary, returned, prefix, auxiliary, loss
+                del handle, optimizer, boundary, returned, all_returned, prefix, auxiliary, loss
     finally:
         adapter.load_ndarrays(model, state)
         for name, parameter in parameters.items():

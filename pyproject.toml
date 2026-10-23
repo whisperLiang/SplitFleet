@@ -52,13 +52,11 @@ integration = [
 tensorflow = ["tensorflow>=2.16"]
 jax = ["jax>=0.4.30", "optax>=0.2.3"]
 paddle = ["paddlepaddle>=3.0"]
-tinygrad = ["tinygrad==0.13.0; python_version >= '3.11'"]
 multibackend = [
     "tensorflow>=2.16",
     "jax>=0.4.30",
     "optax>=0.2.3",
     "paddlepaddle>=3.0",
-    "tinygrad==0.13.0; python_version >= '3.11'",
 ]
 
 [tool.uv.sources]

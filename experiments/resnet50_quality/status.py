@@ -131,7 +131,7 @@ def current_status(root):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--root', type=Path, default=Path('results/resnet50_torch50'))
+    parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--watch', action='store_true')
     args = parser.parse_args()
     while True:

@@ -120,12 +120,6 @@ def _all_nodes(model, inputs, targets, loss_fn, backend_name: str) -> None:
         trained.append(candidate.boundary)
 
     assert len(trained) + len(non_differentiable) + len(replay_only) == len(candidates)
-    if backend_name == "tinygrad":
-        # Every nonterminal cut in this pointwise float model carries a
-        # differentiable frontier. A lazy decoded NPY COPY used to silently
-        # turn all 24 cuts into apparent non-differentiable successes.
-        assert len(trained) == 24
-        assert not non_differentiable
     assert trained, f"{backend_name} has no trainable enumerated split boundary"
     print(
         f"ALL_SPLIT_NODES backend={backend_name} total={len(candidates)} "
@@ -206,28 +200,3 @@ def test_paddle_lenet_ocr_all_split_nodes_train(request) -> None:
     inputs = paddle.randn((2, 1, 28, 28))
     targets = paddle.randint(0, 10, shape=(2,), dtype="int64")
     _all_nodes(model, inputs, targets, paddle.nn.CrossEntropyLoss(), "paddle")
-
-
-def test_tinygrad_fcn_segmentation_all_split_nodes_train(request) -> None:
-    if _isolated(request, env_overrides={"DEV": "CPU", "DEBUG": "0"}): return
-    from tinygrad import Tensor
-
-    class FCNSegmenter:
-        def __init__(self):
-            self.scale = Tensor([1.5]).realize()
-            self.bias = Tensor([-0.25]).realize()
-            self.scale.requires_grad = True
-            self.bias.requires_grad = True
-
-        def __call__(self, images):
-            # A trainable foreground-mask calibration head. This is deliberately
-            # pointwise: tinygrad lowers even a 1x1 convolution into hundreds of
-            # UOps, making prepare-on-every-boundary validation impractical.
-            return (images * self.scale + self.bias).relu().sigmoid()
-
-    loss_fn = lambda output, target: ((output - target) ** 2).mean()
-    # Exercise both sides of ReLU with reproducible nonzero parameter gradients.
-    inputs = Tensor(np.linspace(-1.0, 1.0, 128, dtype=np.float32).reshape(2, 1, 8, 8)).realize()
-    inputs.requires_grad = True
-    targets = Tensor(np.zeros((2, 1, 8, 8), dtype=np.float32)).realize()
-    _all_nodes(FCNSegmenter(), inputs, targets, loss_fn, "tinygrad")

@@ -1,4 +1,4 @@
-"""Faithful output frontiers through private TorchLens 2.34.1 TF bindings.
+"""Faithful output frontiers through private TorchLens 2.34.1 bindings.
 
 The pinned planner redundantly carries the parents of prefix-owned final
 outputs. Those outputs are already present in the boundary. This extension
@@ -176,8 +176,8 @@ def _native_bindings():
 
 def bind_native_frontier(runtime):
     """Keep native analysis/recut/materialization on this instance's policy."""
-    if runtime.adapter.name not in {"tf", "tensorflow"}:
-        raise ValueError("Native minimal frontier is currently validated only for TensorFlow")
+    if runtime.adapter.name not in {"tf", "tensorflow", "paddle", "jax"}:
+        raise ValueError("Native minimal frontier requires TensorFlow, Paddle or JAX")
     if getattr(runtime, "_splitfleet_minimal_frontier", False):
         return runtime
     private_plan, _ = _native_bindings()
@@ -205,12 +205,12 @@ def bind_native_frontier(runtime):
 
 
 def prepare_native_frontier_runtime(model, inputs, request, *, input_kwargs=None):
-    """Prepare unchanged native TF capture/probes with a faithful new ABI.
+    """Prepare unchanged native capture/probes with a faithful new ABI.
 
     Caller retains its actual native device scope. No framework, SDK module,
     class, registry or captured graph object is modified by this function.
     """
-    if str(request.backend) not in {"tf", "tensorflow"}:
-        raise ValueError("Native minimal frontier is currently validated only for TensorFlow")
+    if str(request.backend) not in {"tf", "tensorflow", "paddle", "jax"}:
+        raise ValueError("Native minimal frontier requires TensorFlow, Paddle or JAX")
     _, prepare = _native_bindings()
     return bind_native_frontier(prepare(model, inputs, request, input_kwargs=input_kwargs))
