@@ -546,7 +546,7 @@ class AutoSplitStrategy(PlainSlStrategy):
         # ModelInputs rather than a TaskBatch, so there is no representative
         # target available here; avoid a second, target-less calibration call.
         if (prepare_calibration is not None and self._calibration_batch is not None
-                and self.backend_adapter.backend_name in {'torch', 'tf', 'paddle', 'jax'}
+                and self.backend_adapter.backend_name in {'torch', 'tf', 'paddle'}
                 and hasattr(self.placement_policy.candidate_provider, "model")):
             prepare_calibration(
                 ModelInputs(self.sample_inputs, self.sample_kwargs),

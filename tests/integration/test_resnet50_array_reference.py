@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 import subprocess
@@ -13,9 +12,8 @@ import numpy as np
 import pytest
 
 from tests.integration.resnet50_reference.array_helpers import (
-    RecordingFunctionalSGD, canonical_array, stage_boundaries,
+    canonical_array, stage_boundaries,
 )
-from experiments.resnet50_quality.model_contract import NAMES, TRAINABLE_NAMES, TRAINABLE_PARAMETERS
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -33,14 +31,14 @@ def test_tf_gradient_layout_preserves_every_axis_and_scalar_counter():
         canonical_array("paddle", "bn1.num_batches_tracked", np.asarray([1], np.int64))
 
 
-@pytest.mark.parametrize("backend", ["tensorflow", "paddle", "jax"])
+@pytest.mark.parametrize("backend", ["tensorflow", "paddle"])
 def test_stage_selection_uses_final_bottleneck_relu_metadata(backend):
     nodes = []
     for stage, blocks, channels, spatial in ((1, 3, 256, 16), (2, 4, 512, 8), (3, 6, 1024, 4)):
         shape = (1, spatial, spatial, channels) if backend == "tensorflow" else (1, channels, spatial, spatial)
         for block in range(blocks):
-            nodes.append(SimpleNamespace(module_path=f"layer{stage}.{block}" + ("" if backend == "jax" else ".relu3"),
-                op_type="select_n" if backend == "jax" else "Relu",
+            nodes.append(SimpleNamespace(module_path=f"layer{stage}.{block}.relu3",
+                op_type="Relu",
                 output_shape=shape, canonical_id=f"relu_stage{stage}_block{block}", label="native_relu"))
         nodes.append(SimpleNamespace(module_path=f"layer{stage}.{blocks - 1}.bn3", op_type="Mean",
             output_shape=(channels,), canonical_id="statistics", label="statistics"))
@@ -52,7 +50,7 @@ def test_stage_selection_uses_final_bottleneck_relu_metadata(backend):
 
 def _interpreter(backend):
     selected = ROOT / {
-        "paddle": ".venv-paddle-gpu/bin/python", "jax": ".venv-jax-gpu/bin/python",
+        "paddle": ".venv-paddle-gpu/bin/python",
         "tensorflow": ".venv/bin/python",
     }[backend]
     return str(selected) if selected.exists() else sys.executable
@@ -61,65 +59,11 @@ def _interpreter(backend):
 def _environment(backend=None):
     environment = dict(os.environ)
     environment.update(CUDA_VISIBLE_DEVICES="0", NVIDIA_TF32_OVERRIDE="0")
-    if backend == "jax":
-        environment.update(CUDA_VISIBLE_DEVICES="1", XLA_PYTHON_CLIENT_PREALLOCATE="false",
-                           JAX_PLATFORMS="cuda,cpu")
     for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
                  "TF_NUM_INTRAOP_THREADS", "TF_NUM_INTEROP_THREADS"):
         environment[name] = "1"
     return environment
 
-
-def test_recording_functional_sgd_delegates_native_update_and_excludes_buffers():
-    from splitfleet.runtime.functional_sgd import OwnedFunctionalSGD
-
-    class Model:
-        params = {"bn1.bias": np.ones(64, np.float32),
-                  "bn1.num_batches_tracked": np.asarray(0, np.int64)}
-
-        def set_params(self, values):
-            self.params = values
-
-    model = Model()
-    optimizer = RecordingFunctionalSGD(model)
-    assert isinstance(optimizer, OwnedFunctionalSGD)
-    gradients = {"bn1.bias": np.arange(64, dtype=np.float32),
-                 "bn1.num_batches_tracked": np.asarray(1, np.int64)}
-    optimizer._step(gradients)
-    assert optimizer.recorded_steps == 1 and set(optimizer.gradients) == {"bn1.bias"}
-    np.testing.assert_array_equal(optimizer.gradients["bn1.bias"], gradients["bn1.bias"])
-    np.testing.assert_array_equal(model.params["bn1.bias"], 1 - np.float32(.05) * gradients["bn1.bias"])
-    assert int(model.params["bn1.num_batches_tracked"]) == 0
-    with pytest.raises(RuntimeError, match="more than one"):
-        optimizer._step({"bn1.bias": gradients["bn1.bias"]})
-
-
-def test_jax_loss_receipt_observes_same_native_differentiated_forward(request):
-    if os.environ.get("SPLITFLEET_JAX_LOSS_TEST_CHILD") != "1":
-        environment = _environment("jax")
-        environment.update(SPLITFLEET_JAX_LOSS_TEST_CHILD="1", CUDA_VISIBLE_DEVICES="", JAX_PLATFORMS="cpu")
-        result = subprocess.run([_interpreter("jax"), "-m", "pytest", request.node.nodeid,
-            "-o", "addopts=", "-q"], cwd=ROOT, env=environment, capture_output=True, text=True, timeout=60)
-        assert result.returncode == 0, result.stdout + result.stderr
-        return
-    import jax
-    import jax.numpy as jnp
-    from tests.integration.resnet50_reference.array_helpers import RecordingLoss
-    from splitfleet.tasks.losses import sparse_cross_entropy
-
-    logits = jnp.asarray([[.1, -.4, .7], [.3, .6, -.2]], dtype=jnp.float32)
-    labels = jnp.asarray([2, 1], dtype=jnp.int32)
-    recorder = RecordingLoss("jax")
-    actual_loss, actual_gradient = jax.value_and_grad(
-        lambda value: recorder({"logits": value}, labels))(logits)
-    jax.effects_barrier()
-    expected_loss, expected_gradient = jax.value_and_grad(
-        lambda value: sparse_cross_entropy(value, labels))(logits)
-    assert len(recorder.calls) == 1
-    np.testing.assert_array_equal(recorder.calls[0]["logits"], np.asarray(logits))
-    assert recorder.calls[0]["loss"] == float(expected_loss)
-    np.testing.assert_array_equal(np.asarray(actual_loss), np.asarray(expected_loss))
-    np.testing.assert_array_equal(np.asarray(actual_gradient), np.asarray(expected_gradient))
 
 
 def test_tf_loss_receipt_observes_each_compiled_training_invocation(request):
@@ -157,75 +101,6 @@ def test_tf_loss_receipt_observes_each_compiled_training_invocation(request):
         np.testing.assert_array_equal(actual_loss.numpy(), expected_loss.numpy())
         np.testing.assert_array_equal(actual_gradient.numpy(), expected_gradient.numpy())
 
-
-def test_jax_factory_bn_replay_preserves_all_native_gradients(request):
-    """Use the actual factory BN body between trainable upstream/head weights."""
-    if os.environ.get("SPLITFLEET_JAX_BN_TEST_CHILD") != "1":
-        environment = _environment("jax")
-        environment.update(SPLITFLEET_JAX_BN_TEST_CHILD="1", CUDA_VISIBLE_DEVICES="", JAX_PLATFORMS="cpu")
-        result = subprocess.run([_interpreter("jax"), "-m", "pytest", request.node.nodeid,
-            "-o", "addopts=", "-q"], cwd=ROOT, env=environment, capture_output=True, text=True, timeout=90)
-        assert result.returncode == 0, result.stdout + result.stderr
-        return
-    import jax
-    import jax.numpy as jnp
-    from tests.integration.resnet50_reference.jax_model import ResNet50
-    from splitfleet.autosplit import AutoSplitSession
-    from splitfleet.tasks.losses import sparse_cross_entropy
-
-    random = np.random.default_rng(712)
-
-    class Model:
-        def __init__(self):
-            self.params = {
-                "first": jnp.asarray(random.normal(size=(3, 64)).astype(np.float32) * .2),
-                "bn1.weight": jnp.ones(64, dtype=jnp.float32),
-                "bn1.bias": jnp.zeros(64, dtype=jnp.float32),
-                "head": jnp.asarray(random.normal(size=(64, 3)).astype(np.float32) * .2),
-                "head_bias": jnp.zeros(3, dtype=jnp.float32),
-            }
-            self.training = True
-
-        def __call__(self, params, images):
-            projected = jax.lax.dot_general(images, params["first"], (((3,), (0,)), ((), ())))
-            statistics = {}
-            normalized = ResNet50._batch_norm(self, projected.transpose(0, 3, 1, 2), params,
-                                              "bn1", statistics, training=True)
-            activated = jax.lax.select(normalized > 0, normalized, jnp.zeros_like(normalized))
-            logits = activated.mean(axis=(2, 3)) @ params["head"] + params["head_bias"]
-            return {"logits": logits, "batch_statistics": statistics}
-
-        def apply_statistics(self, statistics, names=None):
-            pass
-
-    model = Model()
-    images = jnp.asarray(random.normal(size=(2, 2, 2, 3)).astype(np.float32))
-    labels = jnp.asarray([0, 2], dtype=jnp.int32)
-    session = AutoSplitSession(device="cpu")
-    base = session.prepare_runtime(model, (model.params, images), trainable=True,
-                                   batch_axes={"/args/1": 0}, dynamic_batch=(1, 16))
-    endpoint = next(node for node in base.runtime.trace_graph.nodes if node.op_type == "dot_general")
-    handle = session.repartition_runtime(base, "after:" + endpoint.canonical_id)
-    assert handle.runtime.batch_validation["status"] == "passed"
-    for batch in (1, 2, 16):
-        current = jnp.asarray(random.normal(size=(batch, 2, 2, 3)).astype(np.float32))
-        labels = jnp.arange(batch, dtype=jnp.int32) % 3
-        expected_loss, expected_gradients = jax.value_and_grad(
-            lambda values: sparse_cross_entropy(model(values, current)["logits"], labels))(model.params)
-        expected_statistics = model(model.params, current)["batch_statistics"]
-        boundary = handle.backend.run_prefix(model.params, current, training=True)
-        loss, gradients = handle.backend.train_suffix(boundary, labels,
-            loss_fn=lambda output, targets: sparse_cross_entropy(output["logits"], targets))
-        actual = handle.backend.backward_prefix(boundary, gradients)["inputs"][0]
-        np.testing.assert_allclose(np.asarray(loss), np.asarray(expected_loss), atol=1e-5, rtol=1e-4)
-        assert set(actual) == set(expected_gradients)
-        for name, expected in expected_gradients.items():
-            np.testing.assert_allclose(np.asarray(actual[name]), np.asarray(expected), atol=1e-5, rtol=1e-4,
-                                       err_msg=f"Actual factory BN replay gradient differs at {name}, B={batch}")
-        for name, expected in expected_statistics["bn1"].items():
-            np.testing.assert_allclose(np.asarray(handle.backend.train_suffix_auxiliary["bn1"][name]),
-                                       np.asarray(expected), atol=1e-5, rtol=1e-4)
-        assert int(handle.backend.train_suffix_auxiliary["bn1"]["count"]) == 4 * batch
 
 
 @pytest.mark.parametrize("norm_owner", ["prefix", "suffix"])

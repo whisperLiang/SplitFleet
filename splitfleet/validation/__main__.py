@@ -1,4 +1,4 @@
-"""Run with ``python -m splitfleet.validation --backends torch jax --all-nodes``."""
+"""Run with ``python -m splitfleet.validation --backends torch --all-nodes``."""
 
 from __future__ import annotations
 

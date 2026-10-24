@@ -55,6 +55,11 @@ class LeasedServerModelManager(ServerModelManager):
         self.peak_live = 0
         self.total_created = 0
         self.total_reused = 0
+        # ``id(model)`` is only unique while the object is alive.  Per-client
+        # models are released after each task, so CPython may reuse that
+        # address before the metrics for the round are consumed.  Keep a
+        # manager-local monotonic identity on each materialized model instead.
+        self._next_model_instance_id = 0
         self.records = {}
 
     def initialize_server_models(self, configs):
@@ -96,6 +101,10 @@ class LeasedServerModelManager(ServerModelManager):
         try:
             if model is None:
                 model = self.factory().to_server_model()
+                with self.lock:
+                    self._next_model_instance_id += 1
+                    model_instance_id = self._next_model_instance_id
+                setattr(model, "_splitfleet_model_instance_id", model_instance_id)
                 # Model construction happens outside the critical section so
                 # a slow framework build cannot block unrelated leases.  The
                 # peak counter is shared state, however, and must be updated
@@ -106,6 +115,10 @@ class LeasedServerModelManager(ServerModelManager):
                         self.peak_client_models,
                         len(self.live) + len(self.preparing),
                     )
+            else:
+                model_instance_id = getattr(model, "_splitfleet_model_instance_id", None)
+                if model_instance_id is None:
+                    raise RuntimeError("Suffix slot is missing its model instance identity")
             if isinstance(config, ServerModelFitIns):
                 model.configure_fit(config)
             else:
@@ -115,7 +128,8 @@ class LeasedServerModelManager(ServerModelManager):
                        "suffix_capture_reused": bool(
                            getattr(model, 'runtime_handle', None)
                            and model.runtime_handle.plan.metadata.get('_reused_capture', False)),
-                       "suffix_model_instance_id": id(model), "suffix_model_client_id": sid}
+                       "suffix_model_instance_id": model_instance_id,
+                       "suffix_model_client_id": sid}
         except BaseException as error:
             try:
                 if model is not None:

@@ -199,7 +199,7 @@ def prepare_split_runtime(
                     prepare_training_runtime,
                 )
                 runtime = prepare_training_runtime(model, inputs, request, input_kwargs=input_kwargs)
-            elif backend in {"tf", "jax"}:
+            elif backend == "tf":
                 from splitfleet.runtime.tensorflow_capture_scope import tensorflow_capture_scope
                 from splitfleet.runtime.native_frontier import (
                     prepare_native_frontier_runtime,

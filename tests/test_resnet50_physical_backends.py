@@ -68,37 +68,19 @@ def test_six_clients_require_each_physical_cpu_and_gpu_and_all_local_examples():
         validate_round_budget(broken, six_client_config())
 
 
-def test_launch_hides_gpu_from_cpu_clients_and_preserves_unique_receipt_paths(tmp_path):
-    from experiments.resnet50_backends.campaign import command
-    import shlex
-    manifest = {"workspace": str(tmp_path), "server_devices": {"jax": "cpu"}}
-    clients = [{**spec, "root": "/isolated/run", "ssh": "nvidia@192.168.66.140"}
-               for spec in LOGICAL_CLIENTS[:2]]
-    commands = [shlex.split(command(tmp_path, manifest, "jax", "client", host=client,
-                output=f"/isolated/run/{client['id']}.json", address="127.0.0.1:12345")[-1])
-                for client in clients]
-    assert "CUDA_VISIBLE_DEVICES=-1" in commands[0] and "JAX_PLATFORMS=cpu" in commands[0]
-    assert "CUDA_VISIBLE_DEVICES=0" in commands[1] and "JAX_PLATFORMS=cuda,cpu" in commands[1]
-    assert "JAX_DISABLE_JIT=1" in commands[1] and "JAX_DISABLE_JIT=1" not in commands[0]
-    assert commands[0][commands[0].index("--admission") + 1] != commands[1][commands[1].index("--admission") + 1]
-    assert commands[0][commands[0].index("--index") + 1] == "0"
-    assert commands[1][commands[1].index("--index") + 1] == "1"
-
 
 def test_figure3_server_uses_a6000_gpu_for_every_backend(tmp_path):
     from experiments.resnet50_backends.campaign import SERVER_DEVICES, command
 
     manifest = {"workspace": str(tmp_path), "server_devices": dict(SERVER_DEVICES),
                 "server": {"host": "fy205"}}
-    for backend in ("tensorflow", "jax", "paddle"):
+    for backend in ("tensorflow", "paddle"):
         args = command(tmp_path, manifest, backend, "server", output=tmp_path / "server.json",
                        address="127.0.0.1:12345")
         assert args[args.index("--device") + 1] == "cuda:0"
         assert "CUDA_VISIBLE_DEVICES=0" in args
         assert "SPLITFLEET_CLIENT_ID=server" in args
         assert "SPLITFLEET_PHYSICAL_HOST=fy205" in args
-        assert "JAX_PLATFORMS=cpu" not in args
-        assert "JAX_DISABLE_JIT=1" not in args
 
 
 def test_measured_placement_reaches_each_cpu_gpu_and_server_process(tmp_path):
@@ -214,7 +196,8 @@ def test_admission_cli_accepts_protocol_specific_batch_sizes(tmp_path, monkeypat
     assert calls == [8]
 
 
-def test_executed_placement_must_match_every_independent_client_decision(tmp_path, monkeypatch):
+@pytest.mark.parametrize("skip_admission", [False, True])
+def test_executed_placement_must_match_every_independent_client_decision(tmp_path, monkeypatch, skip_admission):
     from experiments.resnet50_backends import summarize
 
     decisions = [{"logical_client_id": spec["id"], "boundary": "after:pool", "algorithm": "Greedy",
@@ -225,11 +208,12 @@ def test_executed_placement_must_match_every_independent_client_decision(tmp_pat
         for spec in LOGICAL_CLIENTS]
     checked = []
     monkeypatch.setattr(summarize, "validate_selected_admission", lambda *args: checked.append(args))
-    summarize.validate_placement_round(tmp_path, {"round": 1, "clients": clients}, six_client_config())
-    assert len(checked) == 12
+    protocol = {**six_client_config(), "skip_training_admission": skip_admission}
+    summarize.validate_placement_round(tmp_path, {"round": 1, "clients": clients}, protocol)
+    assert len(checked) == (0 if skip_admission else 12)
     clients[0]["metrics"]["selected_boundary"] = "after:fixed_stage2"
     with pytest.raises(ValueError, match="independent measured Greedy"):
-        summarize.validate_placement_round(tmp_path, {"round": 1, "clients": clients}, six_client_config())
+        summarize.validate_placement_round(tmp_path, {"round": 1, "clients": clients}, protocol)
 
 
 def test_batches_reproduce_augmentations_without_global_rng_or_dropped_examples(tmp_path):
@@ -266,11 +250,11 @@ def test_cosine_schedule_has_fixed_endpoints_and_rejects_extra_rounds():
 def test_partial_or_failed_admission_cannot_be_presented_as_convergence(tmp_path):
     (tmp_path / "bundle").mkdir()
     (tmp_path / "bundle/protocol.json").write_text(json.dumps(config()))
-    path = tmp_path / "admission/jax"
+    path = tmp_path / "admission/paddle"
     path.mkdir(parents=True)
     (path / "server.json").write_text(json.dumps({"status": "failed", "cuts": [{}, {}, {}]}))
     with pytest.raises(ValueError, match="must pass"):
-        read_pair(tmp_path, "jax")
+        read_pair(tmp_path, "paddle")
 
 
 def test_progress_detects_host_reboot_instead_of_reporting_stale_running(tmp_path):
@@ -479,7 +463,7 @@ def test_pairing_handles_native_round_zero_and_requires_matching_client_hashes(t
             read_pair(tmp_path, "tensorflow")
 
 
-@pytest.mark.parametrize("queued_backends", [[], ["jax"]])
+@pytest.mark.parametrize("queued_backends", [[]])
 def test_splitfleet_summary_ignores_stopped_fedavg_and_never_claims_pairing(tmp_path, queued_backends):
     from experiments.resnet50_backends.summarize import summarize
 
@@ -502,6 +486,30 @@ def test_splitfleet_summary_ignores_stopped_fedavg_and_never_claims_pairing(tmp_
     assert "fedavg" not in (tmp_path / "summary/curves.csv").read_text()
     with pytest.raises(ValueError, match="Incomplete"):
         read_pair(tmp_path, "tensorflow")
+
+
+def test_direct_training_summary_reports_skipped_admission_without_receipts(tmp_path):
+    import shutil
+    from experiments.resnet50_backends.summarize import summarize
+
+    write_completed_methods(tmp_path, True, methods=("splitfleet",))
+    shutil.rmtree(tmp_path / "admission")
+    protocol_path = tmp_path / "bundle/protocol.json"
+    protocol = json.loads(protocol_path.read_text())
+    protocol["skip_training_admission"] = True
+    protocol_path.write_text(json.dumps(protocol))
+    result_path = tmp_path / "runs/tensorflow/splitfleet/server.json"
+    result = json.loads(result_path.read_text())
+    result["protocol"] = protocol
+    result_path.write_text(json.dumps(result))
+    (tmp_path / "campaign.json").write_text(json.dumps({
+        "method_order": ["splitfleet"], "source_identity": "unit-test-source"}))
+    (tmp_path / "execution_attempt.json").write_text(json.dumps({"backends": ["tensorflow"]}))
+    (tmp_path / "status.json").write_text(json.dumps({"backends": {"tensorflow": {"phase": "completed"}}}))
+    report = summarize(tmp_path, ["tensorflow"])["tensorflow"]
+    assert report["complete_requested_training"] is True
+    assert report["numerical_admission"] == "skipped_by_user_request"
+    assert "numerical admission skipped" in json.loads((tmp_path / "summary/summary.json").read_text())["scope"]
 
 
 @pytest.mark.parametrize("formal,round_count", [(False, 10), (False, 50), (True, 50)])

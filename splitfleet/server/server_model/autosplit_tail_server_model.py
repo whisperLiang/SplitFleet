@@ -190,9 +190,6 @@ class AutoSplitTailServerModel(ServerModel):
     def _configure_optimizer(self):
         if self.optimizer_fn is not None:
             self.optimizer = self.optimizer_fn(self.model)
-        elif self.backend_adapter.backend_name == "jax":
-            # Functional parameter gradients return to the client for its update.
-            self.optimizer = None
         else:
             self.optimizer = self.backend_adapter.build_optimizer(self.model, {"name": "sgd", "lr": 0.01})
 
@@ -244,21 +241,6 @@ class AutoSplitTailServerModel(ServerModel):
             self._validate_wire_identity(wire_boundary)
             step_key = (wire_boundary.round_id, wire_boundary.client_id, wire_boundary.step_id)
             boundary = envelope_to_boundary(wire_boundary, runtime_handle.runtime, self.device)
-            from splitfleet.runtime.functional_sgd import (
-                OwnedFunctionalSGD,
-                hydrate_resident_boundary,
-            )
-            functional_optimizer = self.optimizer if isinstance(self.optimizer, OwnedFunctionalSGD) else None
-            resident_bindings = {}
-            if functional_optimizer is not None:
-                if not self.sid or wire_boundary.client_id != self.sid or wire_boundary.round_id != self.model_version:
-                    raise RuntimeError("Resident functional state request has incorrect client/round identity")
-                if self.state_ownership is None:
-                    raise RuntimeError("Resident functional state requires verified ownership")
-                boundary, resident_bindings = hydrate_resident_boundary(
-                    boundary, runtime_handle, self.state_ownership,
-                    contract=wire_boundary.metadata.get("resident_state_contract"),
-                )
             self.boundary_deserialize_sec += time.perf_counter() - deserialize_started
             targets = decode_bundle_wire(batch.data["targets"], self.device)
             examples = _request_num_examples(batch.data["metadata"])
@@ -270,11 +252,9 @@ class AutoSplitTailServerModel(ServerModel):
                     boundary,
                     targets=targets,
                     loss_fn=self.loss_fn,
-                    optimizer=None if functional_optimizer is not None else self.optimizer,
+                    optimizer=self.optimizer,
                     measurements=measurements,
                 )
-                if functional_optimizer is not None:
-                    result["boundary_grads"] = functional_optimizer.suffix_update(resident_bindings, result["boundary_grads"])
                 auxiliary = getattr(runtime_handle.backend, "train_suffix_auxiliary", None)
                 prefix_statistics = None
                 if auxiliary is not None:

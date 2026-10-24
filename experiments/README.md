@@ -4,7 +4,7 @@ The physical runner defaults to **Greedy** with **`--server-concurrency 1`**. Gr
 
 The active adaptive implementations are Greedy and the optional L2S reference. Retired UCB controllers are absent from active code and command-line choices. Frozen result directories retain their original labels and source snapshots for provenance.
 
-The [current paper](../paper/README.md) reports 120 fixed-ten-round endpoints across six methods, including 20 measured Greedy C=1 runs. Its 160 common-budget endpoints combine completed Greedy measurements and retained controls, with task-specific budgets and source cohorts reported separately. It also includes a six-round dynamic-network check, seven-model capture evidence, a paired 100-client PyTorch experiment, and physical TensorFlow/JAX/Paddle validation. The concurrency-capacity experiment is removed from the current paper.
+The [current paper](../paper/README.md) reports 120 fixed-ten-round endpoints across six methods, including 20 measured Greedy C=1 runs. Its 160 common-budget endpoints combine completed Greedy measurements and retained controls, with task-specific budgets and source cohorts reported separately. It also includes a six-round dynamic-network check, seven-model capture evidence, a paired 100-client PyTorch experiment, and physical TensorFlow/Paddle validation. The concurrency-capacity experiment is removed from the current paper.
 
 ## Training
 

@@ -14,7 +14,7 @@ from PIL import Image
 from experiments.resnet50_quality.data import keyed_seed, load_cifar
 from experiments.resnet50_quality.model_contract import canonical_state, state_hash
 
-BACKENDS = ("tensorflow", "jax", "paddle")
+BACKENDS = ("tensorflow", "paddle")
 METHODS = ("splitfleet", "fedavg")
 HOST_SUFFIXES = ("140", "118", "238")
 LOGICAL_CLIENTS = tuple(
@@ -85,6 +85,11 @@ def learning_rate(round_id, config):
     fraction = (round_id - 1) / max(config["rounds"] - 1, 1)
     return config["minimum_learning_rate"] + .5 * (
         config["learning_rate"] - config["minimum_learning_rate"]) * (1 + math.cos(math.pi * fraction))
+
+
+def training_admission_enabled(config):
+    """Keep old frozen protocols strict; skipping must be recorded explicitly."""
+    return not config.get("skip_training_admission", False)
 
 
 def training_batch_sizes(config):

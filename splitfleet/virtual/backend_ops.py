@@ -114,11 +114,6 @@ class FrameworkOps:
                 "native_state_tensors": len(self.names(model)),
                 "state_layout": "native_adapter_schema",
                 "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES"),
-                "XLA_FLAGS": os.environ.get("XLA_FLAGS"),
-                "XLA_PYTHON_CLIENT_PREALLOCATE": os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE"),
-                "XLA_PYTHON_CLIENT_ALLOCATOR": os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR"),
-                "XLA_CLIENT_MEM_FRACTION": os.environ.get("XLA_CLIENT_MEM_FRACTION"),
-                "XLA_PYTHON_CLIENT_MEM_FRACTION": os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION"),
                 "optional_framework_isolation": ["tensorflow"] if (
                     "tensorflow" in sys.modules and sys.modules["tensorflow"] is None) else [],
                 "rng_scope": self.rng_scope_description}
@@ -126,11 +121,6 @@ class FrameworkOps:
     def trainable_names(self, model):
         if self.backend == "torch":
             return {name for name, value in model.named_parameters() if value.requires_grad}
-        if self.backend == "jax":
-            state = self.native_state(model)
-            import jax
-            identities = {id(value) for value in jax.tree_util.tree_leaves(model.params)}
-            return {name for name, value in state.items() if id(value) in identities}
         names = set()
         for name, value in self.native_state(model).items():
             active = (value.trainable if self.backend == "tf" else not value.stop_gradient
@@ -141,9 +131,8 @@ class FrameworkOps:
 
     def set_training(self, model, training):
         self.adapter.set_training(model, training)
-        # JAX factories provide explicit functional mode methods.
         method = getattr(model, "train", None)
-        if self.backend == "jax" and callable(method):
+        if self.backend == "torch" and callable(method):
             method(bool(training))
 
     def optimizer(self, model, name, learning_rate):
@@ -153,11 +142,6 @@ class FrameworkOps:
             if factory is None:
                 raise ValueError(f"Unsupported Torch optimizer {name!r}")
             return factory(model.parameters(), lr=learning_rate)
-        if self.backend == "jax":
-            if name != "sgd":
-                raise ValueError("Owned functional JAX training requires SGD")
-            from splitfleet.runtime.functional_sgd import OwnedFunctionalSGD
-            return OwnedFunctionalSGD(model, learning_rate)
         if self.backend == "tf":
             from splitfleet.backends.utils import (
                 native_device_scope,
@@ -196,12 +180,6 @@ class FrameworkOps:
         if self.backend == "paddle":
             import paddle
             return paddle.device.cuda.device_count() if paddle.is_compiled_with_cuda() else 0
-        if self.backend == "jax":
-            import jax
-            try:
-                return len(jax.devices("gpu"))
-            except RuntimeError:
-                return 0
         raise ValueError(f'Unsupported native GPU backend {self.backend}')
 
     def admit_device(self, device):
@@ -221,8 +199,6 @@ class FrameworkOps:
         for name, value in self.native_state(model).items():
             if self.backend == "torch":
                 actual = (value.device.type, value.device.index or 0)
-            elif self.backend == "jax":
-                actual = ("cuda" if value.device.platform == "gpu" else value.device.platform, value.device.id)
             elif self.backend == "tf":
                 import tensorflow as tf
                 native = getattr(value, "value", value)
@@ -274,28 +250,19 @@ class FrameworkOps:
             import paddle
             value = paddle.device.cuda.max_memory_allocated(index)
         else:
-            # JAX's allocator exposes cumulative counters without a portable
-            # reset API; those are not a per-task peak-memory measurement.
             return None
         return value / 2**20
 
     def native_memory_receipt(self, device):
-        """Record public JAX allocator counters without calling them task peaks."""
-        platform, index = self._device(device)
-        if self.backend != "jax" or platform != "cuda":
-            return None
-        import jax
-        native = jax.devices("gpu")[index]
-        statistics = native.memory_stats()
-        return {
-            "scope": "worker process cumulative allocator counters; sampled before task-local model cleanup",
-            "device": str(native), "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES"),
-            "allocator": os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR", "default"),
-            "preallocate": os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE"),
-            "memory_fraction": os.environ.get("XLA_CLIENT_MEM_FRACTION", os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION")),
-            "public_memory_stats": {str(key): int(value) for key, value in (statistics or {}).items()},
-            "live_arrays_all_process_devices": len(jax.live_arrays()),
-        }
+        """Return optional backend allocator details for a worker receipt.
+
+        The virtual worker records this hook for every backend.  The current
+        backends do not expose a comparable allocator receipt, so they
+        deliberately return ``None`` while preserving the worker metrics
+        contract.
+        """
+        _ = device
+        return None
 
     @contextmanager
     def worker_resources(self, profile, *, mode):

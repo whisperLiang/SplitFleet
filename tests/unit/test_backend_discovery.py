@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import numpy as np
 
-from splitfleet.backends import BACKEND_ADAPTERS, BackendAdapterRegistry, JaxBackendAdapter
+from splitfleet.backends import BACKEND_ADAPTERS, BackendAdapterRegistry
 from splitfleet.backends.array_backends import ArrayBackendAdapter
 
 
@@ -30,7 +30,7 @@ def test_builtin_backend_discovery_has_install_hints():
     reports = {report.name: report for report in BACKEND_ADAPTERS.availability()}
     assert reports["torch"].available
     assert reports["tensorflow"].install_extra == reports["tf"].install_extra == "tensorflow"
-    assert set(reports) == {"torch", "tf", "tensorflow", "jax", "paddle"}
+    assert set(reports) == {"torch", "tf", "tensorflow", "paddle"}
 
 
 def test_factory_errors_are_not_misreported_as_unregistered_backend():
@@ -42,19 +42,6 @@ def test_factory_errors_are_not_misreported_as_unregistered_backend():
     registry.register("broken", broken_factory)
     with pytest.raises(KeyError, match="missing factory configuration"):
         registry.create("broken")
-
-
-@pytest.mark.parametrize("params", [{"weight": object()}, [object()]])
-def test_in_place_functional_update_keeps_jax_parameters(params):
-    adapter = JaxBackendAdapter()
-    adapter.bind_external_params(params)
-    original = params.copy()
-
-    # An update callback may mutate the synchronized tree and return that tree.
-    adapter.bind_external_params(params)
-
-    assert adapter.external_params is params
-    assert params == original
 
 
 @pytest.mark.parametrize("value", [

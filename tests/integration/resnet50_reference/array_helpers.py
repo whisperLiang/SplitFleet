@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import numpy as np
 
-from splitfleet.runtime.functional_sgd import OwnedFunctionalSGD
 from experiments.resnet50_quality.gate_torch import LEARNING_RATE
 from experiments.resnet50_quality.model_contract import NAMES, SCHEMA, TRAINABLE_NAMES
 
@@ -67,30 +66,6 @@ class RecordingOptimizer:
         return self.native.step()
 
 
-class RecordingFunctionalSGD(OwnedFunctionalSGD):
-    """Record the actual owned native JAX gradients before shared SGD commits."""
-
-    def __init__(self, model):
-        from .native import native_parameters
-        super().__init__(model, LEARNING_RATE)
-        self.backend = "jax"
-        self.parameters = native_parameters("jax", model)
-        self.gradients, self.recorded_steps = {}, 0
-
-    def _step(self, gradients):
-        from .native import numpy_value
-        unknown = set(gradients) - set(NAMES)
-        if unknown:
-            raise RuntimeError(f"Native functional SGD gradients have undeclared names: {sorted(unknown)}")
-        trainable = {name: value for name, value in gradients.items() if name in TRAINABLE_NAMES}
-        for name, gradient in trainable.items():
-            if name in self.gradients:
-                raise RuntimeError(f"Parameter received more than one native SGD update: {name}")
-            self.gradients[name] = canonical_array("jax", name, numpy_value(gradient))
-        self.recorded_steps += 1
-        return super()._step(trainable)
-
-
 class RecordingLoss:
     def __init__(self, backend="tensorflow"):
         self.backend = backend
@@ -104,10 +79,7 @@ class RecordingLoss:
         from splitfleet.tasks.losses import extract_logits, sparse_cross_entropy
         logits = extract_logits(output)
         loss = sparse_cross_entropy(logits, labels)
-        if self.backend == "jax":
-            import jax
-            jax.debug.callback(self._record, logits, loss, ordered=True)
-        elif self.backend == "tensorflow":
+        if self.backend == "tensorflow":
             import tensorflow as tf
             if tf.inside_function():
                 # Observe the actual differentiated invocation, rather than
@@ -127,29 +99,12 @@ class RecordingLoss:
         return loss
 
 
-def jax_device_proof(model, *inputs, device):
-    """Require all 320 native states and actual inputs on the requested device."""
-    import jax
-    requested = jax.devices("gpu" if device.startswith("cuda") else "cpu")[int(device.split(":")[-1]) if ":" in device else 0]
-    state = model.state_tensors()
-    if tuple(state) != NAMES:
-        raise RuntimeError("JAX device proof requires the complete canonical state")
-    leaves = jax.tree_util.tree_leaves(inputs)
-    if any(value.devices() != {requested} for value in (*state.values(), *leaves)):
-        raise RuntimeError("A JAX model state or actual input is outside the explicitly requested device")
-    return {"requested_device": str(requested), "platform": requested.platform,
-        "native_parameter_arrays": len(model.params), "native_buffer_arrays": len(model.buffers),
-        "state_devices": sorted({str(next(iter(value.devices()))) for value in state.values()}),
-        "input_devices": [str(next(iter(value.devices()))) for value in leaves],
-        "input_dtypes": [str(value.dtype) for value in leaves]}
-
-
 def stage_boundaries(handle, backend):
     """Select the actual residual endpoint by native address and shape."""
     endpoints = {}
     for stage, channels, spatial in ((1, 256, 16), (2, 512, 8), (3, 1024, 4)):
         expected = (spatial, spatial, channels) if backend == "tensorflow" else (channels, spatial, spatial)
-        operations = {"select_n"} if backend == "jax" else {"relu"}
+        operations = {"relu"}
         matches = [node for node in handle.runtime.trace_graph.nodes
                    if str(node.module_path or "").startswith(f"layer{stage}.")
                    and str(node.op_type).split(".")[-1].lower() in operations

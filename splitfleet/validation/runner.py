@@ -76,7 +76,6 @@ def run_matrix(
             "TF_NUM_INTRAOP_THREADS", "TF_NUM_INTEROP_THREADS",
         ):
             env[variable] = "1"
-        env.setdefault("JAX_PLATFORMS", "cpu")
         with tempfile.TemporaryDirectory(prefix=f"splitfleet-validation-{backend}-") as directory:
             output = Path(directory) / "report.json"
             command = [

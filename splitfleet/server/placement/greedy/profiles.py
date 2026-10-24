@@ -89,18 +89,9 @@ def graph_workload_features(provider):
         prefix = cumulative[prefix_end]
         suffix = total - prefix
         gradient_proxy = 0
-        resident = set(candidate.metadata.get("resident_parameter_labels") or ())
         for label in candidate.metadata["boundary_tensor_labels"]:
-            if label in resident:
-                continue
             node = by_id[label]
             differentiable = bool(node.requires_grad)
-            if getattr(candidate, "framework_backend", "") == "jax" and node.requires_grad is None:
-                # JAX VJP differentiates inexact inputs without a mutable
-                # requires_grad flag. Resident parameter gradients are consumed
-                # by suffix SGD and never travel back to the client.
-                name = _dtype_name(node.dtype)
-                differentiable = name == "bfloat16" or np.dtype(name).kind in "fc"
             if differentiable and isinstance(node.output_shape, tuple) and all(isinstance(v, int) for v in node.output_shape):
                 gradient_proxy += math.prod(node.output_shape) * _dtype_itemsize(node.dtype) / batch
         result[candidate.boundary] = {

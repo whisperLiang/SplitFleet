@@ -1,4 +1,4 @@
-"""Freeze, admit and execute the three backends on the three existing Orins."""
+"""Freeze, admit and execute the retained TensorFlow/Paddle backends on Orins."""
 
 from __future__ import annotations
 
@@ -13,19 +13,17 @@ import shutil
 import signal
 import socket
 import subprocess
-import sys
 import time
 
 from .common import BACKENDS, HOST_SUFFIXES, LOGICAL_CLIENTS, METHODS, file_hash, prepare, save_json, validate_methods
 from .status import campaign_process_alive
 
-SERVER_PYTHON = {"tensorflow": ".venv/bin/python", "jax": ".venv-jax-gpu/bin/python",
-                 "paddle": ".venv-paddle-gpu/bin/python"}
+SERVER_PYTHON = {"tensorflow": ".venv/bin/python", "paddle": ".venv-paddle-gpu/bin/python"}
 SERVER_DEVICES = {backend: "cuda:0" for backend in BACKENDS}
 ENVIRONMENT = {"OMP_NUM_THREADS": "2", "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "2",
                "TF_NUM_INTRAOP_THREADS": "2", "TF_NUM_INTEROP_THREADS": "1",
                "TF_CPP_MIN_LOG_LEVEL": "2", "TF_ENABLE_ONEDNN_OPTS": "0",
-               "TF_FORCE_GPU_ALLOW_GROWTH": "true", "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+               "TF_FORCE_GPU_ALLOW_GROWTH": "true",
                "NVIDIA_TF32_OVERRIDE": "0", "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
                "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1"}
 
@@ -39,10 +37,13 @@ def ssh(host, command, *, timeout=120, **kwargs):
                            shlex.join(command)], check=True, timeout=timeout, **kwargs)
 
 
-def prepare_campaign(root, *, methods=("splitfleet",), placement="greedy", **settings):
+def prepare_campaign(root, *, methods=("splitfleet",), placement="greedy",
+                     skip_training_admission=False, **settings):
     methods = validate_methods(methods)
     if placement not in {"greedy", "fixed_stage2"}:
         raise ValueError("Choose measured per-client Greedy or the explicit fixed-stage control")
+    if skip_training_admission and placement != "greedy":
+        raise ValueError("Direct training uses Greedy; fixed_stage2 requires native cut receipts")
     workspace = Path(__file__).resolve().parents[2]
     reference = workspace / "results/figure3_splitfleet_optimized_20261017/inputs/resnet50_pretrained.deployment.json"
     reference_deployment = json.loads(reference.read_text())
@@ -54,6 +55,7 @@ def prepare_campaign(root, *, methods=("splitfleet",), placement="greedy", **set
     protocol_path = root / "bundle" / "protocol.json"
     protocol = json.loads(protocol_path.read_text())
     protocol["placement_policy"] = placement
+    protocol["skip_training_admission"] = bool(skip_training_admission)
     save_json(protocol_path, protocol)
     snapshot = root / "runtime_snapshot"
     snapshot.mkdir()
@@ -89,17 +91,16 @@ def prepare_campaign(root, *, methods=("splitfleet",), placement="greedy", **set
                     "server": reference_deployment["server"], "hosts": reference_deployment["hosts"]},
                 "seed_count": 1, "method_order": methods,
                 "backend_runtime": {
-                    "jax": {"cpu_version": "0.6.2", "orin_gpu_version": "0.5.1", "orin_dependency_overlay": "/home/nvidia/SplitFleet/.jax-051-py311-20261022",
-                            "xla_gpu_autotune_level": 0, "orin_gpu_jit": False,
-                            "training_programs": "cached_native_jaxpr_eager_without_fusion",
-                            "cuda_libraries": "JetPack system libraries"},
                     "paddle": {"orin_version": "3.4.0.dev20260119", "orin_dependency_overlay": "/home/nvidia/SplitFleet/.paddle-jetson-py310-20261022",
                                "wheel_source": "https://github.com/SidaWang12/paddle3.0-jetson-jetpack6-build/releases/download/0.0.0/paddlepaddle_gpu-3.4.0.dev20260119-cp310-cp310-linux_aarch64.whl",
                                "coordinator_version": "3.3.1", "build_scope": "community JetPack build; native full/split training admission required"}},
                 "placement_policy": placement,
+                "skip_training_admission": bool(skip_training_admission),
                 "placement": ("SplitFleet measured Greedy; independent per-client operation cuts each round"
                               if placement == "greedy" else "fixed native residual stage2 control"),
-                "claim_scope": "backend training correctness and descriptive convergence; no cross-device speed ranking"}
+                "claim_scope": ("descriptive training and convergence; numerical admission skipped by user request"
+                                if skip_training_admission else
+                                "backend training correctness and descriptive convergence; no cross-device speed ranking")}
     save_json(root / "campaign.json", manifest)
     return manifest
 
@@ -145,8 +146,7 @@ def command(root, manifest, backend, role, *, output, method="splitfleet", host=
     base = host["root"] if remote else str(root / "runtime_snapshot")
     bundle = base + "/bundle" if remote else str(root / "bundle")
     if remote:
-        python = ("/home/nvidia/SplitFleet/.venv-real-device/bin/python" if backend in {"tensorflow", "paddle"}
-                  else "/home/nvidia/SplitFleet/.venv-backends-20261022/bin/python")
+        python = "/home/nvidia/SplitFleet/.venv-real-device/bin/python"
     else:
         python = str(Path(manifest["workspace"]) / SERVER_PYTHON[backend])
     environment = {**ENVIRONMENT, "PYTHONPATH": base + (":" + base + "/dependencies" if remote else "")}
@@ -156,21 +156,6 @@ def command(root, manifest, backend, role, *, output, method="splitfleet", host=
         environment.update(SPLITFLEET_CLIENT_ID=host["id"], SPLITFLEET_PHYSICAL_HOST=host["host_id"])
     elif "server" in manifest:
         environment.update(SPLITFLEET_CLIENT_ID="server", SPLITFLEET_PHYSICAL_HOST=manifest["server"]["host"])
-    if backend == "jax":
-        # The GPU is mandatory, while native debug callbacks also need a
-        # host CPU device. Model/input state placement is checked separately.
-        environment["JAX_PLATFORMS"] = "cpu" if device == "cpu" else "cuda,cpu"
-        if remote and device.startswith("cuda"):
-            environment["PYTHONPATH"] += ":/home/nvidia/SplitFleet/.jax-051-py311-20261022"
-            # Native eager execution passes the fixed gradient gate on the
-            # JetPack build; compiled JAX 0.5.1 replay exceeds that tolerance.
-            environment["JAX_DISABLE_JIT"] = "1"
-        # Wheel autotuning helper kernels omit Orin sm_87. Keep deterministic
-        # operators and native JetPack cuDNN, with autotuning disabled.
-        environment["XLA_FLAGS"] = "--xla_gpu_autotune_level=0"
-        if remote:
-            environment["LD_LIBRARY_PATH"] = "/usr/local/cuda/lib64:/usr/lib/aarch64-linux-gnu"
-            environment["PATH"] = "/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin"
     if backend == "paddle" and remote:
         environment["PYTHONPATH"] += ":/home/nvidia/SplitFleet/.paddle-jetson-py310-20261022"
         environment["LD_LIBRARY_PATH"] = "/usr/local/cuda/lib64:/usr/lib/aarch64-linux-gnu"
@@ -180,9 +165,11 @@ def command(root, manifest, backend, role, *, output, method="splitfleet", host=
     if remote:
         args += ["--index", str(host["index"]), "--identity", host["id"], "--physical-host", host["host_id"]]
     if role != "admit":
-        admission = (base + "/admission/" + backend + "_" + host["id"] + ".json" if remote else
-                     str(root / "admission" / backend / "server.json"))
-        args += ["--admission", admission, "--address", address]
+        if not manifest.get("skip_training_admission", False):
+            admission = (base + "/admission/" + backend + "_" + host["id"] + ".json" if remote else
+                         str(root / "admission" / backend / "server.json"))
+            args += ["--admission", admission]
+        args += ["--address", address]
     args = ["env", *(key + "=" + value for key, value in environment.items()), *args]
     if remote:
         return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
@@ -290,7 +277,8 @@ def run_method(root, manifest, backend, method):
             output = host["root"] + f"/{backend}_{method}_{host['id']}.json"
             subprocess.run(["rsync", "-a", host["ssh"] + ":" + output,
                             str(directory / (host["id"] + ".json"))], check=True, timeout=120)
-        if manifest.get("placement_policy") == "greedy" and method == "splitfleet":
+        if (manifest.get("placement_policy") == "greedy" and method == "splitfleet"
+                and not manifest.get("skip_training_admission", False)):
             for host in manifest["hosts"]:
                 destination = directory / "selected_admission" / host["id"]
                 destination.mkdir(parents=True, exist_ok=True)
@@ -355,9 +343,18 @@ def execute(root, backends):
         stage(root, manifest)
         for backend in backends:
             try:
-                status["backends"][backend] = {"phase": "native_admission"}
+                status["backends"][backend] = {"phase": "training_setup"}
                 save_json(root / "status.json", status)
-                admissions(root, manifest, backend)
+                if manifest.get("skip_training_admission", False):
+                    (root / "admission" / backend).mkdir(parents=True, exist_ok=True)
+                    save_json(root / "admission" / backend / "summary.json", {
+                        "status": "skipped_by_user_request", "performed": False,
+                        "scope": ["base_native", "cold_shape", "selected_cut"],
+                        "per_round_validation_evaluation": True})
+                else:
+                    status["backends"][backend] = {"phase": "native_admission"}
+                    save_json(root / "status.json", status)
+                    admissions(root, manifest, backend)
                 for method in methods:
                     status["backends"][backend] = {"phase": method}
                     save_json(root / "status.json", status)
@@ -477,6 +474,8 @@ def main():
                    help="Methods to execute; defaults to SplitFleet only")
     p.add_argument("--placement", choices=("greedy", "fixed_stage2"), default="greedy",
                    help="SplitFleet measured per-client placement; fixed_stage2 is an explicit control")
+    p.add_argument("--skip-training-admission", action="store_true",
+                   help="Skip native/selected-cut numerical checks; retain per-round validation-set evaluation")
     p = sub.add_parser("execute")
     p.add_argument("--root", type=Path, required=True)
     p.add_argument("--backends", choices=BACKENDS, nargs="+", default=list(BACKENDS))

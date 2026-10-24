@@ -45,8 +45,8 @@ def payload_bytes_from_plan(
 
     ABI shapes collapse expressions such as ``B * 10`` to ``B``. The shape
     program retains those expressions, and boundary bindings resolve container
-    keys to the graph values used by that program. Exclusions must be audited
-    resident roots from the explicitly negotiated functional state transport.
+    keys to the graph values used by that program. Exclusions are reserved for
+    callers that have separately audited the corresponding boundary contract.
     """
     program = runtime.trace_graph.shape_program
     if program is None:

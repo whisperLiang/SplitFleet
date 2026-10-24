@@ -148,10 +148,7 @@ def initialize_ray(config, ray, ops=None):
                 "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                 "TF_NUM_INTRAOP_THREADS", "TF_NUM_INTEROP_THREADS",
                 "TF_ENABLE_ONEDNN_OPTS", "TF_FORCE_GPU_ALLOW_GROWTH",
-                "JAX_PLATFORMS", "JAX_DEFAULT_MATMUL_PRECISION",
-                "XLA_PYTHON_CLIENT_PREALLOCATE", "XLA_PYTHON_CLIENT_ALLOCATOR",
-                "XLA_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_MEM_FRACTION", "CACHELEVEL",
-                "XLA_FLAGS", "PYTHONFAULTHANDLER",
+                "CACHELEVEL", "PYTHONFAULTHANDLER",
             ) if name in os.environ},
         }}
         if ops.backend == "paddle" or (
@@ -461,7 +458,6 @@ def run_virtual(config: VirtualConfig, spec: TrainingSpec, *, output: str | Path
                 }
                 if spec.candidate_provider_factory is None:
                     provider_kwargs["require_trainable_prefix"] = True
-                    provider_kwargs["resident_parameter_transport"] = ops.backend == "jax" and config.optimizer == "sgd"
                 provider = (
                     spec.candidate_provider_factory or TorchLensCandidateProvider
                 )(**provider_kwargs)

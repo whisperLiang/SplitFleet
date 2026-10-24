@@ -9,7 +9,6 @@ installed TorchLens and framework globals untouched.
 
 from __future__ import annotations
 
-import builtins
 import hashlib
 import importlib
 import types
@@ -209,62 +208,3 @@ def prepare_auxiliary_runtime(model, inputs, request, *, input_kwargs=None):
 
         runtime = bind_native_frontier(runtime)
     return runtime
-
-
-def train_jax_suffix_with_auxiliary(runtime, boundary, targets, *, loss_fn, optimizer=None):
-    if optimizer is None and getattr(runtime.model, '_splitfleet_jax_training_program_cache', False):
-        from splitfleet.runtime.jax_training_program import train_suffix
-        return train_suffix(runtime, boundary, targets, loss_fn=loss_fn,
-                            native=_train_jax_suffix_with_auxiliary)
-    return _train_jax_suffix_with_auxiliary(runtime, boundary, targets,
-                                          loss_fn=loss_fn, optimizer=optimizer)
-
-
-def _train_jax_suffix_with_auxiliary(runtime, boundary, targets, *, loss_fn, optimizer=None):
-    """Run the pinned native JAX trainer with a private has_aux transform binding."""
-    import jax
-    from splitfleet.autosplit.torchlens_runtime import require_torchlens_version
-
-    require_torchlens_version()
-    training = importlib.import_module("torchlens.split.training")
-    captured = []
-
-    def auxiliary_loss(output, target):
-        restored = restore_auxiliary_output(runtime.trace_graph, output)
-        return loss_fn(restored, target), restored["batch_statistics"]
-
-    class JaxWithAuxiliary:
-        def __getattr__(self, name):
-            return getattr(jax, name)
-
-        @staticmethod
-        def value_and_grad(function, *args, **kwargs):
-            if kwargs.get("has_aux"):
-                raise RuntimeError("Pinned native JAX trainer unexpectedly already uses has_aux")
-            differentiated = jax.value_and_grad(function, *args, **dict(kwargs, has_aux=True))
-
-            def evaluate(*values, **options):
-                (loss, auxiliary), gradients = differentiated(*values, **options)
-                captured.append(auxiliary)
-                return loss, gradients
-
-            return evaluate
-
-    native_import = builtins.__import__
-    facade = JaxWithAuxiliary()
-
-    def scoped_import(name, *args, **kwargs):
-        return facade if name == "jax" else native_import(name, *args, **kwargs)
-
-    native = _clone(training._train_suffix_jax,
-                    __builtins__=dict(vars(builtins), __import__=scoped_import))
-    loss, gradients, _ = native(runtime, boundary, targets, loss_fn=auxiliary_loss, optimizer=optimizer)
-    if captured:
-        if len(captured) != 1:
-            raise RuntimeError("Native JAX suffix differentiation evaluated multiple forwards")
-        auxiliary = captured[0]
-    else:
-        # The native trainer directly calls suffix_loss when it has no
-        # differentiable roots. That result still comes from its sole replay.
-        loss, auxiliary = loss
-    return (loss, gradients), auxiliary

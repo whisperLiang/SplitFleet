@@ -98,7 +98,7 @@ def freeze_runtime(workspace: Path, root: Path) -> tuple[Path, dict]:
               for path in sorted(runtime.rglob("*.py"))}
     packages = {}
     for package in ("torch", "torchvision", "torchlens", "flwr", "numpy", "rfdetr",
-                    "tensorflow", "jax", "paddlepaddle", "timm", "transformers"):
+                    "tensorflow", "paddlepaddle", "timm", "transformers"):
         try:
             packages[package] = metadata.version(package)
         except metadata.PackageNotFoundError:

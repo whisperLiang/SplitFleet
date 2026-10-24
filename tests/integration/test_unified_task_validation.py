@@ -17,7 +17,7 @@ from splitfleet.validation import TASKS
 pytestmark = pytest.mark.integration
 
 
-@pytest.fixture(scope="module", params=["torch", "jax"])
+@pytest.fixture(scope="module", params=["torch"])
 def matrix_report(request, tmp_path_factory):
     backend = request.param
     if importlib.util.find_spec(backend) is None:

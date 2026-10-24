@@ -50,12 +50,9 @@ integration = [
 ]
 
 tensorflow = ["tensorflow>=2.16"]
-jax = ["jax>=0.4.30", "optax>=0.2.3"]
 paddle = ["paddlepaddle>=3.0"]
 multibackend = [
     "tensorflow>=2.16",
-    "jax>=0.4.30",
-    "optax>=0.2.3",
     "paddlepaddle>=3.0",
 ]
 

@@ -1,16 +1,13 @@
-from functools import partial
 from subprocess import CompletedProcess
 from types import SimpleNamespace
 
 import pytest
 
 from tests.integration import torchlens_real_model_helpers as helpers
-from tests.integration import test_resnet18_all_backends_all_nodes as resnet_helpers
 
 
 @pytest.mark.parametrize("runner,child_env,failure_type", [
     (helpers.run_real_model_test_isolated, "SPLITFLEET_REAL_MODEL_CHILD", pytest.fail.Exception),
-    (partial(resnet_helpers._run_isolated, backend="torch"), resnet_helpers.CHILD_ENV, AssertionError),
 ])
 @pytest.mark.parametrize("child_output,returncode", [
     ("s [100%]\n1 skipped in 0.01s\n", 0),

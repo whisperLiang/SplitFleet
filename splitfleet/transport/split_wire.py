@@ -18,7 +18,6 @@ if TYPE_CHECKING:
 REPLAY_METADATA_KEYS = (
     "runtime_batch_size", "shape_program_hash", "batch_symbol", "profile_hash",
     "device_policy",
-    "resident_state_contract",
 )
 
 
@@ -44,8 +43,6 @@ def boundary_to_envelope(
     canonical_graph_hash: str,
     boundary_schema_hash: str,
     model_version: int,
-    resident_tensor_ids: set[str] | None = None,
-    resident_state_contract: str | None = None,
 ) -> BoundaryEnvelope:
     try:
         backend = str(payload.metadata["backend"])
@@ -54,14 +51,9 @@ def boundary_to_envelope(
     if payload.batch_size is None:
         raise ValueError("Boundary payload is missing its batch size.")
     adapter = BACKEND_ADAPTERS.create(backend)
-    omitted = set(resident_tensor_ids or ())
-    if omitted and (backend != "jax" or not resident_state_contract or not omitted.issubset(payload.tensors)):
-        raise ValueError("Invalid resident parameter transfer contract")
     metadata = replay_metadata(payload.metadata)
-    if resident_state_contract is not None:
-        metadata["resident_state_contract"] = resident_state_contract
     return BoundaryEnvelope(
-        tensors=tuple(adapter.encode_tensor(name, value) for name, value in payload.tensors.items() if name not in omitted),
+        tensors=tuple(adapter.encode_tensor(name, value) for name, value in payload.tensors.items()),
         engine="torchlens",
         backend=backend,
         round_id=round_id,

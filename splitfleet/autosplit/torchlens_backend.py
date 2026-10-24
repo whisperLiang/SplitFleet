@@ -47,7 +47,6 @@ from splitfleet.runtime.auxiliary_state import (
     prepare_auxiliary_runtime,
     restore_auxiliary_output,
     supports_auxiliary_state,
-    train_jax_suffix_with_auxiliary,
 )
 from splitfleet.runtime.torch_suffix_training import TorchReplicaRNG, train_torch_suffix
 
@@ -513,7 +512,7 @@ class TorchLensSplitBackend:
         observed = []
 
         original_loss = loss_fn
-        if auxiliary and self.framework_backend != "jax":
+        if auxiliary:
             def collect_loss(output, target):
                 restored = restore_auxiliary_output(runtime.trace_graph, output)
                 observed.append(restored['batch_statistics'])
@@ -534,12 +533,7 @@ class TorchLensSplitBackend:
             )
         else:
             started = time.perf_counter_ns() if measurements is not None else None
-            if auxiliary and self.framework_backend == "jax":
-                result, statistics = train_jax_suffix_with_auxiliary(
-                    runtime, native, targets, loss_fn=loss_fn, optimizer=optimizer,
-                )
-                observed.append(statistics)
-            elif self.framework_backend in {"tf", "tensorflow"} and getattr(
+            if self.framework_backend in {"tf", "tensorflow"} and getattr(
                 self._ensure_model(), "_splitfleet_tensorflow_function_forward", False
             ):
                 from splitfleet.runtime.tensorflow_forward import train_tensorflow_function_suffix
@@ -581,10 +575,6 @@ class TorchLensSplitBackend:
         if device is not None:
             native = native.to(device)
             boundary_grads = _move_to_device(boundary_grads, device)
-        if (self.framework_backend == 'jax' and optimizer is None
-                and getattr(self._ensure_model(), '_splitfleet_jax_training_program_cache', False)):
-            from splitfleet.runtime.jax_training_program import backward_prefix
-            return backward_prefix(runtime, native, boundary_grads)
         return runtime.backward_prefix(native, boundary_grads=boundary_grads, optimizer=optimizer)
 
     def make_plan(self) -> SplitRuntimePlan:

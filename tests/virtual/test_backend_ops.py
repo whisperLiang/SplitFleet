@@ -13,7 +13,6 @@ import textwrap
 import numpy as np
 import pytest
 
-from splitfleet.tasks.base import ModelInputs, TaskBatch
 from splitfleet.virtual.backend_ops import FrameworkOps
 
 
@@ -45,7 +44,7 @@ def test_torch_hash_optimizer_and_checkpoint_keep_existing_runtime_contract(tmp_
 
 
 def test_array_host_rng_is_restored_and_does_not_claim_native_rng_state():
-    ops = FrameworkOps("jax")
+    ops = FrameworkOps("torch")
     previous = ops.capture_rng()
     with ops.rng_scope(seed=233):
         expected = random.random(), np.random.random()
@@ -56,15 +55,15 @@ def test_array_host_rng_is_restored_and_does_not_claim_native_rng_state():
         assert (random.random(), np.random.random()) == continuation
     with ops.rng_scope(seed=233):
         assert (random.random(), np.random.random()) == expected
-    assert "host RNG" in ops.rng_scope_description
+    assert "RNG" in ops.rng_scope_description
 
 
-@pytest.mark.parametrize("backend", ["tf", "paddle", "jax"])
+@pytest.mark.parametrize("backend", ["tf", "paddle"])
 def test_native_array_checkpoint_counter_and_device_contract(backend, tmp_path, request):
     # Keep optional framework native libraries in independent processes.
     if os.environ.get("SPLITFLEET_BACKEND_OPS_CHILD") != backend:
         environment = dict(os.environ, SPLITFLEET_BACKEND_OPS_CHILD=backend,
-                           PYTHONDONTWRITEBYTECODE="1", CUDA_VISIBLE_DEVICES="-1", JAX_PLATFORMS="cpu",
+                           PYTHONDONTWRITEBYTECODE="1", CUDA_VISIBLE_DEVICES="-1",
                            OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1",
                            TF_NUM_INTRAOP_THREADS="1", TF_NUM_INTEROP_THREADS="1")
         result = subprocess.run([sys.executable, "-B", "-m", "pytest", request.node.nodeid,
@@ -94,24 +93,6 @@ def test_native_array_checkpoint_counter_and_device_contract(backend, tmp_path, 
                 self.weight = self.create_parameter(shape=(4, 2), dtype="float32")
                 self.register_buffer("counter", paddle.to_tensor(np.asarray(0, np.int64)))
 
-    else:
-        jax = pytest.importorskip("jax")
-        jax.config.update("jax_enable_x64", True)
-
-        class Model:
-            def __init__(self):
-                self.params = {"weight": jax.numpy.ones((4, 2), dtype=jax.numpy.float32)}
-                self.counter = jax.numpy.asarray(0, dtype=jax.numpy.int64)
-
-            def state_tensors(self):
-                return {**self.params, "counter": self.counter}
-
-            def load_state(self, values):
-                self.params.update(weight=jax.numpy.asarray(values["weight"]))
-                self.counter = jax.numpy.asarray(values["counter"])
-
-            def set_params(self, params):
-                self.params.update(params)
 
     ops = FrameworkOps(backend)
     model = ops.build_model(Model, "cpu")
@@ -132,19 +113,9 @@ def test_native_array_checkpoint_counter_and_device_contract(backend, tmp_path, 
     assert ops.state_hash(model) == before_hash
     assert ops.export_arrays(model)[-1].item() == 2**60 + 3
     assert ops.export_arrays(model)[0].shape == ((3, 3, 2, 4) if backend == "tf" else (4, 2))
-    if backend == "jax":
-        from splitfleet.runtime.functional_sgd import OwnedFunctionalSGD
-        optimizer = ops.optimizer(model, "sgd", .05)
-        assert isinstance(optimizer, OwnedFunctionalSGD)
-        inputs = jax.numpy.ones((3, 4), dtype=jax.numpy.float32)
-        batch = ops.prepare_batch(model, TaskBatch(ModelInputs((None, inputs)), jax.numpy.zeros(3), 3), "cpu")
-        bound = batch.inputs.args[0]
-        optimizer._step({"weight": jax.numpy.ones((4, 2), dtype=jax.numpy.float32)})
-        assert model.params is bound and ops.trainable_names(model) == {"weight"}
-        np.testing.assert_allclose(np.asarray(bound["weight"]), .95, atol=1e-7)
 
 
-@pytest.mark.parametrize("backend", ["tensorflow", "paddle", "jax"])
+@pytest.mark.parametrize("backend", ["tensorflow", "paddle"])
 def test_other_backends_are_rejected_before_experiment_preparation(quality_inputs, backend):
     from experiments.resnet50_quality.run import make_config
     with pytest.raises(ValueError, match=f"Unknown native backend {backend!r}"):
@@ -153,7 +124,7 @@ def test_other_backends_are_rejected_before_experiment_preparation(quality_input
                     data_root=quality_inputs.data_root, backend=backend)
 
 
-@pytest.mark.parametrize("backend", ["torch", "jax", "paddle"])
+@pytest.mark.parametrize("backend", ["torch", "paddle"])
 def test_native_ray_processes_isolate_unused_tensorflow_before_native_import(backend):
     script = textwrap.dedent("""
         import os
@@ -191,11 +162,6 @@ def test_native_ray_processes_isolate_unused_tensorflow_before_native_import(bac
                     loss = (x * x).sum()
                     loss.backward()
                     gradients = x.grad.numpy().tolist()
-                else:
-                    import jax
-                    x = jax.numpy.asarray([1., 2., 3.])
-                    loss, gradient = jax.value_and_grad(lambda value: (value * value).sum())(x)
-                    gradients = gradient.tolist()
                 assert gradients == [2., 4., 6.]
                 return os.getpid(), float(loss)
         try:
@@ -208,7 +174,7 @@ def test_native_ray_processes_isolate_unused_tensorflow_before_native_import(bac
             ray.shutdown()
     """)
     environment = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", CUDA_VISIBLE_DEVICES="-1",
-                       OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", JAX_PLATFORMS="cpu")
+                       OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1")
     result = subprocess.run([sys.executable, "-u", "-B", "-c", script, backend],
                             cwd=Path(__file__).resolve().parents[2], env=environment,
                             capture_output=True, text=True, timeout=120)

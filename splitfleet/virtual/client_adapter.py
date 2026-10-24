@@ -191,7 +191,7 @@ class VirtualClientAdapter(NumPyClient):
             return {"splitfleet_probe_payload": payload if reply_size == len(payload) else bytes(reply_size)}
         runtime = self.factory.config
         properties = {
-            PLACEMENT_CALIBRATION_HASH_HANDSHAKE_KEY: self.ops.backend in {'torch', 'tf', 'paddle', 'jax'},
+            PLACEMENT_CALIBRATION_HASH_HANDSHAKE_KEY: self.ops.backend in {'torch', 'tf', 'paddle'},
             "logical_client_id": self.state["logical_client_id"],
             "virtual_partition_id": self.partition_id,
             "partition_hash": self.state["partition_hash"],

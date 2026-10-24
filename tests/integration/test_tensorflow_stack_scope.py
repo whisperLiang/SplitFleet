@@ -6,7 +6,7 @@ import weakref
 from tests.integration.test_torchlens_optional_frameworks import _run_isolated
 
 
-def test_native_function_padding_retains_dynamic_code_until_trace_is_frozen(request):
+def test_native_function_call_retains_dynamic_code_until_trace_is_frozen(request):
     if _run_isolated(request, extra_env={"CUDA_VISIBLE_DEVICES": ""}):
         return
     from tensorflow.python.util import _tf_stack
@@ -33,7 +33,7 @@ def test_native_function_padding_retains_dynamic_code_until_trace_is_frozen(requ
                for frame in frames)
 
 
-def test_native_function_padding_preserves_single_invocation_and_result_identity():
+def test_native_function_call_preserves_single_invocation_and_result_identity():
     from splitfleet.runtime.tensorflow_stack_scope import call_tensorflow_function
 
     calls, value = [], object()

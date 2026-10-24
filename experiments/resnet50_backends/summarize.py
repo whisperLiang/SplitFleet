@@ -1,4 +1,4 @@
-"""Plot only complete, physically admitted experiments for requested methods."""
+"""Plot complete physical training and report its numerical admission status."""
 
 from __future__ import annotations
 
@@ -8,11 +8,9 @@ import hashlib
 import json
 from pathlib import Path
 
-import numpy as np
-
 from experiments.resnet50_quality.convergence import convergence_metrics
 from .common import (BACKENDS, METHODS, client_identities, file_hash, save_json,
-                     training_batch_sizes, validate_methods, validate_round_budget)
+                     training_admission_enabled, training_batch_sizes, validate_methods, validate_round_budget)
 
 
 def validate_selected_admission(directory, identity, boundary, protocol):
@@ -45,9 +43,10 @@ def validate_placement_round(path, row, protocol):
                 or decision["boundary"] != metrics.get("boundary")
                 or metrics.get("placement_policy") != "greedy"):
             raise ValueError("Executed cuts must match the independent measured Greedy decisions")
-        validate_selected_admission(path / "selected_admission" / spec["host_id"],
-                                    spec["id"], decision["boundary"], protocol)
-        validate_selected_admission(path / "selected_admission", "server", decision["boundary"], protocol)
+        if training_admission_enabled(protocol):
+            validate_selected_admission(path / "selected_admission" / spec["host_id"],
+                                        spec["id"], decision["boundary"], protocol)
+            validate_selected_admission(path / "selected_admission", "server", decision["boundary"], protocol)
 
 
 def read_methods(root, backend, methods):
@@ -56,7 +55,7 @@ def read_methods(root, backend, methods):
     runs = {}
     identities = client_identities(protocol)
     count = protocol.get("clients", len(identities))
-    for name in ("server", *identities):
+    for name in (("server", *identities) if training_admission_enabled(protocol) else ()):
         receipt = json.loads((root / "admission" / backend / (name + ".json")).read_text())
         cuts = receipt.get("cuts", [])
         if (receipt.get("status") != "passed" or {row.get("stage") for row in cuts} != {1, 2, 3}
@@ -137,7 +136,9 @@ def summarize(root, backends=BACKENDS, *, output=None, methods=None):
                            if protocol["formal"] else {"converged": None, "reason": "smoke budget; convergence not assessed"})
             values[method] = {"convergence": convergence, "final_validation_top1": rows[-1]["val_top1"],
                               "test": run["test"], "duration_sec": run["duration_sec"]}
-        summary[backend] = {"numerical_admission": f"passed on coordinator and all {protocol.get('clients', 3)} logical Orin clients",
+        summary[backend] = {"numerical_admission": (
+                                f"passed on coordinator and all {protocol.get('clients', 3)} logical Orin clients"
+                                if training_admission_enabled(protocol) else "skipped_by_user_request"),
                             "complete_requested_training": True,
                             "complete_paired_training": paired, "methods": values}
         if paired:
@@ -156,7 +157,9 @@ def summarize(root, backends=BACKENDS, *, output=None, methods=None):
               "training_source_identity": manifest["source_identity"], "requested_methods": methods,
               "requested_backends": requested, "excluded_backends": excluded,
               "all_requested_backends_completed": set(requested) == set(backends),
-              "seed_count": 1, "scope": "descriptive curves plus native numerical admission and complete physical training budgets",
+              "seed_count": 1, "scope": ("descriptive curves and complete physical training budgets; numerical admission skipped"
+                  if not training_admission_enabled(protocol) else
+                  "descriptive curves plus native numerical admission and complete physical training budgets"),
               "placement_policy": manifest.get("placement_policy", "fixed_stage2"),
               "limitations": ("One seed; " + manifest.get("placement", "fixed stage2 training cut")
                   + "; backend native versions differ; no cross-backend speed ranking or statistical equivalence claim")})

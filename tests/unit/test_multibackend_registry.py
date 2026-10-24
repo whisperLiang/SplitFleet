@@ -4,12 +4,12 @@ import numpy as np
 import pytest
 
 from splitfleet.backends import BACKEND_ADAPTERS
-from splitfleet.backends.utils import adapter_for, detect_torchlens_backend, move_value
+from splitfleet.backends.utils import detect_torchlens_backend, move_value
 
 
 @pytest.mark.parametrize(
     "name,canonical",
-    [("tf", "tf"), ("tensorflow", "tf"), ("jax", "jax"), ("paddle", "paddle")],
+    [("tf", "tf"), ("tensorflow", "tf"), ("paddle", "paddle")],
 )
 def test_optional_backend_adapters_are_registered_lazily(name: str, canonical: str) -> None:
     assert BACKEND_ADAPTERS.create(name).backend_name == canonical
@@ -17,7 +17,7 @@ def test_optional_backend_adapters_are_registered_lazily(name: str, canonical: s
 
 @pytest.mark.parametrize(
     "module,expected",
-    [("tensorflow.python", "tf"), ("jaxlib.xla_extension", "jax"), ("paddle.nn", "paddle")],
+    [("tensorflow.python", "tf"), ("paddle.nn", "paddle")],
 )
 def test_torchlens_backend_detection_does_not_import_optional_frameworks(module: str, expected: str) -> None:
     model_type = type("Model", (), {"__module__": module})
@@ -79,38 +79,3 @@ def test_tensorflow_training_mode_reaches_keras_layers() -> None:
 
     np.testing.assert_array_equal(evaluation.numpy(), np.ones((8, 64), dtype=np.float32))
     assert not np.array_equal(training.numpy(), evaluation.numpy())
-
-
-def test_functional_jax_params_are_exported_and_loaded() -> None:
-    jax = pytest.importorskip("jax")
-    jnp = pytest.importorskip("jax.numpy")
-    params = {"weight": jnp.ones((2, 2)), "bias": jnp.zeros((2,))}
-
-    def model(parameters, inputs):
-        return inputs @ parameters["weight"] + parameters["bias"]
-
-    adapter = adapter_for(model, (params, jnp.ones((1, 2))))
-    state = adapter.export_ndarrays(model)
-    replacement = [np.full_like(value, index + 3) for index, value in enumerate(state)]
-
-    adapter.load_ndarrays(model, replacement)
-
-    assert adapter.has_external_params
-    assert adapter.external_params is params
-    for actual, expected in zip(adapter.export_ndarrays(model), replacement):
-        np.testing.assert_array_equal(actual, expected)
-
-
-def test_move_numpy_value_to_jax_named_device() -> None:
-    jax = pytest.importorskip("jax")
-    jnp = pytest.importorskip("jax.numpy")
-    params = {"weight": jnp.ones((1,))}
-
-    def model(parameters, inputs):
-        return inputs * parameters["weight"]
-
-    adapter = adapter_for(model, (params, jnp.ones((1,))))
-    result = move_value(np.ones((2,), dtype=np.float32), adapter, "cpu")
-
-    assert result.device.platform == "cpu"
-    np.testing.assert_array_equal(np.asarray(result), np.ones((2,), dtype=np.float32))

@@ -131,9 +131,6 @@ def _synchronize_prefix_device(backend_name: str, device: str, values=None) -> N
         import torch
 
         torch.cuda.synchronize(device)
-    elif backend_name == 'jax' and values is not None:
-        import jax
-        jax.block_until_ready(values)
 
 
 def _transport_phase_ms(
@@ -311,7 +308,6 @@ class AutoSplitSplitLearningClient(NumPyClient):
         batch_adapter: Callable[[Any], tuple[Any, Any]] | None = None,
         task: TaskAdapter | None = None,
         optimizer_fn=None,
-        functional_update_fn: Callable[[Any, Any], Any] | None = None,
         autosplit_session: AutoSplitSession | None = None,
         device: str = "cpu",
         partial_batch_policy: str = "error",
@@ -347,7 +343,6 @@ class AutoSplitSplitLearningClient(NumPyClient):
         self.online_calibration_receipt = None
         self.batch_adapter = batch_adapter
         self.optimizer_fn = optimizer_fn
-        self.functional_update_fn = functional_update_fn
         self.autosplit_session = autosplit_session or AutoSplitSession(device=device)
         self.device = device
         self.partial_batch_policy = partial_batch_policy
@@ -414,7 +409,6 @@ class AutoSplitSplitLearningClient(NumPyClient):
         if len(self._context_store):
             raise RuntimeError("A completed execution retains an unconsumed prefix context")
         self.server_model_proxy = None
-        self._owned_functional_optimizer = None
         self.online_calibration_receipt = None
         self._round_config = {}
         self.train_data = self.evaluate_data = ()
@@ -637,7 +631,7 @@ class AutoSplitSplitLearningClient(NumPyClient):
                     raise ValueError("Provide a representative TaskBatch for Greedy calibration")
                 self.calibrate_runtime(self._calibration_targets, boundaries=boundaries)
         properties = {
-            PLACEMENT_CALIBRATION_HASH_HANDSHAKE_KEY: self.backend_adapter.backend_name in {'torch', 'tf', 'paddle', 'jax'},
+            PLACEMENT_CALIBRATION_HASH_HANDSHAKE_KEY: self.backend_adapter.backend_name in {'torch', 'tf', 'paddle'},
             "logical_client_id": f"{platform.node()}:{self.device}:{id(self)}",
             "framework_backend": self.backend_adapter.backend_name,
             "runtime_backend": "torchlens_native",
@@ -683,20 +677,6 @@ class AutoSplitSplitLearningClient(NumPyClient):
             )
             schema = self.backend_adapter.state_manifest(self.model).schema_hash
             auxiliary_ownership = read_ownership(config, runtime_handle, schema) or state_ownership(runtime_handle, schema)
-        resident_bindings, residency_contract = {}, None
-        functional_optimizer = getattr(self, "_owned_functional_optimizer", None)
-        if functional_optimizer is not None:
-            from splitfleet.autosplit.state_ownership import read_ownership
-            from splitfleet.runtime.functional_sgd import (
-                resident_contract,
-                resident_parameter_bindings,
-            )
-            ownership = read_ownership(config, runtime_handle, self.backend_adapter.state_manifest(self.model).schema_hash)
-            if ownership is None:
-                raise RuntimeError("Stage-owned functional SGD requires an ownership contract")
-            functional_optimizer.ownership = ownership
-            resident_bindings = resident_parameter_bindings(runtime_handle, ownership)
-            residency_contract = resident_contract(runtime_handle, ownership, resident_bindings)
         telemetry = _RoundTelemetry()
         round_id = int(config.get(AUTOSPLIT_MODEL_VERSION_CONFIG_KEY, 0))
         # Physical Flower dispatch consumes the hidden ID while binding the
@@ -746,8 +726,6 @@ class AutoSplitSplitLearningClient(NumPyClient):
                 canonical_graph_hash=contract.canonical_graph_hash,
                 boundary_schema_hash=contract.boundary_schema_hash,
                 model_version=round_id,
-                resident_tensor_ids=set(resident_bindings),
-                resident_state_contract=residency_contract,
             )
             telemetry.boundary_serialize_sec += time.perf_counter() - serialize_started
             response = self._call_tail(
@@ -784,16 +762,6 @@ class AutoSplitSplitLearningClient(NumPyClient):
             backward_sec = time.perf_counter() - backward_started
             telemetry.prefix_compute_sec += backward_sec
             telemetry.record_component("client_backward", backward_sec * 1000.0)
-            if self.backend_adapter.backend_name == "jax" and self.functional_update_fn is not None:
-                update_target = (
-                    self.backend_adapter.external_params
-                    if self.backend_adapter.has_external_params
-                    else self.model
-                )
-                updated = self.functional_update_fn(update_target, prefix_result)
-                if self.backend_adapter.has_external_params and updated is not None:
-                    self.backend_adapter.bind_external_params(updated)
-
             if "auxiliary_state" in response:
                 from splitfleet.runtime.auxiliary_state import commit_auxiliary_state
                 from splitfleet.runtime.owned_auxiliary_state import (
@@ -1204,20 +1172,8 @@ class AutoSplitSplitLearningClient(NumPyClient):
         return metadata
 
     def _build_optimizer(self):
-        self._owned_functional_optimizer = None
         if self.optimizer_fn is not None:
-            value = self.optimizer_fn(self.model)
-            if self.backend_adapter.backend_name == "jax":
-                from splitfleet.runtime.functional_sgd import OwnedFunctionalSGD
-                if isinstance(value, OwnedFunctionalSGD):
-                    self._owned_functional_optimizer = value
-                    self.functional_update_fn = value.prefix_update
-                    return None
-            return value
-        if self.backend_adapter.backend_name == "jax":
-            if self.functional_update_fn is None:
-                raise ValueError("JAX split training requires an explicit functional_update_fn.")
-            return None
+            return self.optimizer_fn(self.model)
         return self.backend_adapter.build_optimizer(self.model, {"name": "sgd", "lr": 0.01})
 
     def _require_server_model_proxy(self):

@@ -22,7 +22,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from .common import (BACKENDS, Images, client_identities, file_hash, learning_rate, save_json,
-                     training_batch_sizes, validate_client_budget, validate_round_budget)
+                     training_admission_enabled, training_batch_sizes, validate_client_budget, validate_round_budget)
 
 
 @contextmanager
@@ -68,10 +68,10 @@ def initialize(args):
     return config, initial, model, images, labels
 
 
-def receipt(backend, model, device):
+def receipt(backend, model, device, *, admission_enabled=True):
     from splitfleet.virtual.backend_ops import FrameworkOps
     versions = {}
-    for name in ("torch", "torchlens", "flwr", "grpcio", "numpy", "tensorflow", "jax", "jaxlib",
+    for name in ("torch", "torchlens", "flwr", "grpcio", "numpy", "tensorflow",
                  "paddlepaddle", "paddlepaddle-gpu", "pillow"):
         try:
             versions[name] = importlib.metadata.version(name)
@@ -82,10 +82,11 @@ def receipt(backend, model, device):
             "python": sys.version, "executable": sys.executable, "packages": versions,
             "logical_client_id": os.environ.get("SPLITFLEET_CLIENT_ID", "server"),
             "physical_host": os.environ.get("SPLITFLEET_PHYSICAL_HOST", "coordinator"),
-            "JAX_DISABLE_JIT": os.environ.get("JAX_DISABLE_JIT"),
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
             "boot_id": Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
-            "jax_training_program_cache": bool(getattr(model, '_splitfleet_jax_training_program_cache', False))}
+            "cpu_affinity": sorted(os.sched_getaffinity(0)),
+            "training_admission_enabled": admission_enabled,
+            "selected_admission_process_policy": ("skipped_by_user_request" if not admission_enabled else "inline")}
 
 
 def endpoints(handle, backend):
@@ -115,7 +116,7 @@ def admit(args):
     from .common import ATOL, RTOL, compare_tensor
     from experiments.resnet50_quality.model_contract import NAMES, SCHEMA, TRAINABLE_NAMES, state_hash
     from tests.integration.resnet50_reference.native import (
-        build_model, call_inputs, export_state, numpy_value, optimizer, train_step, training_mode,
+        build_model, call_inputs, export_state, numpy_value, train_step, training_mode,
     )
     from tests.integration.resnet50_reference.array_helpers import (
         RecordingLoss, RecordingOptimizer, canonical_array,
@@ -123,7 +124,6 @@ def admit(args):
     from splitfleet.autosplit import AutoSplitSession
     from splitfleet.autosplit.state_ownership import state_ownership
     from splitfleet.backends.utils import adapter_for
-    from splitfleet.tasks.losses import extract_logits, sparse_cross_entropy
     from splitfleet.transport import encode_boundary, decode_boundary, encode_gradients, decode_gradients
     from splitfleet.transport.split_wire import (
         boundary_to_envelope, envelope_to_boundary, gradients_to_envelope, envelope_to_gradients,
@@ -138,6 +138,7 @@ def admit(args):
     gc.collect()
     record = {"status": "running", "backend": args.backend, "atol": ATOL, "rtol": RTOL,
               "initial_hash": config["initial_hash"], "batch_size": int(labels.shape[0]),
+              "capture_batch_size": int(labels.shape[0]),
               "cuts": [], "environment": None}
     save_json(args.output, record)
     model = build_model(args.backend, initial, args.device)
@@ -145,7 +146,7 @@ def admit(args):
     with execution(args.backend, args.device):
         inputs = call_inputs(args.backend, model, images)
         handle = AutoSplitSession(device=args.device).prepare_runtime(
-            model, inputs, trainable=True, batch_axes={"/args/1" if args.backend == "jax" else "/args/0": 0},
+            model, inputs, trainable=True, batch_axes={"/args/0": 0},
             dynamic_batch=(1, config["batch_size"]))
         all_endpoints = endpoints(handle, args.backend)
         adapter = adapter_for(model, inputs)
@@ -167,19 +168,16 @@ def admit(args):
             if (owners != expected_owners or set(owners.values()) != {"prefix", "suffix"}
                     or state_hash(export_state(args.backend, model)) != config["initial_hash"]):
                 raise RuntimeError("Capture changed initial state or native stage ownership")
-            if args.backend == "jax":
-                prefix_opt = suffix_opt = None
-            else:
-                # As in physical execution, each stage has its own optimizer.
-                prefix_opt = RecordingOptimizer(args.backend, model)
-                suffix_opt = RecordingOptimizer(args.backend, model)
-                for owner, recorder in (("prefix", prefix_opt), ("suffix", suffix_opt)):
-                    recorder.parameters = {name: value for name, value in recorder.parameters.items()
-                                           if owners[name] == owner}
-                    if args.backend == "paddle":
-                        import paddle
-                        recorder.native = paddle.optimizer.SGD(
-                            learning_rate=.05, parameters=list(recorder.parameters.values()))
+            # As in physical execution, each stage has its own optimizer.
+            prefix_opt = RecordingOptimizer(args.backend, model)
+            suffix_opt = RecordingOptimizer(args.backend, model)
+            for owner, recorder in (("prefix", prefix_opt), ("suffix", suffix_opt)):
+                recorder.parameters = {name: value for name, value in recorder.parameters.items()
+                                       if owners[name] == owner}
+                if args.backend == "paddle":
+                    import paddle
+                    recorder.native = paddle.optimizer.SGD(
+                        learning_rate=.05, parameters=list(recorder.parameters.values()))
             local = handle.backend.run_prefix(*inputs, training=True)
             from splitfleet.split_engine import graph_contract_for_runtime_handle
             contract = graph_contract_for_runtime_handle(handle)
@@ -196,17 +194,11 @@ def admit(args):
             gradient_wire = encode_gradients(gradients_to_envelope(decoded, gradients))
             returned = envelope_to_gradients(decode_gradients(gradient_wire), args.device)
             update = handle.backend.backward_prefix(local, returned, optimizer=prefix_opt)
-            if args.backend == "jax":
-                native_gradients = update["inputs"][0]
-                grads = {name: numpy_value(native_gradients[name]) for name in TRAINABLE_NAMES}
-                model.set_params({name: value - np.float32(.05) * native_gradients[name]
-                                  for name, value in model.params.items()})
-            else:
-                if set(prefix_opt.gradients) & set(suffix_opt.gradients):
-                    raise RuntimeError("Prefix and suffix both updated the same parameter")
-                grads = {**prefix_opt.gradients, **suffix_opt.gradients}
-                if set(grads) != set(TRAINABLE_NAMES):
-                    raise RuntimeError("Split SGD omitted a native parameter gradient")
+            if set(prefix_opt.gradients) & set(suffix_opt.gradients):
+                raise RuntimeError("Prefix and suffix both updated the same parameter")
+            grads = {**prefix_opt.gradients, **suffix_opt.gradients}
+            if set(grads) != set(TRAINABLE_NAMES):
+                raise RuntimeError("Split SGD omitted a native parameter gradient")
             statistics = getattr(handle.backend, "train_suffix_auxiliary", {})
             if statistics:
                 model.apply_statistics(statistics)
@@ -246,6 +238,8 @@ def admit(args):
 
 def admit_selected_boundaries(args, boundaries, config):
     """Strictly verify every selected cut at all actual training batch shapes."""
+    if not training_admission_enabled(config):
+        return
     directory = args.output.parent / "selected_admission"
     directory.mkdir(exist_ok=True)
     for boundary in sorted(set(boundaries)):
@@ -298,8 +292,18 @@ class Batches:
                                   "elapsed_sec": time.perf_counter() - started}), flush=True)
 
 
+def bootstrap_boundary(args, config):
+    if not training_admission_enabled(config):
+        # Capture a reusable graph; Greedy supplies the actual cut before fit.
+        # No numerical receipt is manufactured for this bootstrap boundary.
+        return "50%"
+    admission = json.loads(args.admission.read_text())
+    return next(row["boundary"] for row in admission["cuts"] if row["stage"] == 2)
+
+
 def client(args):
-    config, _, model, images, labels = initialize(args)
+    config, initial, model, images, labels = initialize(args)
+    del initial, labels
     from tests.integration.resnet50_reference.native import call_inputs, optimizer, train_step
     from splitfleet.backends.utils import adapter_for
     from splitfleet.client.autosplit_split_client import AutoSplitSplitLearningClient
@@ -325,7 +329,8 @@ def client(args):
         records.append({"round": round_id, "num_examples": examples, "metrics": metrics,
                         "duration_sec": time.perf_counter() - started})
         save_json(args.output, {"status": "running", "backend": args.backend, "method": args.method,
-                  "environment": receipt(args.backend, model, args.device), "rounds": records})
+                  "environment": receipt(args.backend, model, args.device,
+                      admission_enabled=training_admission_enabled(config)), "rounds": records})
         print(json.dumps({"event": "client_round", "round": round_id, "identity": args.identity,
                           "loss": metrics["loss"], "num_examples": examples}), flush=True)
         return values, examples, metrics
@@ -342,16 +347,19 @@ def client(args):
             from splitfleet.common.constants import AUTOSPLIT_BOUNDARY_CONFIG_KEY
             batches.round_id = int(round_config["physical_round"])
             current_lr[0] = learning_rate(batches.round_id, config)
-            verification_started = time.perf_counter()
-            if args.placement == "greedy":
+            verification_seconds = 0.
+            if args.placement == "greedy" and training_admission_enabled(config):
+                verification_started = time.perf_counter()
                 with execution(args.backend, args.device):
                     admit_selected_boundaries(args, [round_config[AUTOSPLIT_BOUNDARY_CONFIG_KEY]], config)
-            verification_seconds = time.perf_counter() - verification_started
+                verification_seconds = time.perf_counter() - verification_started
             started = time.perf_counter()
             with execution(args.backend, args.device):
                 result = super().fit(parameters, round_config)
             result[2].update(placement_policy=args.placement,
                              selected_boundary=round_config[AUTOSPLIT_BOUNDARY_CONFIG_KEY],
+                             selected_admission_status=("passed" if training_admission_enabled(config)
+                                                        else "skipped_by_user_request"),
                              selected_admission_sec=verification_seconds)
             # Keep numerical admission out of the measured transport residual.
             result[2]["client_fit_handler_ms"] += verification_seconds * 1000
@@ -380,11 +388,10 @@ def client(args):
             return 0., 0, {}
 
     if args.method == "splitfleet":
-        admission = json.loads(args.admission.read_text())
-        boundary = next(row["boundary"] for row in admission["cuts"] if row["stage"] == 2)
+        boundary = bootstrap_boundary(args, config)
         instance = SplitClient(model=model, sample_inputs=call_inputs(args.backend, model, images),
             train_data=batches, task=ImageClassificationTask(), device=args.device,
-            batch_axes={"/args/1" if args.backend == "jax" else "/args/0": 0},
+            batch_axes={"/args/0": 0},
             optimizer_fn=make_optimizer, max_cached_runtimes=1,
             calibration_batch=(calibration_batch(args, model, config) if args.placement == "greedy" else None))
         with execution(args.backend, args.device):
@@ -503,7 +510,8 @@ def server(args):
                 best[0] = metrics["top1"]
         rounds.append(row)
         _publish_server_round(args.output, {"status": "running", "backend": args.backend, "method": args.method,
-                              "protocol": config, "environment": receipt(args.backend, model, args.device), "rounds": rounds})
+                              "protocol": config, "environment": receipt(args.backend, model, args.device,
+                                  admission_enabled=training_admission_enabled(config)), "rounds": rounds})
         print(json.dumps({"event": "server_round", "backend": args.backend, "method": args.method,
                           "round": round_id, **metrics, "elapsed_sec": row["elapsed_wall_sec"]}), flush=True)
         return metrics["loss"], {"top1": metrics["top1"]}
@@ -519,8 +527,9 @@ def server(args):
                 diagnostics = policy.round_diagnostics[server_round]
                 if len(assigned) != config["clients"] or assigned != diagnostics["assignment"]:
                     raise RuntimeError("Every physical client must receive its own Greedy decision")
-                with execution(args.backend, args.device):
-                    admit_selected_boundaries(args, assigned.values(), config)
+                if training_admission_enabled(config):
+                    with execution(args.backend, args.device):
+                        admit_selected_boundaries(args, assigned.values(), config)
                 save_json(args.output.parent / f"placement_round_{server_round:03d}.json",
                     {"round": server_round, "policy": args.placement, "diagnostics": diagnostics,
                      "decisions": [row for row in policy.decision_receipts if row["round_id"] == server_round]})
@@ -563,16 +572,14 @@ def server(args):
     options = dict(fraction_fit=1., fraction_evaluate=0., min_fit_clients=config["clients"],
                    min_evaluate_clients=0, min_available_clients=config["clients"])
     if args.method == "splitfleet":
-        admission = json.loads(args.admission.read_text())
-        boundary = next(row["boundary"] for row in admission["cuts"] if row["stage"] == 2)
+        boundary = bootstrap_boundary(args, config)
         policy = None
         if args.placement == "greedy":
             from splitfleet.server.placement import GreedyConfig, GreedyPlacementPolicy, TorchLensCandidateProvider
             provider = TorchLensCandidateProvider(model=model,
                 sample_inputs=call_inputs(args.backend, model, images),
-                batch_axes={"/args/1" if args.backend == "jax" else "/args/0": 0},
-                dynamic_batch=(1, config["batch_size"]), require_trainable_prefix=True,
-                resident_parameter_transport=args.backend == "jax")
+                batch_axes={"/args/0": 0},
+                dynamic_batch=(1, config["batch_size"]), require_trainable_prefix=True)
             policy = GreedyPlacementPolicy(candidate_provider=provider, config=GreedyConfig(
                 server_concurrency=1, seed=config["seed"], warm_start=False,
                 state_path=str(args.output.parent / "placement_state.json")))
@@ -580,7 +587,7 @@ def server(args):
             task=ImageClassificationTask(), boundary=boundary,
             placement_policy=policy,
             constraints=PlacementConstraint(max_payload_bytes=config["placement_max_payload_bytes"]),
-            batch_axes={"/args/1" if args.backend == "jax" else "/args/0": 0},
+            batch_axes={"/args/0": 0},
             dynamic_batch=(1, config["batch_size"]), runtime_device=args.device,
             aggregation_policy="splitfed", owned_state_exchange=True, integer_aggregation_policy="maximum",
             config_client_fit_fn=configure, optimizer_fn=lambda m: optimizer(args.backend, m, current_lr[0]), **options)

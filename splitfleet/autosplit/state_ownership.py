@@ -38,74 +38,7 @@ def _native_identities(value):
 
 def _runtime_adapter(handle):
     from splitfleet.backends import BACKEND_ADAPTERS
-
-    backend = str(handle.backend.framework_backend)
-    adapter = BACKEND_ADAPTERS.create(backend)
-    if adapter.backend_name == "jax" and not hasattr(handle.runtime.model, "params"):
-        inputs = handle.backend.trace_sample_input
-        if not inputs:
-            raise ValueError("Functional JAX ownership requires the captured params argument")
-        adapter.bind_external_params(inputs[0])
-    return adapter
-
-
-def _jax_parameter_bindings(adapter, model, state=None):
-    """Map native parameter addresses to pytree paths and adapter state names."""
-    import jax
-
-    state = adapter._state(model) if state is None else state
-    bindings = {}
-    for path, value in jax.tree_util.tree_flatten_with_path(adapter._params(model))[0]:
-        parts = [str(getattr(key, "key", getattr(key, "idx", getattr(key, "name", key)))) for key in path]
-        address = ".".join(parts) or "root"
-        key = jax.tree_util.keystr(path)
-        name = address if address in state else key
-        if name not in state or state[name] is not value:
-            raise ValueError(f"JAX parameter {address!r} is not bound to declared native state")
-        if address in bindings:
-            raise ValueError(f"Ambiguous JAX parameter address {address!r}")
-        bindings[address] = (path, name, value)
-    return bindings
-
-
-def _jax_bindings(adapter, model, state, graph):
-    """Bind parameter addresses to their captured input purpose.
-
-    Immutable parameter roots can lie in the prefix while their consuming
-    equations lie in either stage. Paths survive replacement of array objects.
-    """
-    address_names = {address: name for address, (_, name, _) in
-                     _jax_parameter_bindings(adapter, model, state).items()}
-    program = _attribute(graph, "shape_program")
-    input_paths = {} if program is None else dict(zip(program.input_node_ids, program.input_paths, strict=True))
-    source_names = {}
-    for node in graph.nodes:
-        if not node.is_input:
-            continue
-        addresses = set()
-        annotation = (_attribute(node.op, "annotations", {}) or {}).get("jax_container_path")
-        if isinstance(annotation, str) and annotation.startswith("0."):
-            addresses.add(annotation[2:])
-        pointer = input_paths.get(node.canonical_id, "")
-        if pointer == "/args/0":
-            addresses.add("root")
-        elif pointer.startswith("/args/0/"):
-            addresses.add(".".join(part.replace("~1", "/").replace("~0", "~")
-                                   for part in pointer[len("/args/0/"):].split("/")))
-        names = {address_names[address] for address in addresses if address in address_names}
-        if len(names) > 1:
-            raise ValueError(f"Conflicting JAX parameter input bindings at {node.canonical_id}")
-        if names:
-            name = next(iter(names))
-            value = state[name]
-            if tuple(node.output_shape or ()) != tuple(value.shape) or str(node.dtype) != str(value.dtype):
-                raise ValueError(f"JAX parameter input schema differs at {name!r}")
-            source_names[node.canonical_id] = names
-    bound_names = set().union(*source_names.values()) if source_names else set()
-    if set(address_names.values()) - bound_names:
-        raise ValueError("JAX parameter input bindings are missing from the native capture")
-    return address_names, source_names
-
+    return BACKEND_ADAPTERS.create(str(handle.backend.framework_backend))
 
 def _is_state_source(node):
     kind = str(node.op_type).lower().replace("_", "")
@@ -131,11 +64,8 @@ def state_ownership(handle, schema_hash: str, *, native_plan=None) -> dict:
     for name, value in state.items():
         for identity in _native_identities(value):
             identities[identity].add(name)
-    address_names, source_names = ({}, {})
-    if backend == "jax":
-        address_names, source_names = _jax_bindings(adapter, runtime.model, state, graph)
-        trainables = set(address_names.values())
-    elif backend == "torch":
+    source_names = {}
+    if backend == "torch":
         trainables = {name for name, parameter in runtime.model.named_parameters(remove_duplicate=False)
                       if parameter.requires_grad}
     else:
@@ -177,13 +107,6 @@ def state_ownership(handle, schema_hash: str, *, native_plan=None) -> dict:
             refs.extend((_attribute(module, "buffers", {}) or {}).values())
         for ref in refs:
             matched = set().union(*(identities.get(identity, set()) for identity in _native_identities(ref)))
-            if backend == "jax":
-                address = _attribute(ref, "address")
-                if address in address_names:
-                    matched.add(address_names[address])
-                    parent_bindings = set().union(*(source_names.get(aliases[parent], set()) for parent in node.parents))
-                    if address_names[address] not in parent_bindings:
-                        raise ValueError(f"JAX parameter {address!r} has no proven consuming input binding")
             if not matched and bool(_attribute(ref, "is_trainable", False)):
                 raise ValueError("Native trainable parameter reference cannot be bound to model state")
             referenced.update(matched)

@@ -176,8 +176,8 @@ def _native_bindings():
 
 def bind_native_frontier(runtime):
     """Keep native analysis/recut/materialization on this instance's policy."""
-    if runtime.adapter.name not in {"tf", "tensorflow", "paddle", "jax"}:
-        raise ValueError("Native minimal frontier requires TensorFlow, Paddle or JAX")
+    if runtime.adapter.name not in {"tf", "tensorflow", "paddle"}:
+        raise ValueError("Native minimal frontier requires TensorFlow or Paddle")
     if getattr(runtime, "_splitfleet_minimal_frontier", False):
         return runtime
     private_plan, _ = _native_bindings()
@@ -210,7 +210,7 @@ def prepare_native_frontier_runtime(model, inputs, request, *, input_kwargs=None
     Caller retains its actual native device scope. No framework, SDK module,
     class, registry or captured graph object is modified by this function.
     """
-    if str(request.backend) not in {"tf", "tensorflow", "paddle", "jax"}:
-        raise ValueError("Native minimal frontier requires TensorFlow, Paddle or JAX")
+    if str(request.backend) not in {"tf", "tensorflow", "paddle"}:
+        raise ValueError("Native minimal frontier requires TensorFlow or Paddle")
     _, prepare = _native_bindings()
     return bind_native_frontier(prepare(model, inputs, request, input_kwargs=input_kwargs))

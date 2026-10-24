@@ -67,7 +67,6 @@ def _exercise_engine_protocol(model, inputs, targets, loss_fn, backend: str) -> 
     from splitfleet.transport import decode_bundle
 
     args = inputs if isinstance(inputs, tuple) else (inputs,)
-    batch_size = int(targets.shape[0])
     engine = TorchLensSplitEngine()
     handle = engine.prepare(
         model,
@@ -112,40 +111,6 @@ def test_tensorflow_split_engine_protocol_optional(request) -> None:
     _exercise_engine_protocol(model, inputs, targets, tf.keras.losses.MeanSquaredError(), "tf")
 
 
-def test_jax_split_training_optional(request) -> None:
-    if _run_isolated(request): return
-    jax = pytest.importorskip("jax")
-    jnp = pytest.importorskip("jax.numpy")
-    params = {"weight": jnp.arange(8, dtype=jnp.float32).reshape(4, 2) / 10}
-    def model(params, x): return jnp.tanh(x) @ params["weight"]
-    inputs, targets = (params, jnp.ones((3, 4))), jnp.zeros((3, 2))
-    _exercise(model, inputs, targets, lambda output, target: jnp.mean((output - target) ** 2), "jax")
-    _exercise_engine_protocol(model, inputs, targets, lambda output, target: jnp.mean((output - target) ** 2), "jax")
-
-
-def test_jax_reshape_payload_includes_passthrough_parameters(request) -> None:
-    if _run_isolated(request, extra_env={"CUDA_VISIBLE_DEVICES": ""}): return
-    jnp = pytest.importorskip("jax.numpy")
-    from splitfleet.autosplit import prepare_torchlens_runtime
-
-    params = {"first": jnp.ones((4, 8)), "last": jnp.ones((8, 3))}
-
-    def model(parameters, inputs):
-        return (inputs @ parameters["first"]).reshape(-1, 8) @ parameters["last"]
-
-    inputs = jnp.ones((2, 10, 4))
-    handle = prepare_torchlens_runtime(
-        model, (params, inputs), boundary="after:reshape_1_5:1",
-        batch_axes={"/args/1": 0}, dynamic_batch=(1, 8),
-    )
-    capture_batch = handle.runtime.traced_batch_size
-    payload = handle.backend.run_prefix(params, inputs[:capture_batch])
-    actual_bytes = sum(np.asarray(tensor).nbytes for tensor in payload.tensors.values())
-
-    assert len(payload.tensors) == 2  # Reshaped activations and the suffix parameter matrix.
-    assert handle.plan.boundary_bytes == actual_bytes == (capture_batch * 10 * 8 + 8 * 3) * 4
-
-
 def test_paddle_split_training_optional(request) -> None:
     if _run_isolated(request): return
     paddle = pytest.importorskip("paddle")
@@ -155,7 +120,7 @@ def test_paddle_split_training_optional(request) -> None:
     _exercise_engine_protocol(model, inputs, targets, paddle.nn.MSELoss(), "paddle")
 
 
-@pytest.mark.parametrize("backend", ["tf", "jax", "paddle"])
+@pytest.mark.parametrize("backend", ["tf", "paddle"])
 def test_cosplit_payload_context_matches_optional_backend_capture(request, backend):
     if _run_isolated(request, extra_env={"CUDA_VISIBLE_DEVICES": "", "DEV": "CPU", "DEBUG": "0"}):
         return
@@ -167,14 +132,6 @@ def test_cosplit_payload_context_matches_optional_backend_capture(request, backe
         model = tf.keras.Sequential([
             tf.keras.layers.Input((4,)), tf.keras.layers.Dense(8, activation="relu"), tf.keras.layers.Dense(2)])
         inputs, batch_argument = (tf.ones((3, 4)),), 0
-    elif backend == "jax":
-        jnp = pytest.importorskip("jax.numpy")
-
-        def model(params, x):
-            return jnp.maximum(x @ params["first"], 0) @ params["last"]
-
-        inputs = ({"first": jnp.ones((4, 8)), "last": jnp.ones((8, 2))}, jnp.ones((3, 4)))
-        batch_argument = 1
     elif backend == "paddle":
         paddle = pytest.importorskip("paddle")
         model = paddle.nn.Sequential(paddle.nn.Linear(4, 8), paddle.nn.ReLU(), paddle.nn.Linear(8, 2))

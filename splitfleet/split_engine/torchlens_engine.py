@@ -30,10 +30,7 @@ def _value(value: Any) -> Any:
     if isinstance(value, Enum):
         return value.value
     if is_dataclass(value):
-        # dataclasses.asdict() deep-copies every non-container leaf. JAX graph
-        # records can contain jaxlib Traceback objects, which intentionally
-        # cannot be pickled/deep-copied. Walk fields directly for the
-        # JSON-compatible contract projection.
+        # Walk fields directly for the JSON-compatible contract projection.
         return {
             field.name: _value(getattr(value, field.name))
             for field in fields(value)
@@ -65,11 +62,6 @@ class TorchLensSplitEngine:
         runtime = prepare_split_runtime(model, call.args, request, input_kwargs=kwargs)
         args, kwargs, _ = normalize_model_call(model, call.args, kwargs)
         backend = runtime.adapter.name
-        adapter = BACKEND_ADAPTERS.create(backend)
-        if backend == "jax" and not hasattr(model, "params"):
-            if not args:
-                raise ValueError("Functional JAX models require parameters as the first argument.")
-            adapter.bind_external_params(args[0])
         return SplitRuntimeHandle(
             runtime=runtime,
             backend=backend,
@@ -83,8 +75,6 @@ class TorchLensSplitEngine:
             raise RuntimeError("TorchLens runtime has no captured graph IR.")
         model = handle.metadata["model"]
         state_adapter = BACKEND_ADAPTERS.create(handle.backend)
-        if handle.backend == "jax" and not hasattr(model, "params"):
-            state_adapter.bind_external_params(handle.metadata["sample_inputs"][0])
         state_schema_hash = state_adapter.state_manifest(model).schema_hash
         input_schema = _tensor_schema(
             {"args": handle.metadata["sample_inputs"], "kwargs": handle.metadata["sample_kwargs"]},

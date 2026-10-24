@@ -34,23 +34,6 @@ def test_unknown_frontier_dtype_cannot_silently_change_network_cost():
         _dtype_itemsize("native.unknown")
 
 
-def test_jax_vjp_gradient_volume_excludes_resident_weights_and_integer_metadata():
-    conv = SimpleNamespace(canonical_id="conv", output_shape=(2, 8, 4, 4),
-        op_type="conv2d", param_refs=[], requires_grad=None, dtype="float32")
-    weights = SimpleNamespace(canonical_id="weights", output_shape=(8, 3, 3, 3),
-        op_type="input", param_refs=[], requires_grad=None, dtype="float32", is_input=True)
-    counter = SimpleNamespace(canonical_id="counter", output_shape=(), op_type="sum",
-        param_refs=[], requires_grad=None, dtype="int64")
-    candidate = SimpleNamespace(boundary="after:conv", framework_backend="jax",
-        metadata={"boundary_tensor_labels": ["conv", "weights", "counter"],
-                  "resident_parameter_labels": ["weights"]}, boundary_forward_bytes=512)
-    runtime = SimpleNamespace(trace_graph=SimpleNamespace(nodes=[weights, conv, counter]), traced_batch_size=2)
-    provider = SimpleNamespace(get_candidates=lambda **_: [candidate],
-                               _backends={True: SimpleNamespace(runtime=runtime)})
-    row = graph_workload_features(provider)[candidate.boundary]
-    assert row["gradient_volume_proxy_bytes_per_sample"] == 8 * 4 * 4 * 4
-
-
 def test_transport_cost_uses_shape_resolved_gradient_bytes_for_the_real_batch():
     from splitfleet.server.placement.greedy import GreedyPlacementPolicy
 

@@ -51,7 +51,9 @@ def status(root):
     identities = [row["id"] for row in protocol["logical_clients"]] if "logical_clients" in protocol else ["orin140", "orin118", "orin238"]
     output = {"status": effective_status, "formal": protocol["formal"], "rounds": protocol["rounds"],
               "clients": protocol.get("clients", 3), "logical_clients": protocol.get("logical_clients", []),
-              "pid": state["pid"], "backends": {}}
+              "pid": state["pid"], "backends": {},
+              "numerical_admission": ("skipped_by_user_request" if protocol.get("skip_training_admission")
+                                       else "required")}
     if "prerequisite" in state:
         output["prerequisite"] = state["prerequisite"]
     for backend, progress in state["backends"].items():
@@ -76,6 +78,13 @@ def status(root):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--root", type=Path, help="Campaign root; defaults to the current result index")
     args = parser.parse_args()
-    print(json.dumps(status(args.root), indent=2, ensure_ascii=False))
+    if args.root is not None:
+        root = args.root
+    else:
+        index = Path(__file__).resolve().parents[2] / "results/resnet50_backends_current.json"
+        if not index.is_file():
+            parser.error("--root is required when results/resnet50_backends_current.json is unavailable")
+        root = Path(json.loads(index.read_text())["active_root"])
+    print(json.dumps(status(root), indent=2, ensure_ascii=False))

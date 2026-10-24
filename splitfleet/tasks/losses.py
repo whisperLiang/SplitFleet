@@ -8,7 +8,7 @@ from typing import Any, Mapping
 def tensor_backend(value: Any) -> str:
     module = type(value).__module__.lower()
     for prefix, name in (("torch", "torch"), ("tensorflow", "tf"), ("keras", "tf"),
-                         ("jax", "jax"), ("jaxlib", "jax"), ("paddle", "paddle")):
+                         ("paddle", "paddle")):
         if module.startswith(prefix):
             return name
     raise TypeError(f"Unsupported tensor backend for {type(value).__name__}; supply a custom loss_fn.")
@@ -48,15 +48,6 @@ def sparse_cross_entropy(logits: Any, targets: Any, *, ignore_index: int = -100)
     if backend == "paddle":
         from paddle.nn.functional import cross_entropy
         return cross_entropy(logits, targets.astype("int64"), axis=1, ignore_index=ignore_index)
-    if backend == "jax":
-        import jax.numpy as jnp
-        from jax.nn import log_softmax
-        labels = jnp.asarray(targets, dtype=jnp.int32)
-        mask = labels != ignore_index
-        safe_labels = jnp.where(mask, labels, 0)
-        scores = jnp.moveaxis(log_softmax(logits, axis=1), 1, -1)
-        losses = -jnp.take_along_axis(scores, safe_labels[..., None], axis=-1)[..., 0]
-        return jnp.sum(jnp.where(mask, losses, 0)) / jnp.maximum(jnp.sum(mask), 1)
     if backend == "tf":
         import tensorflow as tf
         labels = tf.cast(targets, tf.int64)

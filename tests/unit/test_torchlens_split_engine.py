@@ -72,7 +72,7 @@ def test_engine_training_keeps_context_local_and_consumes_once() -> None:
     )
     assert result.gradients is not None
     assert result.loss is not None
-    for field_name, bad_value in (("backend", "jax"), ("split_id", "wrong-split"),
+    for field_name, bad_value in (("split_id", "wrong-split"),
                                   ("plan_id", "wrong-plan"), ("model_version", 1)):
         with pytest.raises(ValueError, match="Gradient"):
             engine.backward_prefix(handle, token, replace(result.gradients, **{field_name: bad_value}), optimizer)

@@ -41,11 +41,7 @@ class _OwnedParameters:
 
 
 def _synchronize(backend, device, value=None):
-    if backend == 'jax':
-        import jax
-        if value is not None:
-            jax.block_until_ready(value)
-    elif backend == 'tf':
+    if backend == 'tf':
         from tensorflow.python.eager import context
         context.async_wait()
     elif backend == 'paddle' and str(device).startswith(('cuda', 'gpu')):
@@ -60,9 +56,6 @@ def _finite(backend, value):
         return all(_finite(backend, item) for item in value)
     if value is None or not hasattr(value, 'dtype'):
         return True
-    if backend == 'jax':
-        import jax.numpy as jnp
-        return bool(jnp.all(jnp.isfinite(value)))
     if backend == 'tf':
         import tensorflow as tf
         return bool(tf.reduce_all(tf.math.is_finite(value)).numpy())
@@ -78,14 +71,13 @@ def calibrate_native_split(model, inputs, targets, *, boundaries, make_handle,
     and host RNG preservation must not pretend to restore opaque native streams.
     """
     backend = adapter.backend_name
-    if backend not in {'tf', 'paddle', 'jax'}:
+    if backend not in {'tf', 'paddle'}:
         raise TypeError(f'Native calibration is unavailable for {backend}')
     boundaries = tuple(boundaries)
     if not boundaries or len(set(boundaries)) != len(boundaries):
         raise ValueError('Calibration requires distinct admitted boundaries')
-    from splitfleet.autosplit.state_ownership import _jax_parameter_bindings, state_ownership
+    from splitfleet.autosplit.state_ownership import state_ownership
     from splitfleet.runtime.auxiliary_state import commit_auxiliary_state
-    from splitfleet.runtime.functional_sgd import OwnedFunctionalSGD, resident_parameter_bindings
     from splitfleet.runtime.owned_auxiliary_state import statistics_for_stage
 
     started = time.perf_counter()
@@ -117,19 +109,12 @@ def calibrate_native_split(model, inputs, targets, *, boundaries, make_handle,
                 ownership = state_ownership(handle, 'calibration')
                 owners = dict(zip(ownership['names'], ownership['owners'], strict=True))
                 native = adapter._state(model)
-                if backend == 'jax':
-                    trainable = {name for _, name, _ in _jax_parameter_bindings(adapter, model, native).values()}
-                else:
-                    trainable = {name for name, value in native.items()
-                                 if (value.trainable if backend == 'tf' else not value.stop_gradient)}
+                trainable = {name for name, value in native.items()
+                             if (value.trainable if backend == 'tf' else not value.stop_gradient)}
                 owned = {name: value for name, value in native.items() if name in trainable and owners[name] == stage}
                 optimizer = None
                 if optimizer_fn is not None and owned:
-                    optimizer = optimizer_fn(model if backend == 'jax' else _OwnedParameters(model, owned))
-                functional = isinstance(optimizer, OwnedFunctionalSGD)
-                if functional:
-                    optimizer.ownership = ownership
-                bindings = resident_parameter_bindings(handle, ownership) if functional else {}
+                    optimizer = optimizer_fn(_OwnedParameters(model, owned))
                 samples = []
                 for batch_index in range(2):
                     if backend == 'paddle':
@@ -142,16 +127,8 @@ def calibrate_native_split(model, inputs, targets, *, boundaries, make_handle,
                     forward_ms = (time.perf_counter() - begin) * 1000
                     begin = time.perf_counter()
                     loss, returned = handle.backend.train_suffix(boundary, targets, loss_fn=loss_fn,
-                        optimizer=optimizer if stage == 'suffix' and not functional else None)
+                        optimizer=optimizer if stage == 'suffix' else None)
                     all_returned = returned
-                    if functional and stage == 'suffix':
-                        returned = optimizer.suffix_update(bindings, returned)
-                    elif functional:
-                        # Production suffix SGD consumes its resident weight
-                        # gradients. Client calibration must time that same
-                        # activation-only VJP rather than propagate private
-                        # suffix parameter roots back through the prefix.
-                        returned = {key: value for key, value in returned.items() if key not in bindings}
                     auxiliary = handle.backend.train_suffix_auxiliary
                     if auxiliary is not None:
                         commit_auxiliary_state(model, statistics_for_stage(model, auxiliary, ownership, 'suffix'))
@@ -159,9 +136,7 @@ def calibrate_native_split(model, inputs, targets, *, boundaries, make_handle,
                     service_ms = (time.perf_counter() - begin) * 1000
                     begin = time.perf_counter()
                     prefix = handle.backend.backward_prefix(boundary, boundary_grads=returned,
-                        optimizer=optimizer if stage == 'prefix' and not functional else None)
-                    if functional and stage == 'prefix':
-                        optimizer.prefix_update(model, prefix)
+                        optimizer=optimizer if stage == 'prefix' else None)
                     if auxiliary is not None:
                         commit_auxiliary_state(model, statistics_for_stage(model, auxiliary, ownership, 'prefix'))
                     _synchronize(backend, device, (prefix, adapter._state(model)))

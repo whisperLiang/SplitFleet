@@ -12,7 +12,7 @@ from contextlib import nullcontext
 
 import numpy as np
 
-from experiments.resnet50_quality.model_contract import BLOCKS, NAMES, SCHEMA, TRAINABLE_NAMES
+from experiments.resnet50_quality.model_contract import NAMES, SCHEMA, TRAINABLE_NAMES
 from .native import (
     build_model,
     export_state,
@@ -39,46 +39,7 @@ def _context(backend, device):
     return nullcontext()
 
 
-def _jax_forward(model, params, images, stages, *, stem, head):
-    import jax
-    import jax.numpy as jnp
-
-    from .jax_model import _conv, _relu
-
-    statistics = {}
-    value = images
-    if stem:
-        value = _conv(value, params["conv1.weight"], stride=2, padding=3)
-        value = _relu(model._batch_norm(value, params, "bn1", statistics, training=True))
-        value = jax.lax.reduce_window(value, np.float32(-np.inf), jax.lax.max,
-            window_dimensions=(1, 1, 3, 3), window_strides=(1, 1, 2, 2),
-            padding=((0, 0), (0, 0), (1, 1), (1, 1)))
-    for stage in stages:
-        for index in range(BLOCKS[stage - 1]):
-            name = f"layer{stage}.{index}"
-            stride = 2 if stage > 1 and index == 0 else 1
-            identity = value
-            hidden = _relu(model._batch_norm(_conv(value, params[name + ".conv1.weight"]),
-                params, name + ".bn1", statistics, training=True))
-            hidden = _relu(model._batch_norm(_conv(hidden, params[name + ".conv2.weight"], stride=stride, padding=1),
-                params, name + ".bn2", statistics, training=True))
-            hidden = model._batch_norm(_conv(hidden, params[name + ".conv3.weight"]),
-                params, name + ".bn3", statistics, training=True)
-            if name + ".downsample.0.weight" in params:
-                identity = model._batch_norm(_conv(identity, params[name + ".downsample.0.weight"], stride=stride),
-                    params, name + ".downsample.1", statistics, training=True)
-            value = _relu(hidden + identity)
-    if head:
-        pooled = jnp.mean(value, axis=(2, 3), dtype=jnp.float32)
-        value = jax.lax.dot_general(pooled, params["fc.weight"],
-            dimension_numbers=(((1,), (1,)), ((), ())), precision=jax.lax.Precision.HIGHEST,
-            preferred_element_type=jnp.float32) + params["fc.bias"]
-    return value, statistics
-
-
 def _forward(backend, model, images, stages, *, stem, head, params=None):
-    if backend == "jax":
-        return _jax_forward(model, params, images, stages, stem=stem, head=head)
     statistics = {}
     value = images
     if backend == "tensorflow":
@@ -123,14 +84,12 @@ def _copy(backend, value, device):
     if backend == "tensorflow":
         import tensorflow as tf
         return tf.identity(value)
-    import jax
-    native = jax.devices("gpu" if device.startswith("cuda") else "cpu")[int(device.split(":")[-1]) if ":" in device else 0]
-    return jax.device_put(value, native)
+    raise ValueError(f"Unsupported backend {backend!r}")
 
 
 def train_staged(backend, initial, images, labels, *, stage, client_device, server_device, learning_rate):
     """One full real native CE/autograd/SGD batch through both native devices."""
-    if stage not in (1, 2, 3) or backend not in {"pytorch", "tensorflow", "paddle", "jax"}:
+    if stage not in (1, 2, 3) or backend not in {"pytorch", "tensorflow", "paddle"}:
         raise ValueError("Native reference supports the three real residual-stage endpoints")
     from splitfleet.tasks.losses import sparse_cross_entropy
     from splitfleet.virtual.backend_ops import FrameworkOps
@@ -169,12 +128,7 @@ def train_staged(backend, initial, images, labels, *, stage, client_device, serv
         return loss, (logits, prefix_statistics, suffix_statistics)
 
     optimizers = {}
-    if backend == "jax":
-        import jax
-        (loss, auxiliary), native_gradients = jax.value_and_grad(forward, argnums=(0, 1), has_aux=True)(
-            models["prefix"].params, models["suffix"].params)
-        gradients_by_owner = dict(zip(("prefix", "suffix"), native_gradients, strict=True))
-    elif backend == "tensorflow":
+    if backend == "tensorflow":
         import tensorflow as tf
         # Eager TF gradient kernels use the current device scope. Separate
         # native tapes preserve both stages' actual backward placement too.
@@ -237,10 +191,7 @@ def train_staged(backend, initial, images, labels, *, stage, client_device, serv
     loss_value, logits_array = float(numpy_value(loss)), numpy_value(logits)
     for owner, model in models.items():
         with _context(backend, devices[owner]):
-            if backend == "jax":
-                model.set_params({name: value - np.float32(learning_rate) * gradients_by_owner[owner][name]
-                                  if stage_owner(name, stage) == owner else value for name, value in model.params.items()})
-            elif backend == "tensorflow":
+            if backend == "tensorflow":
                 opt = optimizer(backend, model, learning_rate)
                 opt.apply_gradients([(gradients_by_owner[owner][name], value) for name, value in parameters[owner].items()
                                      if stage_owner(name, stage) == owner])

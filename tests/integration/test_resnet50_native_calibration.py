@@ -52,7 +52,7 @@ def test_native_resnet_calibration_initializes_the_physical_policy_before_placem
     batch = TaskBatch(ModelInputs(args=call_inputs(backend, model, images)), labels, num_examples=16)
     client_batch = TaskBatch(ModelInputs(args=call_inputs(backend, client_model, images)), labels, num_examples=16)
     provider = StageCandidateProvider(model=model, sample_inputs=batch.inputs, backend=backend,
-        batch_axes={'/args/1' if backend == 'jax' else '/args/0': 0}, dynamic_batch=(1, 16))
+        batch_axes={'/args/0': 0}, dynamic_batch=(1, 16))
     catalog = provider.get_candidates(training=True)
     before = model_state_hash(model, ops.adapter)
     assert model_state_hash(client_model, ops.adapter) == before
@@ -63,7 +63,7 @@ def test_native_resnet_calibration_initializes_the_physical_policy_before_placem
     optimizer = OptimizerFactory('sgd', .05, ops.backend)
     client = AutoSplitSplitLearningClient(model=client_model, sample_inputs=client_batch.inputs,
         calibration_batch=client_batch, train_data=[client_batch], task=ImageClassificationTask(),
-        batch_axes={'/args/1' if backend == 'jax' else '/args/0': 0}, device=device,
+        batch_axes={'/args/0': 0}, device=device,
         optimizer_fn=optimizer, autosplit_session=AutoSplitSession(device=device))
     strategy = AutoSplitStrategy(model=model, sample_inputs=batch, task=ImageClassificationTask(),
         placement_policy=policy, batch_axes=provider.batch_axes, dynamic_batch=(1, 16),

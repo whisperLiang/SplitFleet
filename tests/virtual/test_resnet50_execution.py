@@ -96,7 +96,7 @@ def test_queue_preserves_explicit_backend_subset_and_fixed_workers(tmp_path, mon
     assert all(j['worker_count'] == 4 for j in state['jobs'])
 
 
-@pytest.mark.parametrize('selection', [[], ['jax', 'jax'], ['unknown'], ['mlx']])
+@pytest.mark.parametrize('selection', [[], ['unknown'], ['mlx']])
 def test_queue_rejects_invalid_or_excluded_backends_before_creating_outputs(tmp_path, selection):
     from experiments.resnet50_quality.queue import prepare_queue
 

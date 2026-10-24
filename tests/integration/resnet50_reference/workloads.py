@@ -77,8 +77,7 @@ class QualityCollate:
             return torch.from_numpy(images), torch.from_numpy(labels)
         if self.backend == "tensorflow":
             images = images.transpose(0, 2, 3, 1)
-        args = (None, images) if self.backend == "jax" else (images,)
-        return TaskBatch(ModelInputs(args=args), labels, num_examples=int(labels.shape[0]))
+        return TaskBatch(ModelInputs(args=(images,)), labels, num_examples=int(labels.shape[0]))
 
     def __call__(self, items):
         images, labels = zip(*items, strict=True)
@@ -140,8 +139,6 @@ class StageCandidateProvider(TorchLensCandidateProvider):
     def __init__(self, *, backend="pytorch", **kwargs):
         self.quality_backend = backend
         kwargs["require_trainable_prefix"] = True
-        if backend == "jax":
-            kwargs["resident_parameter_transport"] = True
         super().__init__(**kwargs)
         self.stage_endpoints = None
 

@@ -178,8 +178,6 @@ class StageRuntimeManager(ServerModelManager):
             sample_inputs = base.plan.metadata.get("_example_inputs")
             if sample_inputs is None:
                 raise RuntimeError("The active TorchLens runtime does not retain sample inputs.")
-            if base.backend.framework_backend == "jax" and hasattr(model, "params"):
-                sample_inputs = (model.params, *sample_inputs[1:])
             point = base.runtime.request.point
             boundary = (
                 f"{point.target}%"

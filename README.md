@@ -5,10 +5,10 @@ SplitFleet also supports real virtual split learning through Flower/Ray. See
 100-client real-data training, state isolation, bounded suffix replicas, network
 constraints and measured Greedy placement. The current paper retains the paired
 100-client, 50-round PyTorch result; see the [paper evidence guide](paper/README.md).
-Physical TensorFlow/JAX/Paddle training uses
+Physical TensorFlow/Paddle training uses
 [six CPU/GPU clients on three Orins](experiments/resnet50_backends/README.md).
 
-SplitFleet combines a unified split federated learning (SFL) abstraction, SFL-grade fine-grained partitioning, and measured Greedy placement. Built on [Flower](https://flower.ai/), it separates backend, task, partition, aggregation, and placement contracts. Four backend adapters implement the same SFL execution contract.
+SplitFleet combines a unified split federated learning (SFL) abstraction, SFL-grade fine-grained partitioning, and measured Greedy placement. Built on [Flower](https://flower.ai/), it separates backend, task, partition, aggregation, and placement contracts. Three backend adapters implement the same SFL execution contract.
 
 The unified task interface covers image classification, text classification, object detection, semantic segmentation, and instance segmentation.
 Maintained experiment protocols are in `experiments/`; the local manuscript and evidence guide is `paper/README.md`.
@@ -23,11 +23,9 @@ The local wheel's native split extensions are distinct from the execution-captur
 
 Boundary features and gradients use typed tensor envelopes, graph contracts, SHA-256 checks and resource limits.
 
-TorchLens-backed split replay and training can also be enabled for TensorFlow, JAX,
-and Paddle through the corresponding optional dependency groups
-(`tensorflow`, `jax`, `paddle`, or `multibackend`). This project registers these four training backends; MLX and ONNX are
-not exposed as SplitFleet training backends. JAX callers provide `functional_update_fn` on the split client
-when model parameters require an external functional update.
+TorchLens-backed split replay and training can also be enabled for TensorFlow and
+Paddle through the corresponding optional dependency groups (`tensorflow` and
+`paddle`). MLX and ONNX are not exposed as SplitFleet training backends.
 
 ## What This Project Does
 
@@ -94,10 +92,10 @@ uv sync --extra dev --extra integration --extra multibackend --reinstall-package
 ## Quick Start
 
 Run the download-free task correctness matrix (image/text classification, detection,
-semantic and instance segmentation; PyTorch and JAX):
+semantic and instance segmentation; PyTorch):
 
 ```bash
-uv run --no-sync python -m splitfleet.validation --backends torch jax --all-nodes \
+uv run --no-sync python -m splitfleet.validation --backends torch --all-nodes \
   --output results/unified_task_validation.json
 ```
 
@@ -105,11 +103,8 @@ The JSON compares outputs, task losses, all parameter gradients and one SGD step
 at every enumerated before/after boundary, including activation and gradient wire
 round trips. Unsupported and failed cases have separate outcomes and nonzero exit
 codes. These synthetic checks do not measure dataset accuracy or convergence.
-Install the JAX extra with `uv sync --extra dev --extra jax` before this command,
-or use `--backends torch` with the base installation. The full task equivalence
-matrix currently covers PyTorch and JAX. TensorFlow and Paddle have
-separate native replay/training, task-loss and split-node checks; those checks
-do not establish a complete four-backend by five-task equivalence matrix.
+The full task-equivalence matrix covers PyTorch. TensorFlow and Paddle have
+separate native replay/training, task-loss and split-node checks.
 
 Run the TorchLens split training demo:
 
@@ -123,13 +118,12 @@ Run the default test suite:
 uv run --no-sync pytest
 ```
 
-Run the complete suite, including the gated exhaustive ResNet18 and heavy
-detection checks, with all backend and task dependencies installed:
+Run the complete suite, including the gated heavy detection checks, with all
+backend and task dependencies installed:
 
 ```bash
-SPLITFLEET_RUN_RESNET18_ALL_NODES=1 SPLITFLEET_RUN_HEAVY_REAL_MODELS=1 \
-SPLITFLEET_RESNET18_THREADS=1 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
-MKL_NUM_THREADS=1 JAX_PLATFORMS=cpu TOKENIZERS_PARALLELISM=false \
+SPLITFLEET_RUN_HEAVY_REAL_MODELS=1 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+MKL_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false \
   uv run --no-sync pytest tests --tb=short -ra
 ```
 
@@ -145,28 +139,6 @@ The matrix validates Hugging Face BERT/DistilBERT/RoBERTa, CNN classifiers,
 torchvision detection heads, and semantic-segmentation models. Swin training
 and DeepLab training use explicit fixed-shape captures where TorchLens refuses
 dynamic batch replay; the tests preserve those refusals as part of the contract.
-
-Run exhaustive split-node training on the cross-backend task models (YOLO-style
-detection, FCN segmentation, RetinaNet-style detection, OCR, and foreground-mask
-segmentation):
-
-```bash
-uv run --no-sync pytest tests/integration/test_all_split_nodes_training.py -q
-```
-
-This check accounts for terminal and non-differentiable nodes separately. When a
-backend exposes no differentiable single-node boundary, it also tests the
-multi-tensor frontier chosen by TorchLens; a replay-only node is not reported as
-a successful training boundary.
-
-The gated ResNet-18 exhaustive check limits native numerical libraries to one
-CPU thread per backend subprocess by default. Increase the limit explicitly only
-on a suitable host:
-
-```bash
-SPLITFLEET_RUN_RESNET18_ALL_NODES=1 SPLITFLEET_RESNET18_THREADS=2 \
-  uv run --no-sync pytest tests/integration/test_resnet18_all_backends_all_nodes.py -q -s
-```
 
 Run optional heavy detection checks:
 
@@ -392,7 +364,6 @@ wheels share the same import name):
 SPLITFLEET_PADDLE_PYTHON="$PWD/.venv-paddle-gpu/bin/python" \
 SPLITFLEET_FULL_PADDLE_CONTROL=1 \
 SPLITFLEET_FULL_OWNERSHIP_TESTS=1 \
-SPLITFLEET_RUN_RESNET18_ALL_NODES=1 \
 SPLITFLEET_NATIVE_CALIBRATION_BACKEND=pytorch \
 SPLITFLEET_NATIVE_CALIBRATION_DEVICE=cpu \
 SPLITFLEET_RUN_HEAVY_REAL_MODELS=1 \
@@ -400,8 +371,8 @@ uv run --no-sync pytest -ra
 ```
 
 The GPU controls require two real GPUs and the ResNet50 gate's CIFAR-10 data.
-Native framework controls use fresh processes; TensorFlow and JAX test imports
-default to growing GPU allocations so they can coexist with child controls.
+Native framework controls use fresh processes; TensorFlow test imports default
+to growing GPU allocations so they can coexist with child controls.
 Missing dependencies or devices remain explicit skips in the report.
 
 ResNet18 training correctness check:

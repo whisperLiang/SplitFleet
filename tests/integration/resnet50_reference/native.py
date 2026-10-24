@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib
-import os
 
 import numpy as np
 
@@ -11,24 +10,8 @@ from splitfleet.tasks.losses import extract_logits, sparse_cross_entropy
 
 from experiments.resnet50_quality.model_contract import TRAINABLE_NAMES
 
-BACKENDS = {name: None for name in ("pytorch", "tensorflow", "paddle", "jax")}
+BACKENDS = {name: None for name in ("pytorch", "tensorflow", "paddle")}
 MODULES = {"tensorflow": "tf", "pytorch": "torch"}
-
-
-def configure_jax_environment(environment=None):
-    """Freeze the admitted JAX flags before any native device initialization."""
-    environment = os.environ if environment is None else environment
-    flags = environment.get("XLA_FLAGS", "").split()
-    for option in ("xla_gpu_deterministic_ops", "xla_gpu_exclude_nondeterministic_ops"):
-        expected = f"--{option}=true"
-        present = [value for value in flags if value.startswith(f"--{option}=")]
-        if present and present != [expected]:
-            raise ValueError(f"The admitted JAX numerical gate requires {expected}")
-        if not present:
-            flags.append(expected)
-    environment["XLA_FLAGS"] = " ".join(flags)
-    environment["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-    return environment
 
 
 def configure_backend(backend):
@@ -47,11 +30,12 @@ def configure_backend(backend):
         tf.config.experimental.enable_op_determinism()
         tf.config.optimizer.set_experimental_options({'disable_meta_optimizer': True})
         for device in tf.config.list_physical_devices("GPU"):
-            tf.config.experimental.set_memory_growth(device, True)
-    elif backend == "jax":
-        configure_jax_environment()
-        import jax
-        jax.config.update("jax_default_matmul_precision", "highest")
+            try:
+                tf.config.experimental.set_memory_growth(device, True)
+            except RuntimeError:
+                # A preceding isolated test may already have initialized the
+                # process context; the device policy is then immutable.
+                pass
     elif backend == "paddle":
         import faulthandler
         import paddle
@@ -118,15 +102,11 @@ def native_batch(backend, images, labels, device):
         import paddle
         place = paddle.CUDAPlace(int(device.split(":")[-1])) if device.startswith("cuda") else paddle.CPUPlace()
         return paddle.to_tensor(images, place=place), paddle.to_tensor(labels, place=place)
-    if backend == "jax":
-        import jax
-        resolved = jax.devices("gpu" if device.startswith("cuda") else "cpu")[int(device.split(":")[-1]) if ":" in device else 0]
-        return jax.device_put(images, resolved), jax.device_put(labels, resolved)
     raise ValueError(backend)
 
 
 def call_inputs(backend, model, images):
-    return (model.params, images) if backend == "jax" else (images,)
+    return (images,)
 
 
 def native_parameters(backend, model):
@@ -136,8 +116,6 @@ def native_parameters(backend, model):
         return {name: value for name, value in model.canonical_variables().items() if name in TRAINABLE_NAMES}
     if backend == "paddle":
         return dict(model.named_parameters())
-    if backend == "jax":
-        return dict(model.params)
     raise ValueError(backend)
 
 
@@ -160,9 +138,6 @@ def optimizer(backend, model, learning_rate):
     if backend == "paddle":
         import paddle
         return paddle.optimizer.SGD(learning_rate=learning_rate, parameters=model.parameters())
-    if backend == "jax":
-        from splitfleet.runtime.functional_sgd import OwnedFunctionalSGD
-        return OwnedFunctionalSGD(model, learning_rate)
     raise ValueError(backend)
 
 
@@ -195,12 +170,6 @@ def _train_step(backend, model, images, labels, *, learning_rate=.05, native_opt
                 loss = sparse_cross_entropy(output["logits"], labels)
             values = tape.gradient(loss, list(parameters.values()))
         grads = dict(zip(parameters, values, strict=True))
-    elif backend == "jax":
-        import jax
-        def objective(params):
-            output = model(params, images)
-            return sparse_cross_entropy(output["logits"], labels), output
-        (loss, output), grads = jax.value_and_grad(objective, has_aux=True)(model.params)
     else:
         opt.zero_grad() if backend == "pytorch" else opt.clear_grad()
         output = model(images)
@@ -212,9 +181,7 @@ def _train_step(backend, model, images, labels, *, learning_rate=.05, native_opt
     loss_value = float(numpy_value(loss))
     snapshots = {name: numpy_value(value) for name, value in grads.items()} if capture else None
     logits = numpy_value(extract_logits(output)) if capture else None
-    if backend == "jax":
-        model.set_params({name: value - np.float32(learning_rate) * grads[name] for name, value in model.params.items()})
-    elif backend == "tensorflow":
+    if backend == "tensorflow":
         opt.apply_gradients(zip(grads.values(), parameters.values(), strict=True))
     else:
         opt.step()

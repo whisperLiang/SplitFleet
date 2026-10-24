@@ -167,7 +167,7 @@ def _iter_tensors(value: Any):
     if (
         hasattr(value, "shape")
         and hasattr(value, "dtype")
-        and module.startswith(("torch", "tensorflow", "jax", "jaxlib", "paddle"))
+        and module.startswith(("torch", "tensorflow", "paddle"))
     ):
         yield value
     elif isinstance(value, dict):
@@ -192,23 +192,16 @@ def detect_torchlens_backend(model: Any, example_inputs: Any) -> str:
                 return "torch"
             if module.startswith(("tensorflow", "keras")):
                 return "tf"
-            if module.startswith(("jax", "jaxlib", "flax", "haiku")):
-                return "jax"
             if module.startswith("paddle"):
                 return "paddle"
     raise TypeError(
         "Cannot infer a TorchLens split backend; supported backends are "
-        "torch, tf, jax, and paddle."
+        "torch, tf, and paddle."
     )
 
 
 def adapter_for(model: Any, sample_inputs: Any):
     adapter = BACKEND_ADAPTERS.create(detect_torchlens_backend(model, sample_inputs))
-    if adapter.backend_name == "jax" and not hasattr(model, "params"):
-        values = sample_inputs if isinstance(sample_inputs, (tuple, list)) else (sample_inputs,)
-        if not values:
-            raise ValueError("Functional JAX models require params as the first sample input.")
-        adapter.bind_external_params(values[0])
     return adapter
 
 
@@ -231,20 +224,9 @@ def move_value(value: Any, adapter: Any, device: Any) -> Any:
 
 
 def bind_model_inputs(value: Any, adapter: Any, *, model: Any = None) -> Any:
-    """Replace a functional JAX call's params argument with synchronized state."""
-    if adapter.backend_name != "jax":
-        return value
-    if model is not None and hasattr(model, "params"):
-        params = model.params
-    elif getattr(adapter, "has_external_params", False):
-        params = adapter.external_params
-    else:
-        return value
-    if isinstance(value, tuple) and value:
-        return (params, *value[1:])
-    if isinstance(value, list) and value:
-        return [params, *value[1:]]
-    raise ValueError("Functional JAX inputs must be a tuple/list whose first item is params.")
+    """Return model inputs after native framework placement has been applied."""
+    _ = adapter, model
+    return value
 
 
 def inference_context(backend: str):

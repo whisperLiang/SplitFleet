@@ -39,7 +39,6 @@ def test_prefix_timing_synchronizes_only_torch_cuda(monkeypatch) -> None:
     devices = []
     monkeypatch.setattr(torch.cuda, "synchronize", devices.append)
     _synchronize_prefix_device("torch", "cpu")
-    _synchronize_prefix_device("jax", "cuda:0")
     _synchronize_prefix_device("torch", "cuda:1")
     assert devices == ["cuda:1"]
 

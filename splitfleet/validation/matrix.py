@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass
 from typing import Any
 
@@ -10,7 +9,7 @@ import numpy as np
 
 
 TASKS = ("image_classification", "text_classification", "detection", "segmentation", "instance_segmentation")
-TASK_BACKENDS = ("torch", "jax")
+TASK_BACKENDS = ("torch",)
 
 
 @dataclass
@@ -30,10 +29,8 @@ def build_case(task_name: str, *, backend: str = "torch", seed: int = 2026) -> V
         raise ValueError(f"Unknown task {task_name!r}; choose from {TASKS}")
     if backend == "torch":
         return _torch_case(task_name, seed)
-    if backend == "jax":
-        return _jax_case(task_name, seed)
     raise NotImplementedError(
-        f"The task-equivalence fixtures currently support torch and jax, not {backend!r}. "
+        f"The task-equivalence fixtures currently support torch, not {backend!r}. "
         "Other backend replay/training checks are in tests/integration/test_torchlens_optional_frameworks.py."
     )
 
@@ -134,81 +131,6 @@ def _torch_case(task_name: str, seed: int) -> ValidationCase:
     return ValidationCase("torch", task_name, model, inputs, targets, task)
 
 
-def _jax_case(task_name: str, seed: int) -> ValidationCase:
-    import jax
-    import jax.numpy as jnp
-
-    from splitfleet.tasks import (
-        DetectionTask, ImageClassificationTask, InstanceSegmentationTask, SemanticSegmentationTask, TextClassificationTask,
-    )
-
-    rng = np.random.default_rng(seed)
-    params = {
-        "stem": jnp.asarray(rng.normal(0, 0.2, (3, 4)), dtype=jnp.float32),
-        "classifier": jnp.asarray(rng.normal(0, 0.2, (4, 3)), dtype=jnp.float32),
-    }
-    images = jnp.asarray(rng.normal(size=(2, 8, 8, 3)), dtype=jnp.float32)
-    labels = jnp.asarray([0, 2], dtype=jnp.int32)
-    if task_name == "text_classification":
-        params["embedding"] = jnp.asarray(rng.normal(size=(16, 3)), dtype=jnp.float32)
-
-        def model(parameters, tokens, mask):
-            embedded = parameters["embedding"][tokens]
-            pooled = (embedded * mask[..., None]).sum(axis=1) / mask.sum(axis=1, keepdims=True)
-            return {"logits": jax.nn.relu(pooled @ parameters["stem"]) @ parameters["classifier"]}
-
-        inputs = (params, jnp.asarray(rng.integers(0, 16, (2, 5))), jnp.ones((2, 5), dtype=jnp.float32))
-        task, targets = TextClassificationTask(), labels
-    elif task_name in ("detection", "instance_segmentation"):
-        if task_name == "instance_segmentation":
-            params["masks"] = jnp.asarray(rng.normal(0, 0.2, (4, 1)), dtype=jnp.float32)
-        params["boxes"] = jnp.asarray(rng.normal(0, 0.2, (4, 4)), dtype=jnp.float32)
-
-        def model(parameters, image):
-            features = jax.nn.relu(image @ parameters["stem"])
-            pooled = features.mean(axis=(1, 2))
-            output = {"class_logits": pooled @ parameters["classifier"], "boxes": jax.nn.sigmoid(pooled @ parameters["boxes"])}
-            if task_name == "instance_segmentation":
-                output["mask_logits"] = jnp.transpose(features @ parameters["masks"], (0, 3, 1, 2))
-            return output
-
-        def criterion(output, target):
-            log_probs = jax.nn.log_softmax(output["class_logits"], axis=-1)
-            labels = jnp.concatenate([item["labels"] for item in target])
-            classification = -jnp.take_along_axis(log_probs, labels[:, None], axis=-1).mean()
-            delta = jnp.abs(output["boxes"] - jnp.concatenate([item["boxes"] for item in target]))
-            loss = classification + jnp.where(delta < 1, 0.5 * delta ** 2, delta - 0.5).mean()
-            if task_name == "instance_segmentation":
-                logits = output["mask_logits"]
-                masks = jnp.stack([item["masks"] for item in target])
-                loss = loss + (jax.nn.softplus(logits) - logits * masks).mean()
-            return loss
-
-        inputs = (params, images)
-        boxes = jnp.asarray([[0.2, 0.3, 0.5, 0.6], [0.1, 0.2, 0.7, 0.8]])
-        targets = [{"labels": labels[i:i+1], "boxes": boxes[i:i+1]} for i in range(2)]
-        if task_name == "instance_segmentation":
-            for target in targets:
-                target["masks"] = jnp.asarray(rng.integers(0, 2, (1, 8, 8)), dtype=jnp.float32)
-        task_type = InstanceSegmentationTask if task_name == "instance_segmentation" else DetectionTask
-        task = task_type(loss_fn=criterion, model_loss=False)
-        task.prepare_batch((images, targets))
-    elif task_name == "segmentation":
-        def model(parameters, image):
-            logits = jax.nn.relu(image @ parameters["stem"]) @ parameters["classifier"]
-            return {"out": jnp.transpose(logits, (0, 3, 1, 2))}
-
-        inputs = (params, images)
-        targets = jnp.asarray(rng.integers(0, 3, (2, 8, 8)), dtype=jnp.int32)
-        task = SemanticSegmentationTask()
-    else:
-        def model(parameters, image):
-            return jax.nn.relu(image.mean(axis=(1, 2)) @ parameters["stem"]) @ parameters["classifier"]
-
-        inputs, targets, task = (params, images), labels, ImageClassificationTask()
-    return ValidationCase("jax", task_name, model, inputs, targets, task)
-
-
 def _numpy(value):
     if hasattr(value, "detach"):
         value = value.detach().cpu().numpy()
@@ -276,7 +198,6 @@ def validate_case(
         handle = prepare_torchlens_runtime(
             case.model, case.inputs, boundary="50%", trainable=True,
             dynamic_batch=(case.batch_size, case.batch_size), model_name=f"validation-{case.task_name}",
-            batch_axes={"/args/1": 0, **({"/args/2": 0} if case.task_name == "text_classification" else {})} if case.backend == "jax" else None,
         )
         native.restore(initial)
         expected_output, expected_loss, expected_gradients, expected_state = native.full_step()
@@ -355,38 +276,26 @@ class _NativeTraining:
         self.lr = learning_rate
         if case.backend == "torch":
             self.case.model.train()
-        elif case.backend != "jax":
+        else:
             raise NotImplementedError(f"Native gradient comparator for {case.backend!r} is unavailable")
 
     def snapshot(self):
-        if self.case.backend == "torch":
-            return {name: tensor.detach().clone() for name, tensor in self.case.model.state_dict().items()}
-        return copy.deepcopy(self.case.inputs[0])
+        return {name: tensor.detach().clone() for name, tensor in self.case.model.state_dict().items()}
 
     def restore(self, state):
-        if self.case.backend == "torch":
-            self.case.model.load_state_dict(state)
-            self.case.model.zero_grad(set_to_none=True)
-        else:
-            self.case.inputs = (copy.deepcopy(state), *self.case.inputs[1:])
+        self.case.model.load_state_dict(state)
+        self.case.model.zero_grad(set_to_none=True)
 
     def full_step(self):
         case = self.case
-        if case.backend == "torch":
-            import torch
-
-            output = case.model(*case.inputs)
-            loss = case.task.loss(output, case.targets)
-            loss.backward()
-            gradients = {name: None if param.grad is None else param.grad.detach().clone() for name, param in case.model.named_parameters()}
-            torch.optim.SGD(case.model.parameters(), lr=self.lr).step()
-            return output, loss.detach().clone(), gradients, self.snapshot()
-        import jax
+        import torch
 
         output = case.model(*case.inputs)
-        loss, gradients = jax.value_and_grad(lambda p: case.task.loss(case.model(p, *case.inputs[1:]), case.targets))(case.inputs[0])
-        self.case.inputs = (jax.tree_util.tree_map(lambda p, g: p - self.lr * g, case.inputs[0], gradients), *case.inputs[1:])
-        return output, loss, gradients, self.snapshot()
+        loss = case.task.loss(output, case.targets)
+        loss.backward()
+        gradients = {name: None if param.grad is None else param.grad.detach().clone() for name, param in case.model.named_parameters()}
+        torch.optim.SGD(case.model.parameters(), lr=self.lr).step()
+        return output, loss.detach().clone(), gradients, self.snapshot()
 
     def split_step(self, runtime):
         from splitfleet.transport import encode_gradients, decode_gradients
@@ -400,17 +309,10 @@ class _NativeTraining:
         loss, boundary_grads = runtime.backend.train_suffix(remote, case.targets, loss_fn=case.task.loss)
         gradient_wire = encode_gradients(gradients_to_envelope(wire, boundary_grads))
         received_grads = envelope_to_gradients(decode_gradients(gradient_wire), None)
-        prefix_result = runtime.backend.backward_prefix(local, received_grads)
-        if case.backend == "torch":
-            import torch
+        runtime.backend.backward_prefix(local, received_grads)
+        import torch
 
-            gradients = {name: None if param.grad is None else param.grad.detach().clone() for name, param in case.model.named_parameters()}
-            torch.optim.SGD(case.model.parameters(), lr=self.lr).step()
-        else:
-            import jax
+        gradients = {name: None if param.grad is None else param.grad.detach().clone() for name, param in case.model.named_parameters()}
+        torch.optim.SGD(case.model.parameters(), lr=self.lr).step()
 
-            if not prefix_result or "inputs" not in prefix_result:
-                raise AssertionError("The trainable boundary returned no input parameter gradients")
-            gradients = prefix_result["inputs"][0]
-            case.inputs = (jax.tree_util.tree_map(lambda p, g: p - self.lr * g, case.inputs[0], gradients), *case.inputs[1:])
         return loss, gradients, self.snapshot()
